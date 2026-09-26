@@ -1,0 +1,246 @@
+//! The shared terminal control page: ready, claim, acknowledge and the diagnostic gate.
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+pub const CONTROL_OFFSET: u64 = 0x800;
+
+/// Shared backing follows all 32 startup mailboxes. Only atomics are accessed
+/// after entry; one reporter owns transport and every participant stays stopped.
+#[repr(C, align(64))]
+pub struct TerminalControl {
+    ready: AtomicU32,
+    expected: AtomicU32,
+    owner: AtomicU32,
+    request: AtomicU32,
+    acknowledged: AtomicU32,
+    outcome: AtomicU32,
+    initial_acknowledged: AtomicU32,
+    diagnostic_gate: AtomicU32,
+    diagnostic_revoked: AtomicU32,
+    // Retired mailbox field: preserve the shared layout; never accessed after entry.
+    reserved_service: u32,
+    configuration_windows: AtomicU32,
+    reserved: [u32; 53],
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<TerminalControl>() == 256);
+    assert!(core::mem::offset_of!(TerminalControl, reserved_service) == 36);
+    assert!(core::mem::offset_of!(TerminalControl, configuration_windows) == 40);
+    assert!(core::mem::offset_of!(TerminalControl, reserved) == 44);
+    assert!(
+        CONTROL_OFFSET
+            == 32 * core::mem::size_of::<crate::svm::startup::NativeStartupMailbox>() as u64
+    );
+    assert!(CONTROL_OFFSET + core::mem::size_of::<TerminalControl>() as u64 <= 4096);
+};
+
+impl TerminalControl {
+    pub const fn new() -> Self {
+        Self {
+            ready: AtomicU32::new(0),
+            expected: AtomicU32::new(0),
+            owner: AtomicU32::new(0),
+            request: AtomicU32::new(0),
+            acknowledged: AtomicU32::new(0),
+            outcome: AtomicU32::new(0),
+            initial_acknowledged: AtomicU32::new(0),
+            diagnostic_gate: AtomicU32::new(0),
+            diagnostic_revoked: AtomicU32::new(0),
+            reserved_service: 0,
+            configuration_windows: AtomicU32::new(0),
+            reserved: [0; 53],
+        }
+    }
+    pub(crate) fn publish_ready(&self, count: usize) -> bool {
+        let Some(mask) = cpu_mask(count) else {
+            return false;
+        };
+        if self.ready.load(Ordering::Acquire) != 0 || self.owner.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        self.expected.store(mask, Ordering::Relaxed);
+        self.ready.compare_exchange(0, 1, Ordering::Release, Ordering::Relaxed).is_ok()
+    }
+    /// Monotonic initial-entry proof; guest INIT/SIPI never clears these bits.
+    pub fn initial_ack(&self, slot: usize, count: usize) -> bool {
+        let Some(mask) = cpu_mask(count) else {
+            return false;
+        };
+        if slot >= count {
+            return false;
+        }
+        let seen = self.initial_acknowledged.fetch_or(1 << slot, Ordering::AcqRel) | (1 << slot);
+        if seen == mask { self.publish_ready(count) } else { false }
+    }
+    pub(crate) fn ready(&self, count: usize) -> bool {
+        self.ready.load(Ordering::Acquire) == 1
+            && cpu_mask(count) == Some(self.expected.load(Ordering::Relaxed))
+    }
+    pub(crate) fn requested(&self) -> bool {
+        self.request.load(Ordering::Acquire) == 1
+    }
+    pub fn claim(&self, slot: usize, count: usize) -> bool {
+        if slot >= count || !self.ready(count) {
+            return false;
+        }
+        if self
+            .owner
+            .compare_exchange(0, slot as u32 + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.request.store(1, Ordering::Release);
+        true
+    }
+    pub fn acknowledge(&self, slot: usize, count: usize) -> bool {
+        if slot >= count || !self.ready(count) || !self.requested() {
+            return false;
+        }
+        self.acknowledged.fetch_or(1 << slot, Ordering::Release);
+        true
+    }
+    pub fn all_acknowledged(&self, count: usize) -> bool {
+        self.ready(count)
+            && self.requested()
+            && cpu_mask(count) == Some(self.acknowledged.load(Ordering::Acquire))
+    }
+    pub fn finish(&self, result: u32) {
+        self.outcome.store(result, Ordering::Release);
+    }
+    pub fn diagnostic_lock(&self) -> Option<DiagnosticGuard<'_>> {
+        self.diagnostic_gate
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| DiagnosticGuard(self))
+    }
+    pub fn diagnostic_revoked(&self) -> bool {
+        self.diagnostic_revoked.load(Ordering::Acquire) != 0
+    }
+    pub fn diagnostic_revoke(&self) {
+        self.diagnostic_revoked.store(1, Ordering::Release);
+    }
+    pub fn configuration_pending(&self) -> bool {
+        self.configuration_windows.load(Ordering::Acquire) != 0
+    }
+    pub fn configuration_open(&self, slot: usize) -> bool {
+        slot < 32 && self.configuration_windows.load(Ordering::Acquire) & (1 << slot) != 0
+    }
+    /// Owning stopped CPU only, after draining configuration writes, restoring its NPT
+    /// restriction and requesting a full TLB flush. Closing needs no gate: it can only make
+    /// the mask less restrictive. Opening and MMIO publication still share the gate.
+    pub fn finish_configuration(&self, slot: usize) {
+        if slot < 32 {
+            self.configuration_windows.fetch_and(!(1u32 << slot), Ordering::Release);
+        }
+    }
+    pub fn diagnostic_snapshot(&self) -> [u64; 6] {
+        [
+            self.expected.load(Ordering::Acquire) as u64,
+            self.acknowledged.load(Ordering::Acquire) as u64,
+            self.owner.load(Ordering::Acquire) as u64,
+            self.outcome.load(Ordering::Acquire) as u64,
+            self.initial_acknowledged.load(Ordering::Acquire) as u64,
+            0,
+        ]
+    }
+}
+
+impl Default for TerminalControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Nonblocking lifetime exclusion shared by publication and native config I/O.
+pub struct DiagnosticGuard<'a>(&'a TerminalControl);
+
+impl DiagnosticGuard<'_> {
+    /// Publish under the same gate as MMIO, before enabling this stopped CPU's guest writes.
+    pub fn begin_configuration(&self, slot: usize) -> bool {
+        if slot >= 32 {
+            return false;
+        }
+        let bit = 1u32 << slot;
+        self.0.configuration_windows.fetch_or(bit, Ordering::AcqRel) & bit == 0
+    }
+}
+
+impl Drop for DiagnosticGuard<'_> {
+    fn drop(&mut self) {
+        self.0.diagnostic_gate.store(0, Ordering::Release);
+    }
+}
+
+pub fn cpu_mask(count: usize) -> Option<u32> {
+    if count == 32 {
+        Some(u32::MAX)
+    } else if (1..32).contains(&count) {
+        Some((1u32 << count) - 1)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn configuration_windows_exclude_publication_until_every_cpu_closes() {
+        let control = TerminalControl::new();
+        let guard = control.diagnostic_lock().unwrap();
+        assert!(guard.begin_configuration(0));
+        assert!(guard.begin_configuration(31));
+        assert!(!guard.begin_configuration(32));
+        assert!(!guard.begin_configuration(0));
+        control.finish_configuration(0);
+        assert!(control.configuration_pending());
+        assert!(!control.configuration_open(0));
+        assert!(control.configuration_open(31));
+        drop(guard);
+        assert!(control.configuration_pending());
+        let guard = control.diagnostic_lock().unwrap();
+        control.finish_configuration(31);
+        assert!(!control.configuration_pending());
+        assert!(guard.begin_configuration(0));
+        control.finish_configuration(0);
+        assert!(!control.configuration_pending());
+    }
+
+    #[test]
+    fn terminal_requires_all_cpus_and_never_reopens() {
+        let c = TerminalControl::new();
+        assert!(!c.claim(0, 2));
+        assert!(c.publish_ready(2));
+        assert!(c.claim(0, 2));
+        assert!(!c.claim(1, 2));
+        assert!(c.acknowledge(0, 2));
+        assert!(!c.all_acknowledged(2));
+        assert!(c.acknowledge(1, 2));
+        assert!(c.all_acknowledged(2));
+        c.finish(2);
+        assert!(c.requested());
+        assert!(!c.publish_ready(2));
+    }
+    #[test]
+    fn initial_ack_gate_cannot_open_with_missing_cpu_or_lose_proof_on_restart() {
+        let c = TerminalControl::new();
+        for slot in 0..31 {
+            assert!(!c.initial_ack(slot, 32));
+        }
+        assert!(!c.ready(32));
+        assert!(!c.claim(0, 32));
+        assert!(c.initial_ack(31, 32));
+        assert!(c.ready(32));
+        assert!(!c.initial_ack(2, 32));
+        assert!(c.ready(32));
+        assert!(c.claim(31, 32));
+        for slot in 0..31 {
+            assert!(c.acknowledge(slot, 32));
+        }
+        assert!(!c.all_acknowledged(32));
+        assert!(c.acknowledge(31, 32));
+        assert!(c.all_acknowledged(32));
+    }
+}

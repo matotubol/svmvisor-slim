@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "scope": "offline supplied-memory images; static evidence only",
+  "image": {
+    "name": "ntoskrnl.exe",
+    "sha256": "d90c69cfa925d42037ef1cdba3ff5b3f13cc14e16060938073b97e396fdde2f2",
+    "file_bytes": 13104632,
+    "machine": 34404,
+    "timestamp": 4255772020,
+    "preferred_image_base": 5368709120,
+    "image_bytes": 21299200,
+    "checksum": 13113301,
+    "codeview": {
+      "guid": "C29EBFB0-6B78-B3C0-20DC-A66D99713F9E",
+      "age": 1,
+      "name": "ntkrnlmp.pdb"
+    }
+  },
+  "pdb": {
+    "name": "ntkrnlmp.pdb",
+    "guid": "C29EBFB0-6B78-B3C0-20DC-A66D99713F9E",
+    "info_age": 6,
+    "dbi_age": 1,
+    "private_symbols_stripped": true,
+    "file_bytes": 11497472,
+    "sha256": "2f2408d5c6b19264970814b2e9175aa2434cabd09ecbbf9b8d0c335e2b380e6a",
+    "url": "https://msdl.microsoft.com/download/symbols/ntkrnlmp.pdb/C29EBFB06B78B3C020DCA66D99713F9E1/ntkrnlmp.pdb"
+  },
+  "types": {
+    "_EPROCESS": {
+      "type_index": "0x1C75",
+      "field_list": "0x1C74",
+      "bytes": 2112
+    },
+    "_KPROCESS": {
+      "type_index": "0x1B49",
+      "field_list": "0x1B48",
+      "bytes": 456
+    },
+    "_LIST_ENTRY": {
+      "type_index": "0x106C",
+      "field_list": "0x106B",
+      "bytes": 16
+    },
+    "_SE_AUDIT_PROCESS_CREATION_INFO": {
+      "type_index": "0x3664",
+      "field_list": "0x3663",
+      "bytes": 8
+    },
+    "_OBJECT_NAME_INFORMATION": {
+      "type_index": "0x2DDA",
+      "field_list": "0x2DD9",
+      "bytes": 16
+    },
+    "_UNICODE_STRING": {
+      "type_index": "0x1086",
+      "field_list": "0x1085",
+      "bytes": 16
+    }
+  },
+  "fields": {
+    "Pcb": {
+      "offset": 0,
+      "type_index": "0x18B5"
+    },
+    "UniqueProcessId": {
+      "offset": 464,
+      "type_index": "0x0603"
+    },
+    "ActiveProcessLinks": {
+      "offset": 472,
+      "type_index": "0x1069"
+    },
+    "CreateTime": {
+      "offset": 504,
+      "type_index": "0x10A9"
+    },
+    "ImageFileName": {
+      "offset": 824,
+      "type_index": "0x1C50",
+      "bytes": 15
+    },
+    "Peb": {
+      "offset": 736,
+      "type_index": "0x1A44"
+    },
+    "WoW64Process": {
+      "offset": 784,
+      "type_index": "0x1C4F"
+    },
+    "SeAuditProcessCreationInfo": {
+      "offset": 848,
+      "type_index": "0x1C51"
+    },
+    "Pcb.DirectoryTableBase": {
+      "offset": 40,
+      "type_index": "0x0023",
+      "eprocess_offset": 40
+    },
+    "Pcb.UserDirectoryTableBase": {
+      "offset": 344,
+      "type_index": "0x0023",
+      "eprocess_offset": 344
+    },
+    "SeAuditProcessCreationInfo.ImageFileName": {
+      "offset": 0,
+      "type_index": "0x2C87",
+      "eprocess_offset": 848
+    }
+  },
+  "list_fields": {
+    "Flink": {
+      "offset": 0,
+      "type_index": "0x106A"
+    },
+    "Blink": {
+      "offset": 8,
+      "type_index": "0x106A"
+    }
+  },
+  "name_fields": {
+    "Name": {
+      "offset": 0,
+      "type_index": "0x1083"
+    }
+  },
+  "string_fields": {
+    "Length": {
+      "offset": 0,
+      "type_index": "0x0021"
+    },
+    "Buffer": {
+      "offset": 8,
+      "type_index": "0x0671"
+    }
+  },
+  "symbols": {
+    "PsActiveProcessHead": {
+      "section": 26,
+      "section_name": ".data",
+      "section_rva": 14680064,
+      "section_offset": 1072576,
+      "rva": 15752640,
+      "record": "2279036 | S_PUB32 [size = 36] `PsActiveProcessHead`\n           flags = none, addr = 0026:1072576"
+    },
+    "PsInitialSystemProcess": {
+      "section": 27,
+      "section_name": "ALMOSTRO",
+      "section_rva": 16535552,
+      "section_offset": 6896,
+      "rva": 16542448,
+      "record": "876284 | S_PUB32 [size = 40] `PsInitialSystemProcess`\n           flags = none, addr = 0027:6896"
+    },
+    "KiSystemCall64": {
+      "section": 8,
+      "section_name": ".text",
+      "section_rva": 2097152,
+      "section_offset": 4986944,
+      "rva": 7084096,
+      "record": "1039888 | S_PUB32 [size = 32] `KiSystemCall64`\n           flags = function, addr = 0008:4986944"
+    },
+    "KiSystemCall64Shadow": {
+      "section": 18,
+      "section_name": "KVASCODE",
+      "section_rva": 12357632,
+      "section_offset": 8704,
+      "rva": 12366336,
+      "record": "1073224 | S_PUB32 [size = 36] `KiSystemCall64Shadow`\n           flags = function, addr = 0018:8704"
+    }
+  },
+  "llvm_version": "LLVM (http://llvm.org/):\n  LLVM version 22.1.8\n  Optimized build.",
+  "type_evidence": {
+    "0x1C75": "LF_STRUCTURE [size = 48] `_EPROCESS`\n            unique name: `.?AU_EPROCESS@@`\n            vtable: <no type>, base list: <no type>, field list: 0x1C74\n            options: has unique name, sizeof 2112",
+    "0x1C74": "LF_FIELDLIST [size = 7608]\n            - LF_MEMBER [name = `Pcb`, Type = 0x18B5, offset = 0, attrs = public]\n            - LF_MEMBER [name = `UniqueProcessId`, Type = 0x0603 (void*), offset = 464, attrs = public]\n            - LF_MEMBER [name = `ActiveProcessLinks`, Type = 0x1069, offset = 472, attrs = public]\n            - LF_MEMBER [name = `CreateTime`, Type = 0x10A9, offset = 504, attrs = public]\n            - LF_MEMBER [name = `ImageFileName`, Type = 0x1C50, offset = 824, attrs = public]\n            - LF_MEMBER [name = `Peb`, Type = 0x1A44, offset = 736, attrs = public]\n            - LF_MEMBER [name = `WoW64Process`, Type = 0x1C4F, offset = 784, attrs = public]\n            - LF_MEMBER [name = `SeAuditProcessCreationInfo`, Type = 0x1C51, offset = 848, attrs = public]",
+    "0x1B49": "LF_STRUCTURE [size = 48] `_KPROCESS`\n            unique name: `.?AU_KPROCESS@@`\n            vtable: <no type>, base list: <no type>, field list: 0x1B48\n            options: has unique name, sizeof 456",
+    "0x1B48": "LF_FIELDLIST [size = 1724]\n            - LF_MEMBER [name = `DirectoryTableBase`, Type = 0x0023 (unsigned __int64), offset = 40, attrs = public]\n            - LF_MEMBER [name = `UserDirectoryTableBase`, Type = 0x0023 (unsigned __int64), offset = 344, attrs = public]",
+    "0x106C": "LF_STRUCTURE [size = 52] `_LIST_ENTRY`\n            unique name: `.?AU_LIST_ENTRY@@`\n            vtable: <no type>, base list: <no type>, field list: 0x106B\n            options: has unique name, sizeof 16",
+    "0x106B": "LF_FIELDLIST [size = 36]\n            - LF_MEMBER [name = `Flink`, Type = 0x106A, offset = 0, attrs = public]\n            - LF_MEMBER [name = `Blink`, Type = 0x106A, offset = 8, attrs = public]",
+    "0x3664": "LF_STRUCTURE [size = 92] `_SE_AUDIT_PROCESS_CREATION_INFO`\n            unique name: `.?AU_SE_AUDIT_PROCESS_CREATION_INFO@@`\n            vtable: <no type>, base list: <no type>, field list: 0x3663\n            options: has unique name, sizeof 8",
+    "0x3663": "LF_FIELDLIST [size = 28]\n            - LF_MEMBER [name = `ImageFileName`, Type = 0x2C87, offset = 0, attrs = public]",
+    "0x2DDA": "LF_STRUCTURE [size = 80] `_OBJECT_NAME_INFORMATION`\n            unique name: `.?AU_OBJECT_NAME_INFORMATION@@`\n            vtable: <no type>, base list: <no type>, field list: 0x2DD9\n            options: has unique name, sizeof 16",
+    "0x2DD9": "LF_FIELDLIST [size = 20]\n            - LF_MEMBER [name = `Name`, Type = 0x1083, offset = 0, attrs = public]",
+    "0x1086": "LF_STRUCTURE [size = 60] `_UNICODE_STRING`\n            unique name: `.?AU_UNICODE_STRING@@`\n            vtable: <no type>, base list: <no type>, field list: 0x1085\n            options: has unique name, sizeof 16",
+    "0x1085": "LF_FIELDLIST [size = 68]\n            - LF_MEMBER [name = `Length`, Type = 0x0021 (unsigned short), offset = 0, attrs = public]\n            - LF_MEMBER [name = `Buffer`, Type = 0x0671 (wchar_t*), offset = 8, attrs = public]",
+    "0x18B5": "LF_STRUCTURE [size = 48] `_KPROCESS`\n            unique name: `.?AU_KPROCESS@@`\n            vtable: <no type>, base list: <no type>, field list: <no type>\n            options: forward ref (-> 0x1B49) | has unique name, sizeof 0",
+    "0x1069": "LF_STRUCTURE [size = 52] `_LIST_ENTRY`\n            unique name: `.?AU_LIST_ENTRY@@`\n            vtable: <no type>, base list: <no type>, field list: <no type>\n            options: forward ref (-> 0x106C) | has unique name, sizeof 0",
+    "0x10A9": "LF_UNION [size = 52] `_LARGE_INTEGER`\n            unique name: `.?AT_LARGE_INTEGER@@`\n            field list: <no type>\n            options: forward ref (-> 0x10AD) | has unique name, sizeof 0",
+    "0x10AD": "LF_UNION [size = 52] `_LARGE_INTEGER`\n            unique name: `.?AT_LARGE_INTEGER@@`\n            field list: 0x10AC\n            options: has unique name | sealed, sizeof 8",
+    "0x1C50": "LF_ARRAY [size = 16]\n            size: 15, index type: 0x0023 (unsigned __int64), element type: 0x0020 (unsigned char)",
+    "0x1A44": "LF_POINTER [size = 12]\n            referent = 0x1A43, mode = pointer, opts = None, kind = ptr64",
+    "0x1C4F": "LF_POINTER [size = 12]\n            referent = 0x1C4E, mode = pointer, opts = None, kind = ptr64",
+    "0x1C51": "LF_STRUCTURE [size = 92] `_SE_AUDIT_PROCESS_CREATION_INFO`\n            unique name: `.?AU_SE_AUDIT_PROCESS_CREATION_INFO@@`\n            vtable: <no type>, base list: <no type>, field list: <no type>\n            options: forward ref (-> 0x3664) | has unique name, sizeof 0",
+    "0x2C87": "LF_POINTER [size = 12]\n            referent = 0x2C86, mode = pointer, opts = None, kind = ptr64",
+    "0x106A": "LF_POINTER [size = 12]\n            referent = 0x1069, mode = pointer, opts = None, kind = ptr64",
+    "0x1083": "LF_STRUCTURE [size = 60] `_UNICODE_STRING`\n            unique name: `.?AU_UNICODE_STRING@@`\n            vtable: <no type>, base list: <no type>, field list: <no type>\n            options: forward ref (-> 0x1086) | has unique name, sizeof 0"
+  }
+}

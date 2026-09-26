@@ -1,0 +1,352 @@
+import importlib.util
+from pathlib import Path
+import struct
+import unittest
+import zlib
+import contextlib
+import io
+import json
+import tempfile
+from unittest import mock
+
+spec=importlib.util.spec_from_file_location("reader",Path(__file__).with_name("read_snapshot.py"))
+r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
+
+def frame(bank=0,valid=True,fault=False):
+    words=[0x55504353,0x04000001,0x89abcdef,0x01234567,0x9abcdef0,0x12345678,bank|(64 if valid else 0),0]+[0]*24
+    if valid:
+        words[8:27]=[7,0x104|(0x10000 if fault else 0),9,31,1,2]+list(range(12))+[123]
+    raw=struct.pack("<31I",*words[:31]);return (raw+struct.pack("<I",zlib.crc32(raw)))[::-1].hex()
+
+def admission_frame(bank=31, boot=9, operation=4, predicate=7, processor=31,
+                    count=32, apic=27, observed=0xfedcba9876543208,
+                    expected=0x10, status=48, item=0xc0010015, fault=True):
+    words=list(struct.unpack("<32I", bytes.fromhex(frame(bank, fault=bool(bank & 32)))[::-1]))
+    words[9]=0x10c | (0x10000 if fault else 0)
+    words[10]=boot; words[11]=apic
+    contexts=[predicate, item, observed, expected, status, processor | (count << 32)]
+    for index, value in enumerate(contexts):
+        words[14+index*2]=value & 0xffffffff
+        words[15+index*2]=value >> 32
+    words[26]=operation
+    raw=struct.pack("<31I", *words[:31])
+    return (raw+struct.pack("<I", zlib.crc32(raw)))[::-1].hex()
+
+def admission_header(operation=4, predicate=7, boot=9):
+    # Actual journal4/5/6 -> USER2 frame10/11/9 rotation.
+    words=[0x50414e53,0x02000001,0x89abcdef,0x01234567,0x9abcdef0,0x12345678,
+           boot,3,20 | (8 << 16),predicate,19 | (32 << 8) | (operation << 16),0x80000003,0,0,0]
+    raw=struct.pack("<15I", *words)
+    return (raw+struct.pack("<I", zlib.crc32(raw)))[::-1].hex()
+
+class PerCpuSnapshotTests(unittest.TestCase):
+    def test_cache_terminal_stop_keeps_policy_failure_distinct_from_boundary(self):
+        for reason, detail, stage in [(0xf400, 17, "register_write_policy"),
+                                      (0xf400, 11, "hardware_instruction_boundary"),
+                                      (0xf400, 0xffff, "unmapped_cache_stage"),
+                                      (0xf401, 0x8000, "quarantined_routing_access")]:
+            words=list(struct.unpack("<32I", bytes.fromhex(frame(56, fault=True))[::-1]))
+            words[9]=0x1010e
+            words[26]=(24<<24)|(5<<8)
+            contexts=[0xfffff804d1d6601c, 0x7c, reason, detail, 29480, 0x200000003]
+            for index, value in enumerate(contexts):
+                words[14+index*2]=value & 0xffffffff
+                words[15+index*2]=value >> 32
+            raw=struct.pack("<31I", *words[:31])
+            result=r.decode_percpu_frame((raw+struct.pack("<I", zlib.crc32(raw)))[::-1].hex())["record"]
+            self.assertEqual(result["cache_stop"]["stage"], stage)
+            self.assertEqual(result["fields"]["stop_reason"], reason)
+            self.assertEqual(result["fields"]["stop_detail"], detail)
+            self.assertNotIn("requested_value", result["cache_stop"])
+            if reason == 0xf401:
+                self.assertEqual(result["cache_stop"]["guest_physical_address"], detail)
+
+    def test_terminal_extension_uses_only_spare_banks_and_keeps_full_context(self):
+        for part in range(4):
+            words=list(struct.unpack("<32I",bytes.fromhex(frame(56,fault=True))[::-1]))
+            words[9]=0x1010e
+            words[26]=(24<<24)|(3<<16)|(3<<13)|(2<<8)|part
+            def encoded():
+                raw=struct.pack("<31I",*words[:31])
+                return (raw+struct.pack("<I",zlib.crc32(raw)))[::-1].hex()
+            result=r.decode_percpu_frame(encoded())
+            self.assertEqual(result["bank_role"],"terminal_owner_extension")
+            self.assertEqual(result["record"]["owner_processor_slot"],2)
+            self.assertEqual(len(result["record"]["fields"]),6)
+            if part==2: self.assertEqual(result["record"]["guest_cpl"],3)
+            if part==3: self.assertEqual(result["record"]["history_index"],3)
+            words[6]=55|64 # CPU23 is real on this24CPU host, never an extension.
+            with self.assertRaises(ValueError): r.decode_percpu_frame(encoded())
+
+    def test_raw_cache_msr_keeps_full_operands_and_original_refusal(self):
+        contexts=[0xffff800000001111, 0x12345678c0010015, 0xfedcba9876543210,
+                  0xffff800000001113, 0x123456780000f400, 0xfedcba9800000010]
+        words=list(struct.unpack("<32I", bytes.fromhex(frame(63, fault=True))[::-1]))
+        words[9]=0x1010d
+        for index, value in enumerate(contexts):
+            words[14+index*2]=value & 0xffffffff
+            words[15+index*2]=value >> 32
+        words[26]=contexts[4] & 0xffffffff
+        raw=struct.pack("<31I", *words[:31])
+        encoded=(raw+struct.pack("<I", zlib.crc32(raw)))[::-1].hex()
+        result=r.decode_percpu_frame(encoded)
+        record=result["record"]
+        self.assertEqual(result["processor_slot"], 31)
+        self.assertEqual(result["kind"], "first_fault")
+        self.assertEqual(record["event_name"], "raw_cache_msr_boundary")
+        self.assertEqual(record["contexts"], contexts)
+        self.assertEqual(record["msr_index"], 0xc0010015)
+        self.assertEqual(record["fields"]["edx_eax_operand"], 0xfedcba9876543210)
+        self.assertEqual(record["fields"]["reason_info1"], contexts[4])
+        self.assertEqual(record["fields"]["reason_info2"], contexts[5])
+        self.assertEqual(record["aux_name"], "stop_reason_low32")
+        self.assertEqual(record["boundary_observation"], "assembly_capture_before_dispatch")
+        self.assertEqual(record["access"], "not_exported")
+        self.assertEqual(record["instruction_completed"], "not_established")
+
+    def test_config_write_record_says_whether_the_transport_continues(self):
+        # aux bit 8 (diagnostic_runtime.rs TRANSPORT_CONTINUES); older images revoked here.
+        for aux, reason, continues in [(1, 1, False), (2, 2, False), (0x101, 1, True), (0x102, 2, True)]:
+            words=list(struct.unpack("<32I", bytes.fromhex(frame(5))[::-1]))
+            words[9]=0x106; words[26]=aux
+            raw=struct.pack("<31I", *words[:31])
+            record=r.decode_percpu_frame((raw+struct.pack("<I", zlib.crc32(raw)))[::-1].hex())["record"]
+            self.assertEqual(record["event_name"], "transport_revoking")
+            self.assertEqual((record["revocation_reason"], record["transport_continues"]), (reason, continues))
+
+    def test_stop_record_splits_drop_and_discard_counters(self):
+        for counters, drops, discards in [(7, 7, 0), ((3 << 32) | 7, 7, 3), ((1 << 64) - 1, 0xffffffff, 0xffffffff)]:
+            contexts=[0xffff800000001111, 0x401, 0xf521, 0x10_0000_0500, 99, counters]
+            # Stop records win the sticky first-fault bank (fault marker set).
+            words=list(struct.unpack("<32I", bytes.fromhex(frame(63, fault=True))[::-1]))
+            words[9]=0x10103
+            for index, value in enumerate(contexts):
+                words[14+index*2]=value & 0xffffffff
+                words[15+index*2]=value >> 32
+            raw=struct.pack("<31I", *words[:31])
+            encoded=(raw+struct.pack("<I", zlib.crc32(raw)))[::-1].hex()
+            record=r.decode_percpu_frame(encoded)["record"]
+            self.assertEqual(record["event_name"], "stop")
+            self.assertEqual(record["fields"]["stop_counters"], counters)
+            self.assertEqual((record["incomplete_ipi_drops"], record["disabled_apic_edge_discards"]), (drops, discards))
+
+    def test_post_ebs_survey_binds_only_current_boot_cache_failure(self):
+        frame=r.decode_percpu_frame(admission_frame(operation=6,predicate=12,item=0x26c))
+        header={"phase":19,"boot_id":9,"fpga_build_id":frame["fpga_build_id"],
+            "rom_build_id":frame["rom_build_id"],"native_resident_observation":
+            {"encoding_valid":True,"stage":0x80,"activation_failure":48}}
+        detail=r.bind_admission_failure(header,{"frames":[frame]})
+        self.assertEqual(detail["ownership_boundary"],"post_ebs_cache_survey")
+        self.assertEqual(detail["predicate_name"],"physical_bank_agreement")
+        header["boot_id"]=10
+        self.assertEqual(r.bind_admission_failure(header,{"frames":[frame]})["status"],"full_record_unavailable")
+        header["native_resident_observation"]["activation_failure"]=33
+        self.assertIsNone(r.bind_admission_failure(header,{"frames":[frame]}))
+
+    def test_active_fixed_tuple_and_extension_profile_operands_are_distinct(self):
+        detail=r.decode_percpu_frame(admission_frame(predicate=20,item=0x26c,
+            observed=0x1d1d1d1d1d1d1d1d,expected=0))["record"]["admission_failure"]
+        self.assertEqual(detail["predicate_name"],"active_fixed_mtrr_extended_tuple")
+        self.assertEqual(detail["expected_field_role"],"unused")
+        detail=r.decode_percpu_frame(admission_frame(predicate=21,item=0xc0010010,
+            observed=0x700000,expected=1<<18))["record"]["admission_failure"]
+        self.assertEqual(detail["predicate_name"],"active_fixed_mtrr_extensions_enabled")
+        self.assertEqual(detail["comparison"],"required_set_mask")
+
+    def test_admission_full_width_operands_and_unknown_identities(self):
+        record=r.decode_percpu_frame(admission_frame(item=0xfedcba9876543210,
+            expected=0x123456789abcdef0, status=0x8000000000000007))["record"]
+        detail=record["admission_failure"]
+        self.assertEqual(record["aux_name"], "admission_operation")
+        self.assertEqual(detail["register_or_address"], "0xfedcba9876543210")
+        self.assertEqual(detail["observed"], "0xfedcba9876543208")
+        self.assertEqual(detail["expected_or_context"], "0x123456789abcdef0")
+        self.assertEqual(detail["original_status_or_code"], "0x8000000000000007")
+        self.assertEqual(detail["comparison_mask"], "0x0000000000000018")
+        self.assertFalse(detail["operands_truncated"])
+        self.assertFalse(detail["runtime_activation_claim"])
+        unknown=r.decode_percpu_frame(admission_frame(processor=0xffffffff, apic=0xffffffff))["record"]["admission_failure"]
+        self.assertIsNone(unknown["processor"])
+        self.assertIsNone(unknown["apic_id"])
+
+    def test_admission_masks_and_firmware_status_are_distinct(self):
+        for predicate, comparison, role in [(2,"required_set_mask","required_mask"),
+                (6,"allowed_set_mask","allowed_mask"), (7,"masked_equality_mask_0x18","masked_expected_value")]:
+            detail=r.decode_percpu_frame(admission_frame(predicate=predicate))["record"]["admission_failure"]
+            self.assertEqual(detail["comparison"],comparison)
+            self.assertEqual(detail["expected_field_role"],role)
+        for predicate in (1,3,4,6,9,11,14,15,17):
+            detail=r.decode_percpu_frame(admission_frame(operation=2,predicate=predicate,
+                status=0x8000000000000003))["record"]["admission_failure"]
+            self.assertEqual(detail["failure_origin"],"firmware_service")
+        detail=r.decode_percpu_frame(admission_frame(operation=2,predicate=12,
+            status=0x8000000000000003))["record"]["admission_failure"]
+        self.assertEqual(detail["failure_origin"],"software_rejection")
+        self.assertEqual(detail["predicate_name"],"callback_wrong_processor")
+        normalized=r.decode_percpu_frame(admission_frame(operation=6,predicate=12,item=0xc0010010))["record"]["admission_failure"]
+        self.assertTrue(normalized["operands_normalized"])
+
+    def test_admission_malformed_metadata_is_rejected(self):
+        for change in [dict(operation=0),dict(operation=11),dict(predicate=0),dict(predicate=1<<32),
+                       dict(count=0),dict(count=33),dict(processor=32),dict(processor=30),dict(fault=False)]:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                r.decode_percpu_frame(admission_frame(**change))
+
+    def test_slot_preparation_refusal_binds_stage16_and_17_bank_records(self):
+        # activation.rs stages 16/17: operation 9 (host closure) and 10 (NPT),
+        # address slot<<40 | operation<<32 | predicate, status = source code.
+        def header(stage, reason, slot, operation, predicate, code):
+            words=[0x50414e53,0x02000001,0x89abcdef,0x01234567,0x9abcdef0,0x12345678,
+                   9,3,20 | (8 << 16),predicate,stage | (reason << 8) | (((slot << 8) | operation) << 16),code,0,0,0]
+            raw=struct.pack("<15I", *words)
+            return r.decode_frame((raw+struct.pack("<I", zlib.crc32(raw)))[::-1].hex())
+        decoded=header(16,33,17,9,438,24)
+        observed=decoded["native_resident_observation"]
+        self.assertTrue(observed["encoding_valid"])
+        self.assertEqual((observed["stage_name"],observed["reason_name"]),("host_mapping_closure","host_closure_refusal"))
+        self.assertEqual((observed["processor_slot"],observed["admission_operation_name"]),(17,"host_closure"))
+        self.assertEqual((observed["admission_predicate"],observed["admission_predicate_name"]),(438,"entry_not_present"))
+        self.assertEqual((observed["refusal_code"],observed["refusal_name"]),(24,"host_context_closure"))
+        frame=admission_frame(bank=17,operation=9,predicate=438,processor=17,count=24,status=24,
+            item=0x3f700000,observed=0,expected=0x3f6d4000)
+        bound=r.bind_admission_failure(decoded,r.percpu_snapshots("CPU_SNAPSHOT:"+frame))
+        self.assertEqual((bound["ownership_boundary"],bound["predicate_name"],bound["paging_level"]),
+            ("firmware_preparation","entry_not_present",2))
+        self.assertEqual(bound["original_status_or_code"],"0x0000000000000018")
+        # Another slot's or operation's record is not this refusal.
+        for other in (dict(bank=18,processor=18),dict(operation=10)):
+            frame=admission_frame(**{**dict(bank=17,operation=9,predicate=438,processor=17,count=24),**other})
+            self.assertEqual(r.bind_admission_failure(decoded,r.percpu_snapshots("CPU_SNAPSHOT:"+frame))["status"],
+                "full_record_unavailable")
+        # Stage 17: NPT refused, code 64+16+9 = npt address outside width.
+        observed=header(17,35,3,10,636,89)["native_resident_observation"]
+        self.assertTrue(observed["encoding_valid"])
+        self.assertEqual((observed["reason_name"],observed["admission_operation_name"],observed["admission_predicate_name"]),
+            ("nested_page_table_refusal","nested_page_tables","identity_nested_page_tables"))
+        self.assertEqual(observed["refusal_name"],"npt_address_outside_physical_width")
+        detail=r.decode_percpu_frame(admission_frame(operation=10,predicate=636,expected=89))["record"]["admission_failure"]
+        self.assertEqual((detail["comparison"],detail["refusal_name"]),("source_error_code","npt_address_outside_physical_width"))
+        self.assertEqual(r.slot_refusal_name(34,10),"encryption_bit_encoded")
+        self.assertEqual(r.slot_refusal_name(35,39),"map_unsorted_or_overlapping")
+        self.assertEqual(r.slot_refusal_name(36,21),"address_empty_range")
+        self.assertIsNone(r.slot_refusal_name(33,99))
+        # Malformed shapes stay raw: wrong stage, slot, operation, empty predicate.
+        for stage,reason,slot,operation,predicate in ((19,33,0,9,1),(16,33,32,9,1),(16,34,0,3,1),(17,36,0,10,0)):
+            observed=header(stage,reason,slot,operation,predicate,1)["native_resident_observation"]
+            self.assertFalse(observed["encoding_valid"])
+            self.assertNotIn("processor_slot",observed)
+
+    def test_admission_helper_operands_keep_address_mask_and_pat_roles(self):
+        detail=r.decode_percpu_frame(admission_frame(operation=3,predicate=471,
+            item=0x123456789ab0, observed=0xfedcba9876543210, expected=0xffff800012345000))["record"]["admission_failure"]
+        self.assertEqual(detail["predicate_name"],"reserved_entry")
+        self.assertEqual(detail["paging_level"],4)
+        self.assertEqual(detail["expected_field_role"],"requested_virtual_address")
+        self.assertEqual(detail["expected_or_context"],"0xffff800012345000")
+        unreadable=r.decode_percpu_frame(admission_frame(operation=3,predicate=469,
+            item=0x123456789ab0,observed=0))["record"]["admission_failure"]
+        self.assertIsNone(unreadable["observed"])
+        self.assertFalse(unreadable["observed_value_available"])
+        self.assertEqual(unreadable["register_or_address"],"0x0000123456789ab0")
+        self.assertEqual(unreadable["observed_encoded_placeholder"],"0x0000000000000000")
+        for predicate, comparison in [(109,"forbidden_set_mask"),(114,"selected_pat_and_pat0_must_be_wb"),
+                                      (135,"low8_equality"),(616,"not_equal"),(624,"selected_pat_must_be_wb")]:
+            detail=r.decode_percpu_frame(admission_frame(operation=3,predicate=predicate))["record"]["admission_failure"]
+            self.assertEqual(detail["comparison"],comparison)
+        unknown=r.decode_percpu_frame(admission_frame(operation=3,predicate=0xffffffff))["record"]["admission_failure"]
+        self.assertFalse(unknown["predicate_known"])
+        self.assertEqual(unknown["predicate"],0xffffffff)
+
+    def test_admission_binding_uses_current_boot_and_rejects_conflicting_records(self):
+        header=r.decode_frame(admission_header())
+        def bind(*frames):
+            return r.bind_admission_failure(header,r.percpu_snapshots("\n".join("CPU_SNAPSHOT:"+f for f in frames)))
+        stale=admission_frame(bank=63,boot=8,observed=123)
+        result=bind(admission_frame(),stale)
+        self.assertEqual(result["source_bank_kind"],"last_progress")
+        self.assertEqual(result["matching_record_count"],1)
+        self.assertEqual(bind(admission_frame(bank=63))["source_bank_kind"],"first_fault")
+        self.assertEqual(bind(admission_frame(),admission_frame(bank=63))["matching_record_count"],2)
+        self.assertEqual(bind(admission_frame(),admission_frame(bank=63,observed=123))["status"],"conflicting_full_records")
+        self.assertEqual(bind(admission_frame(),admission_frame(bank=30,processor=30))["status"],"conflicting_full_records")
+        for unavailable in (stale, admission_frame(predicate=8), admission_frame(boot=10)):
+            self.assertEqual(bind(unavailable)["status"],"full_record_unavailable")
+        other=r.decode_percpu_frame(admission_frame());other["fpga_build_id"]="0000000000000000"
+        self.assertEqual(r.bind_admission_failure(header,{"frames":[other]})["status"],"full_record_unavailable")
+        header["native_resident_observation"]["encoding_valid"]=False
+        self.assertIsNone(r.bind_admission_failure(header,{"frames":[]}))
+
+    def test_admission_offline_cli_binds_full_record_to_preparation_refusal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/"capture.log"
+            path.write_text("\n".join(["SNAPSHOT:"+admission_header()]*2+
+                ["CPU_SNAPSHOT:"+admission_frame(),"CPU_SNAPSHOT:"+admission_frame(bank=63,boot=8)]))
+            with mock.patch("sys.argv",["read_snapshot.py","--input",str(path)]), contextlib.redirect_stdout(io.StringIO()) as output:
+                r.main()
+            decoded=json.loads(output.getvalue())
+            self.assertEqual(decoded["processor_admission_failure"]["observed"],"0xfedcba9876543208")
+            self.assertEqual(decoded["native_resident_observation"]["reason_name"],"processor_admission_detail")
+            self.assertFalse(decoded["native_resident_observation"]["all_cpus_activated"])
+
+    def test_raw_boundary_distinguishes_hardware_return_from_handler_stop(self):
+        def captured(event, contexts):
+            words=list(struct.unpack('<32I', bytes.fromhex(frame(53,fault=True))[::-1]))
+            words[9]=0x10100|event
+            for i,value in enumerate(contexts):
+                words[14+i*2]=value & 0xffffffff
+                words[15+i*2]=value >> 32
+            words[26]=0x0754f10d
+            raw=struct.pack('<31I',*words[:31])
+            return r.decode_percpu_frame((raw+struct.pack('<I',zlib.crc32(raw)))[::-1].hex())['record']
+        rip=0xfffff8017e165f9d
+        record=captured(10,[rip,rip+2,rip,0xe0010033,0xc06,0x80010033])
+        self.assertFalse(record['zero_length_at_hardware_return'])
+        self.assertEqual(record['fields']['guest_cr0'],0xe0010033)
+        self.assertEqual(record['fields']['physical_mtrr_def_type'],0xc06)
+        self.assertEqual(record['aux_name'],'stop_reason')
+        self.assertTrue(captured(10,[rip+2,rip+2,rip,0,0,0])['zero_length_at_hardware_return'])
+        identity=captured(11,[0x3fb51000,0x3fa51000,(25<<32)|24,rip,rip+2,rip])
+        self.assertEqual(identity['captured_apic_id'],25)
+        self.assertEqual(identity['assigned_apic_id'],24)
+        self.assertEqual(identity['fields']['expected_vmcb_pa'],0x3fa51000)
+
+    def test_valid_and_empty_banks(self):
+        f=r.decode_percpu_frame(frame(31));self.assertEqual(f["processor_slot"],31)
+        self.assertEqual(f["record"]["contexts"][0],1<<32)
+        self.assertEqual(r.decode_percpu_frame(frame(63,fault=True))["kind"],"first_fault")
+        self.assertIsNone(r.decode_percpu_frame(frame(2,valid=False))["record"])
+    def test_corruption_wrong_build_and_false_sticky_rejected(self):
+        for text in [frame()[:-2]+"00",frame(32)]:
+            with self.assertRaises(ValueError):r.decode_percpu_frame(text)
+        with self.assertRaises(ValueError):r.decode_percpu_frame(frame(),{"fpga_build_id":"0","rom_build_id":"0"})
+    def test_partial_collection_is_explicit(self):
+        result=r.percpu_snapshots("CPU_SNAPSHOT:"+frame(5)+"\nCPU_SNAPSHOT:broken")
+        self.assertEqual(result["rejected_frames"],1)
+        self.assertEqual(len(result["missing_banks"]),63)
+        self.assertFalse(result["all_banks_read"])
+    def test_cpu_evidence_does_not_require_legacy_stable_pair(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/"capture.log";path.write_text("CPU_SNAPSHOT:"+frame(5))
+            with mock.patch("sys.argv",["read_snapshot.py","--input",str(path)]), contextlib.redirect_stdout(io.StringIO()) as output:
+                r.main()
+            result=json.loads(output.getvalue())
+            self.assertIn("legacy_snapshot_error",result)
+            self.assertEqual(result["percpu_diagnostics"]["frames"][0]["processor_slot"],5)
+
+    def test_requested_banks_require_matching_returned_banks(self):
+        result=r.percpu_snapshots("CPU_REQUEST:53\nCPU_SNAPSHOT:"+frame(35,fault=True))
+        self.assertEqual(result["requested_banks"],[53])
+        self.assertEqual(result["unmatched_requested_banks"],[53])
+        self.assertEqual(result["capture_status"],"partial")
+        self.assertEqual(result["frame_count"],1)
+        complete="\n".join("CPU_REQUEST:"+str(b)+"\nCPU_SNAPSHOT:"+frame(b,valid=False) for b in range(64))
+        result=r.percpu_snapshots(complete)
+        self.assertEqual(result["capture_status"],"complete")
+        self.assertEqual(result["unmatched_requested_banks"],[])
+        self.assertTrue(result["all_banks_read"])
+
+    def test_real_rtl_vector(self):
+        vector=Path(__file__).parent/"tests/percpu-record-v1.hex"
+        self.assertEqual(r.decode_percpu_frame(vector.read_text().strip())["record"]["sequence"],5)
+
+if __name__=="__main__":unittest.main()

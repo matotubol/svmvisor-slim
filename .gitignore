@@ -1,0 +1,11 @@
+/target/
+/tmp/
+/xvlog.pb
+/.Xil/
+/work/
+**/__pycache__/
+*.py[cod]
+**/target/
+/.agents/
+# rendered by docs/pdf_index.py
+/docs/*/page_*.png

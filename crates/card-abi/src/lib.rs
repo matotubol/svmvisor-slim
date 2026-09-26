@@ -1,0 +1,22 @@
+//! Wire contract between the card loader, the EFI child it starts, and the
+//! resident runtime.
+//!
+//! The card image envelope, the relocatable package the launcher embeds, the boot
+//! options record the loader hands to a child, the card journal's
+//! record commits, and the admitted terminal endpoint live here. The
+//! crate depends on nothing and knows nothing about UEFI or SVM, so any child
+//! payload can use it.
+
+#![no_std]
+#![forbid(unsafe_op_in_unsafe_fn)]
+
+pub mod batch;
+pub mod boot_options;
+pub mod context;
+pub mod endpoint;
+pub mod entry;
+pub mod envelope;
+pub mod journal;
+pub mod local;
+pub mod package;
+pub mod read_service;

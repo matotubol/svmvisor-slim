@@ -1,0 +1,21 @@
+[workspace]
+members = ["client", "crates/card-abi", "crates/card-loader", "crates/hypervisor", "crates/live-reader", "crates/xtask"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+x86_64 = { version = "0.15.5", default-features = false, features = ["instructions"] }
+
+[profile.release]
+panic = "abort"
+
+# The card has a fixed 4 KiB ROM aperture. Keep this size policy local to the card loader.
+[profile.rom]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

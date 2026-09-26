@@ -1,0 +1,106 @@
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+spec = importlib.util.spec_from_file_location("resident_verify", Path(__file__).resolve().parents[1] / "verify-resident-build.py")
+verify = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verify)
+
+
+class ResidentEvidenceTests(unittest.TestCase):
+    def fixture(self, root):
+        (root / "source").mkdir()
+        (root / "source/input.rs").write_bytes(b"source checkpoint")
+        source = {"input.rs": verify.sha(root / "source/input.rs")}
+        files = {"driver.efi": b"reviewed image", "payload.elf": b"ELF", "payload.reloc": b"reloc",
+                 "source-manifest.json": json.dumps(source).encode(), "disassembly.log": b"audited",
+                 "undefined.log": b"", "boot-audit-disassembly.log": b"boot",
+                 "physical-audit-relocations.log": b"AP",
+                 "symbols.log": b"1000 T entry_uefi\n1020 T svmvisor_minimal_prepare\n1040 T svmvisor_resident_enter\n1060 T svmvisor_local_read_service\n"}
+        for name, data in files.items(): (root / name).write_bytes(data)
+        summary = dict(boot=True, test_output=False, payload_only=False,
+                       no_fp_simd_xstate_instructions=True, undefined_symbols=0,
+                       linked_instruction_count=10,
+                       bootstrap_audit=dict(copied_section_relocations=0, copied_wait_bytes=95),
+                       artifacts={name: verify.sha(root / name) for name in files})
+        (root / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        return summary
+
+    def test_audit_binds_image_artifacts_and_retained_sources(self):
+        for member in ("driver.efi", "payload.elf", "source/input.rs"):
+            with self.subTest(member=member), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); self.fixture(root)
+                result = verify.verify(root, root / "driver.efi", current=False)
+                self.assertFalse(result["physical_execution_proven"])
+                (root / member).write_bytes(b"changed")
+                with self.assertRaises(ValueError): verify.verify(root, root / "driver.efi", current=False)
+
+    def test_diagnostic_and_incomplete_audits_are_refused(self):
+        for field, value in (("boot", False), ("test_output", True), ("undefined_symbols", 1)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); summary = self.fixture(root)
+                summary[field] = value
+                (root / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+                with self.assertRaises(ValueError): verify.verify(root, root / "driver.efi", current=False)
+
+    def test_traversal_manifest_member_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); summary = self.fixture(root)
+            summary["artifacts"]["../outside"] = "0" * 64
+            (root / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            with self.assertRaises(ValueError): verify.verify(root, root / "driver.efi", current=False)
+
+    def test_current_source_check_uses_cargo_xtask_sources(self):
+        # current=True compares the audited source-manifest against the manifest
+        # `cargo xtask sources` prints; stub it instead of invoking cargo.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); self.fixture(root)
+            source = json.loads((root / "source-manifest.json").read_text())
+            original = verify.current_sources
+            try:
+                verify.current_sources = lambda *a, **k: source
+                result = verify.verify(root, root / "driver.efi", current=True)
+                self.assertEqual(result["status"], "verified")
+                verify.current_sources = lambda *a, **k: {**source, "input.rs": "0" * 64}
+                with self.assertRaises(ValueError): verify.verify(root, root / "driver.efi", current=True)
+            finally:
+                verify.current_sources = original
+
+    def test_minimal_rejects_missing_or_forbidden_linked_symbols(self):
+        required = ("entry_uefi", "svmvisor_minimal_prepare", "svmvisor_resident_enter",
+                    "svmvisor_local_read_service")
+        forbidden = ("svmvisor_minimal_enter", "svmvisor_minimal_stop", "svmvisor_minimal_halt")
+        for name in required + forbidden:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); summary = self.fixture(root)
+                symbols = (root / "symbols.log").read_text()
+                if name in required:
+                    symbols = "\n".join(line for line in symbols.splitlines() if line.split()[-1] != name)
+                else:
+                    symbols += "\n00001000 T " + name
+                (root / "symbols.log").write_text(symbols, encoding="utf-8")
+                summary["artifacts"]["symbols.log"] = verify.sha(root / "symbols.log")
+                (root / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "linked"):
+                    verify.verify(root, root / "driver.efi", current=False)
+
+    def test_link_evidence_must_be_a_manifest_member(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); summary = self.fixture(root)
+            del summary["artifacts"]["symbols.log"]
+            (root / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "incomplete artifact"):
+                verify.verify(root, root / "driver.efi", current=False)
+
+    def test_link_evidence_is_hash_bound(self):
+        for name in ("symbols.log",):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp); self.fixture(root)
+                (root / name).write_bytes(b"changed")
+                with self.assertRaisesRegex(ValueError, "build artifact changed"):
+                    verify.verify(root, root / "driver.efi", current=False)
+
+
+if __name__ == "__main__": unittest.main()
