@@ -11,7 +11,8 @@ use svmvisor_card_abi::endpoint::TerminalEndpoint;
 use crate::{
     arch::x86_64::{
         capabilities::{
-            CapabilityEvidence, CpuVendor, EvidenceFlag, OptionalFeatures, ValidatedCapabilities,
+            CapabilityEvidence, CpuVendor, EXTENDED_PERFORMANCE_LEAF, EvidenceFlag,
+            OptionalFeatures, ValidatedCapabilities,
         },
         encryption::NativeEncryptionPlan,
         msr::{
@@ -334,7 +335,7 @@ unsafe extern "win64" fn arm(
         if efer & crate::arch::x86_64::msr::EFER_SVME != 0 {
             return 3;
         }
-        if !super::minimal::valid(vmcb) {
+        if !super::minimal::valid_intercepts(vmcb) {
             return 5;
         }
         let Ok(owner) = crate::svm::vmcr::VisibleVmCr::admit(unsafe { read_msr(VM_CR) }) else {
@@ -395,6 +396,21 @@ unsafe extern "win64" fn arm(
         || vmcb.enable_native_nested_paging(&policy).is_err()
     {
         return 5;
+    }
+    // All recording features remain native. The nonreturning entry freezes and
+    // captures their current registers into this VMCB before its first VMRUN.
+    // Refuse unsupported stack geometry before touching either physical control.
+    if maximum_extended_leaf < EXTENDED_PERFORMANCE_LEAF {
+        return 2;
+    }
+    let performance = __cpuid_count(EXTENDED_PERFORMANCE_LEAF, 0);
+    if !vmcb.configure_native_lbr(
+        maximum_extended_leaf,
+        __cpuid_count(0x8000_000a, 0).edx,
+        performance.eax,
+        performance.ebx,
+    ) {
+        return 2;
     }
     if !startup_owned || id_count < 2 {
         return 9;

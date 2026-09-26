@@ -12,6 +12,12 @@ pub(crate) use self::windows::NativeTransport;
 mod windows;
 
 pub(crate) trait Exchange {
+    /// Actual transport instructions issued, when this backend records them.
+    /// Logical requests can need several SUBMIT/STEP calls.
+    fn hypercalls(&self) -> Option<u64> {
+        None
+    }
+
     fn exchange(
         &mut self,
         request: &[u8; REQUEST_BYTES],

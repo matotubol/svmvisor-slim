@@ -127,6 +127,10 @@ impl ReadBridge {
         self.calls
     }
 
+    pub(crate) fn hypercalls(&self) -> Option<u64> {
+        self.transport.hypercalls()
+    }
+
     pub(crate) fn failed(&self) -> bool {
         self.failed
     }
@@ -271,18 +275,23 @@ impl ReadBridge {
         self.calls += 1;
         self.sequence = request.sequence;
         let deadline = self.response_deadline()?;
-        let bytes = self.transport.exchange(&encoded, deadline)?;
+        let mut bytes = self.transport.exchange(&encoded, deadline)?;
         self.finish_phase()?;
         if Instant::now() >= deadline {
             return Err("response deadline reached; discarded".into());
         }
         let (boot, token, data) = decode_response(&bytes, request)?;
+        let length = data.len();
+        // Reuse the transport's allocation after validating the complete response. Keep the
+        // public staging contract without allocating another data vector for each request.
+        bytes.copy_within(HEADER_BYTES..HEADER_BYTES + length, 0);
+        bytes.truncate(length);
         self.boot = boot;
-        Ok((token, data))
+        Ok((token, bytes))
     }
 }
 
-fn decode_response(bytes: &[u8], request: BatchRequest) -> Result<(u64, u64, Vec<u8>), Failure> {
+fn decode_response(bytes: &[u8], request: BatchRequest) -> Result<(u64, u64, &[u8]), Failure> {
     if !(HEADER_BYTES + 4..=MAX_RESPONSE_BYTES).contains(&bytes.len()) || bytes.len() % 4 != 0 {
         return Err("invalid response length".into());
     }
@@ -319,9 +328,15 @@ fn decode_response(bytes: &[u8], request: BatchRequest) -> Result<(u64, u64, Vec
     match word(40) {
         0 => {}
         status if status == Status::Read as u32 && request.operation == Operation::Sample => {
+            if length != 0 || token != request.token {
+                return Err("invalid recoverable read refusal".into());
+            }
             return Err(Failure::Unreadable);
         }
         status if status == Status::Binding as u32 && request.operation == Operation::Sample => {
+            if length != 0 || token != 0 {
+                return Err("invalid recoverable binding refusal".into());
+            }
             return Err(Failure::Unbound);
         }
         status => {
@@ -337,7 +352,7 @@ fn decode_response(bytes: &[u8], request: BatchRequest) -> Result<(u64, u64, Vec
     {
         return Err("response token or data length mismatch".into());
     }
-    Ok((boot, token, bytes[HEADER_BYTES..HEADER_BYTES + length].to_vec()))
+    Ok((boot, token, &bytes[HEADER_BYTES..HEADER_BYTES + length]))
 }
 
 #[cfg(test)]
@@ -557,7 +572,7 @@ mod tests {
         let mut output = [0; MAX_RESPONSE_BYTES];
         let length =
             batch::encode_response(request, 7, 0, Status::Success, &[], &mut output).unwrap();
-        assert_eq!(decode_response(&output[..length], request).unwrap(), (7, 0, Vec::new()));
+        assert_eq!(decode_response(&output[..length], request).unwrap(), (7, 0, &[][..]));
         for token in [1u64, 9, u64::MAX] {
             output[32..40].copy_from_slice(&token.to_le_bytes());
             let crc = batch::crc32(&output[..length - 4]);
@@ -625,7 +640,9 @@ mod tests {
         request.ranges[0] = BatchRange { address: 0x1000, length: 3 };
         let refusal = |request: BatchRequest, status| {
             let mut output = [0; MAX_RESPONSE_BYTES];
-            let length = batch::encode_response(request, 7, 9, status, &[], &mut output).unwrap();
+            let token = if status == Status::Binding { 0 } else { request.token };
+            let length =
+                batch::encode_response(request, 7, token, status, &[], &mut output).unwrap();
             decode_response(&output[..length], request).unwrap_err()
         };
         assert_eq!(refusal(request, Status::Read), Failure::Unreadable);
@@ -635,6 +652,58 @@ mod tests {
         }
         request.operation = Operation::Physical;
         assert!(matches!(refusal(request, Status::Read), Failure::Fatal(_)));
+    }
+
+    #[test]
+    fn malformed_recoverable_refusals_are_fatal_even_with_valid_crc() {
+        let mut request = BatchRequest {
+            operation: Operation::Sample,
+            session: 11,
+            boot: 7,
+            sequence: 3,
+            token: 9,
+            count: 1,
+            ranges: [BatchRange::EMPTY; MAX_RANGES],
+            binding: BindingEvidence::EMPTY,
+        };
+        request.ranges[0] = BatchRange { address: 0x1000, length: 8 };
+        for (status, valid_token) in [(Status::Read, 9), (Status::Binding, 0)] {
+            for token in [0, 9, 10] {
+                for data in [&[][..], &[0xa5][..], &[0xa5; 8][..]] {
+                    let mut output = [0; MAX_RESPONSE_BYTES];
+                    // The encoder correctly forbids error payloads. Construct the malformed
+                    // wire response explicitly, retaining a valid frame and checksum.
+                    let length = batch::encode_response(
+                        request,
+                        7,
+                        token,
+                        Status::Success,
+                        data,
+                        &mut output,
+                    )
+                    .unwrap();
+                    output[40..44].copy_from_slice(&(status as u32).to_le_bytes());
+                    let crc = batch::crc32(&output[..length - 4]);
+                    output[length - 4..length].copy_from_slice(&crc.to_le_bytes());
+                    let failure = decode_response(&output[..length], request).unwrap_err();
+                    if token == valid_token && data.is_empty() {
+                        assert_eq!(
+                            failure,
+                            if status == Status::Read {
+                                Failure::Unreadable
+                            } else {
+                                Failure::Unbound
+                            }
+                        );
+                    } else {
+                        assert!(
+                            matches!(failure, Failure::Fatal(_)),
+                            "{status:?}, {token}, {data:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

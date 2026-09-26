@@ -8,6 +8,10 @@ pub const MAX_RANGES: usize = 8;
 pub const MAX_DATA_BYTES: usize = 4096;
 pub const MAX_RESPONSE_BYTES: usize = HEADER_BYTES + MAX_DATA_BYTES + 4;
 
+// IEEE CRC-32 in reflected byte order. Generated at compile time; the resident
+// uses one scalar table lookup per byte with no CPU feature or SIMD dependency.
+const CRC32_TABLE: [u32; 256] = crc32_table();
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchRequest {
     pub operation: Operation,
@@ -259,12 +263,25 @@ pub fn encode_response(
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
     for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
-        }
+        crc = (crc >> 8) ^ CRC32_TABLE[((crc as u8) ^ byte) as usize];
     }
     !crc
+}
+
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0; 256];
+    let mut index = 0;
+    while index < table.len() {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+    }
+    table
 }
 
 fn word(bytes: &[u8], offset: usize) -> u32 {
@@ -310,6 +327,41 @@ mod tests {
         let mut bytes = request.encode();
         bytes[100] ^= 1;
         assert_eq!(BatchRequest::decode(&bytes), Err(FrameError::Checksum));
+    }
+
+    #[test]
+    fn crc_matches_independent_wire_length_and_unaligned_vectors() {
+        // Python zlib.crc32 over bytes((i * 73 + 19) & 255 for i in range(4168)).
+        // Covers every byte value, request/response sizes and unaligned slices.
+        let data: [u8; 4168] = core::array::from_fn(|index| (index * 73 + 19) as u8);
+        for (length, expected) in [
+            (0, 0),
+            (1, 0x56bc_ae53),
+            (3, 0x5193_8104),
+            (4, 0x928c_776a),
+            (7, 0xc66e_a606),
+            (8, 0xc81e_5556),
+            (64, 0x96af_c5a6),
+            (252, 0xc7f7_5f01),
+            (256, 0x5da8_967f),
+            (4160, 0xe419_c2ff),
+        ] {
+            assert_eq!(crc32(&data[..length]), expected, "length={length}");
+        }
+        for (offset, expected) in [
+            0x7719_bc29,
+            0xb21c_980b,
+            0x77c0_ae6b,
+            0x7a59_839d,
+            0x0571_3f15,
+            0x105c_4cff,
+            0x88a4_18c0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(crc32(&data[offset + 1..offset + 4161]), expected);
+        }
     }
 
     #[test]

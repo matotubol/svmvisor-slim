@@ -15,8 +15,9 @@ use crate::{
     svm::{
         permission_maps::{MsrAccess, Permission},
         startup::{
-            NativeStartupEffect, NativeStartupMailbox, NativeStartupState, NativeStartupTarget,
-            ROUTE_WAIT_ATTEMPTS, guest_started_all_application_processors, lock_routes_within,
+            NativeIcr, NativeIcrError, NativeStartupEffect, NativeStartupMailbox,
+            NativeStartupState, NativeStartupTarget, ROUTE_WAIT_ATTEMPTS,
+            guest_started_all_application_processors, lock_routes_within,
         },
         vmcb::Vmcb,
     },
@@ -195,15 +196,42 @@ pub(super) unsafe fn mailboxes(count: usize) -> &'static [NativeStartupMailbox] 
         )
     }
 }
-pub(super) unsafe fn notify_native_startup() {
-    unsafe { send_native_notification() };
+
+/// Keep the routed target through the native adapter. The callback is invoked
+/// only after successful mailbox publication, with the physical wake's ICR.
+pub(super) fn route_native_startup(
+    icr: &mut NativeIcr,
+    value: u64,
+    mailboxes: &[NativeStartupMailbox],
+    send: impl FnOnce(u64),
+) -> Result<(), NativeIcrError> {
+    icr.route_startup_write(value, mailboxes, |destination| {
+        send(apic::init_notification_icr(destination));
+    })
 }
-pub(super) unsafe fn send_native_notification() {
+
+/// # Safety
+/// The owning stopped CPU has IF/GIF clear and admitted x2APIC enabled. `icr`
+/// comes from `init_notification_icr` for admitted peer mailboxes whose hosts
+/// own R_INIT redirection. Their request is fully published before this call.
+pub(super) unsafe fn send_startup_notification(icr: u64) {
+    // SAFETY: the caller owns this x2APIC and supplies an admitted private INIT;
+    // the fence orders the published request before the physical notification.
     unsafe {
         asm!("mfence", options(nostack, preserves_flags));
-        write_msr(apic::ICR_MSR, 0x000c_0500);
+        write_msr(apic::ICR_MSR, icr);
     }
 }
+
+/// # Safety
+/// Same ownership as `send_startup_notification`; all admitted peers must
+/// participate in the already-published cache or terminal rendezvous.
+pub(super) unsafe fn send_native_notification() {
+    // SAFETY: the caller established the peer rendezvous; the encoder selects
+    // the existing all-excluding-self physical INIT notification.
+    unsafe { send_startup_notification(apic::init_notification_icr(u32::MAX)) };
+}
+
 fn startup_stop(state: &mut State, vmcb: &Vmcb, stage: StartupStage) -> Option<bool> {
     let exit = vmcb.exit_snapshot();
     let (tag, value) = terminal::startup_failure(
@@ -239,5 +267,31 @@ unsafe extern "C" fn svmvisor_resident_reset_guest_debug() {
             out("rax") _,
             options(nostack),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_startup_adapter_passes_the_selected_wake_to_its_writer() {
+        let ids = [0x102, 0x25, 0x27, 0x8abc_0f07];
+        for (guest_icr, expected) in [
+            (0x8abc_0f07_0000_0630, 0x8abc_0f07_0000_0500),
+            (0x0002_0020_0000_0d00, 0x0000_0025_0000_0500),
+            (0x0002_00a0_0000_0d00, 0x0000_0000_000c_0500),
+            (0x0000_0000_000c_0500, 0x0000_0000_000c_0500),
+        ] {
+            let mailboxes = ids.map(NativeStartupMailbox::new);
+            for mailbox in &mailboxes {
+                mailbox.mark_running();
+            }
+            let mut source = NativeIcr::admit(ids[0], &ids).unwrap();
+            let mut written = None;
+            route_native_startup(&mut source, guest_icr, &mailboxes, |icr| written = Some(icr))
+                .unwrap();
+            assert_eq!(written, Some(expected));
+        }
     }
 }

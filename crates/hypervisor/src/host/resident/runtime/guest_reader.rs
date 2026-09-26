@@ -114,8 +114,8 @@ impl GuestReader {
         }
     }
 
-    /// Copy one nonempty page fragment from independently identified host physical RAM.
-    /// The opt-in caller establishes the GPA-to-HPA relation; this method never assumes identity.
+    /// Copy one nonempty page fragment from admitted identity-mapped guest RAM. The actual
+    /// access independently verifies the GPA-to-HPA relation against this owner's private NPT.
     /// Low memory is refused, avoiding the fixed-MTRR routing-control path entirely.
     /// All admission precedes the alias and every byte is staged until the alias is removed.
     ///
@@ -488,20 +488,19 @@ mod tests {
         pcid: false,
         page1gb: true,
     };
-    static NESTED_TABLES: [[u8; PAGE_BYTES]; 2] = {
-        let mut tables = [[0; PAGE_BYTES]; 2];
-        let root = (NESTED_ROOT + PAGE_BYTES as u64 | 7).to_le_bytes();
-        let leaf = 0x87u64.to_le_bytes();
-        let mut byte = 0;
-        while byte < 8 {
-            tables[0][byte] = root[byte];
-            tables[1][byte] = leaf[byte];
-            byte += 1;
-        }
-        tables
-    };
     const RAM_START: u64 = 0x0020_0000;
     const MONITOR_START: u64 = RAM_START + PAGE_BYTES as u64;
+
+    static NESTED_TABLES: [[u8; PAGE_BYTES]; 2] = nested_tables(0x87);
+    static DENIED_NESTED_TABLES: [[[u8; PAGE_BYTES]; 2]; 6] = [
+        nested_tables(0),
+        nested_tables((0x87 & !1) | (1 << 10)),
+        nested_tables(0x8f),
+        nested_tables(0x83),
+        nested_tables(0x87 | NX),
+        nested_tables(0x4000_0087),
+    ];
+    static READ_ONLY_NESTED_TABLES: [[u8; PAGE_BYTES]; 2] = nested_tables(0x85);
     static DESCRIPTORS: [MemoryDescriptor; 4] = [
         MemoryDescriptor {
             memory_type: 7,
@@ -528,6 +527,19 @@ mod tests {
             attributes: 0x2008,
         },
     ];
+
+    const fn nested_tables(leaf: u64) -> [[u8; PAGE_BYTES]; 2] {
+        let mut tables = [[0; PAGE_BYTES]; 2];
+        let root = (NESTED_ROOT + PAGE_BYTES as u64 | 7).to_le_bytes();
+        let leaf = leaf.to_le_bytes();
+        let mut byte = 0;
+        while byte < 8 {
+            tables[0][byte] = root[byte];
+            tables[1][byte] = leaf[byte];
+            byte += 1;
+        }
+        tables
+    }
 
     fn reader(default: u64) -> GuestReader {
         let policy =
@@ -622,19 +634,30 @@ mod tests {
 
     #[test]
     fn every_scratch_access_refuses_denied_npt_before_privileged_work() {
-        let mut reader = reader(DEF_TYPE_E | 6);
-        reader.tables = &[];
-        assert!(!reader.permits_output(RAM_START, 8));
-        // SAFETY: RAM and physical WB pass, but owned-NPT admission fails before any
-        // privileged instruction or alias is reached. No guest execution is modeled.
-        unsafe {
-            assert!(reader.read(RAM_START, 1).is_none());
-            assert!(reader.read(RAM_START, 8).is_none());
-            let mut output = [0xa5; 8];
-            assert!(reader.copy(RAM_START, &mut output).is_err());
-            assert_eq!(output, [0xa5; 8]);
-            assert!(reader.copy_to(RAM_START, &[0x55; 8]).is_err());
+        for tables in
+            core::iter::once(&[][..]).chain(DENIED_NESTED_TABLES.iter().map(|tables| &tables[..]))
+        {
+            let mut reader = reader(DEF_TYPE_E | 6);
+            reader.tables = tables;
+            assert!(!reader.permits_output(RAM_START, 8));
+            // SAFETY: RAM and physical WB pass, but owned-NPT admission fails before any
+            // privileged instruction or alias is reached. No guest execution is modeled.
+            unsafe {
+                assert!(reader.read(RAM_START, 1).is_none());
+                assert!(reader.read(RAM_START, 8).is_none());
+                let mut output = [0xa5; 8];
+                assert!(reader.copy(RAM_START, &mut output).is_err());
+                assert_eq!(output, [0xa5; 8]);
+                assert!(reader.copy_to(RAM_START, &[0x55; 8]).is_err());
+            }
+            assert!(reader.failure == Some(terminal::FetchReadFailure::RamAdmission));
         }
+        let mut reader = reader(DEF_TYPE_E | 6);
+        reader.tables = &READ_ONLY_NESTED_TABLES;
+        assert!(!reader.permits_output(RAM_START, 8));
+        // SAFETY: a present identity read-only leaf must also be refused by the actual
+        // write barrier independently of output preflight, before aliasing or hardware.
+        assert!(unsafe { reader.copy_to(RAM_START, &[0x55; 8]) }.is_err());
         assert!(reader.failure == Some(terminal::FetchReadFailure::RamAdmission));
     }
 

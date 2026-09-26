@@ -28,6 +28,7 @@ use crate::{
 
 pub const VM_HSAVE_PA: u32 = 0xc001_0117;
 pub const SVM_LOCK_KEY: u32 = 0xc001_0118;
+pub const SMM_BASE: u32 = 0xc001_0111;
 pub const SMM_ADDR: u32 = 0xc001_0112;
 pub const SMM_MASK: u32 = 0xc001_0113;
 

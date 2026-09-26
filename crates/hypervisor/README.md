@@ -12,6 +12,12 @@ processors can restart without destroying their resident host. It intercepts the
 x2APIC ICR for startup routing; other IPI writes are forwarded to hardware. An NMI
 caught in a host INIT-acknowledgment window is deferred into guest EVENTINJ.
 
+Directed startup commands now send their private INIT wake only to the selected
+physical CPU. Multiple destinations and cache/terminal rendezvous retain broadcast
+wakes. Readable firmware SMM_BASE, SMMAddr and SMMMask registers run natively;
+their writes remain intercepted. See the [manual-backed VM-exit review](VMEXIT-REVIEW.md)
+for the reviewed policy, changes and remaining architectural limits.
+
 The PCI card terminal remains, including its configuration lifetime checks.
 Legacy physical-mailbox polling has been removed. Guest SYS_CFG bit19 visibility
 is per-thread; it does not change the physical host's routing or memory types.
@@ -40,7 +46,7 @@ Runtime NPTs have 64 pages each; a staged update that exceeds that capacity is
 refused without installing a partial map. Ordinary memory-reader admission remains
 restricted to its existing WB-memory contract.
 
-The [local batch reader](../../LOCAL-READ.md) adds a user-mode VMMCALL interface
+The [local batch reader](../live-reader/README.md) adds a user-mode VMMCALL interface
 after startup acknowledgement. It reads through the caller's buffers and performs
 target translation and process revalidation in the resident runtime. CPUID remains
 unintercepted. The new local calls bypass routine PCI diagnostic/mailbox traffic.
@@ -63,6 +69,10 @@ The resident reuses reviewed VMCB cached groups only after a successful entry on
 the same CPU and VMCB page. Typed writes invalidate their own group, permission
 map edits invalidate the map group, and unknown changes, initial entry or lost
 ownership invalidate everything. VMLOAD/VMSAVE still switch auxiliary state.
+LBR virtualization separately preserves guest branch controls and records. Native
+entry captures the existing records and disables host recording before hardware
+takes over their guest save/restore; admission requires the target's sixteen-entry
+branch stack. The LBR clean group remains dirty.
 Physical CPU/cache diagnostic sampling runs only for SYS_CFG MSR exits; the
 linked-image audit checks that selection precedes CPUID and physical RDMSR.
 

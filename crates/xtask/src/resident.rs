@@ -241,6 +241,7 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
     )?;
     let debug_reset_audit = audit::audit_debug_reset(&text)?;
     let entry_capture_audit = audit::audit_entry_capture(&text)?;
+    let lbr_capture_audit = audit::audit_lbr_capture(&text)?;
     let tsc_ratio_audit = audit::audit_tsc_ratio_init(&text)?;
     let msr_capture_audit = audit::audit_msr_capture(&text)?;
     let host_fault_audit = audit::audit_host_fault(&text)?;
@@ -337,6 +338,7 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
         ("bootstrap_audit".into(), bootstrap_audit),
         ("debug_reset_audit".into(), debug_reset_audit),
         ("entry_capture_audit".into(), entry_capture_audit),
+        ("lbr_capture_audit".into(), lbr_capture_audit),
         ("tsc_ratio_audit".into(), tsc_ratio_audit),
         ("msr_capture_audit".into(), msr_capture_audit),
         ("host_fault_audit".into(), host_fault_audit),

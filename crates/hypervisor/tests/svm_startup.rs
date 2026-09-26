@@ -1,5 +1,5 @@
 use svmvisor_hypervisor::{
-    arch::x86_64::registers::GuestRegisters,
+    arch::x86_64::{apic::init_notification_icr, registers::GuestRegisters},
     svm::{
         startup::{
             NativeDestinationMode, NativeIcr, NativeStartupCommand as Command,
@@ -92,4 +92,68 @@ fn a_single_cpu_never_completes_guest_startup() {
     let mailboxes = [Mailbox::new(0)];
     assert!(!guest_started_all_application_processors(&mailboxes));
     assert!(!guest_started_all_application_processors(&[]));
+}
+
+#[test]
+fn startup_notification_retains_selected_physical_destination_and_published_queue() {
+    // Firmware ordinals, physical IDs and logical destination bits differ.
+    let ids = [0x102, 0, 0x25, 0x27, 0x8abc_0f07];
+    for (guest_icr, expected_wake, selected, command) in [
+        (0x0000_0000_0000_0500, 0x0000_0000_0000_0500, 0b00010, Command::Init),
+        (0x8abc_0f07_0000_0622, 0x8abc_0f07_0000_0500, 0b10000, Command::Sipi(0x22)),
+        // Logical cluster 2, bit 5 selects physical ID 25h only.
+        (0x0002_0020_0000_0d00, 0x0000_0025_0000_0500, 0b00100, Command::Init),
+        // Logical cluster 2, bits 5 and 7 retain a broadcast private wake.
+        (0x0002_00a0_0000_0e30, 0x0000_0000_000c_0500, 0b01100, Command::Sipi(0x30)),
+        (0x0000_0000_000c_4500, 0x0000_0000_000c_0500, 0b11110, Command::Init),
+        (0x0000_0000_000c_0640, 0x0000_0000_000c_0500, 0b11110, Command::Sipi(0x40)),
+    ] {
+        let mailboxes = ids.map(Mailbox::new);
+        ready(&mailboxes);
+        let mut source = NativeIcr::admit(ids[0], &ids).unwrap();
+        let mut wake = None;
+        source
+            .route_startup_write(guest_icr, &mailboxes, |destination| {
+                // This is the encoder used by the native notification writer.
+                wake = Some(init_notification_icr(destination));
+                // Notification must follow complete publication and release its lock.
+                let _routes = try_lock_routes(&mailboxes).unwrap();
+                for (slot, mailbox) in mailboxes.iter().enumerate() {
+                    assert_eq!(mailbox.peek(), (selected & (1 << slot) != 0).then_some(command));
+                }
+            })
+            .unwrap();
+        assert_eq!(wake, Some(expected_wake), "guest ICR {guest_icr:#x}");
+    }
+}
+
+#[test]
+fn startup_refusals_and_deassert_do_not_emit_a_notification() {
+    let ids = [0x25, 0x102];
+    for guest_icr in [
+        0x0000_0025_0000_0500, // Physical self.
+        0x0002_0020_0000_0d00, // Logical self.
+        0x0000_0000_0004_0500, // Self shorthand.
+        0x0000_0000_0008_0500, // All including self shorthand.
+        0xffff_ffff_0000_0500, // Physical all including self.
+    ] {
+        let mailboxes = ids.map(Mailbox::new);
+        ready(&mailboxes);
+        let mut source = NativeIcr::admit(ids[0], &ids).unwrap();
+        assert!(
+            source
+                .route_startup_write(guest_icr, &mailboxes, |_| panic!("unexpected wake"))
+                .is_err()
+        );
+        assert!(mailboxes.iter().all(|mailbox| mailbox.peek().is_none()));
+    }
+    let mailboxes = ids.map(Mailbox::new);
+    ready(&mailboxes);
+    let mut source = NativeIcr::admit(ids[0], &ids).unwrap();
+    source
+        .route_startup_write(0x0000_0102_0000_8500, &mailboxes, |_| panic!("deassert wake"))
+        .unwrap();
+    assert!(mailboxes.iter().all(|mailbox| mailbox.peek().is_none()));
+    // Cache and terminal rendezvous retain their exact existing broadcast.
+    assert_eq!(init_notification_icr(u32::MAX), 0x000c_0500);
 }

@@ -14,7 +14,7 @@ use crate::{
             guest_reader::fetch_instruction,
             image_base,
             msr::{read_msr, write_msr},
-            startup::{acknowledge_init, notify_native_startup},
+            startup::{acknowledge_init, send_native_notification},
             stop::{stop, terminal_requested},
         },
     },
@@ -467,8 +467,10 @@ pub(super) unsafe fn handle(
             memory.departed.store(0, Ordering::Relaxed);
             memory.phase.store(1, Ordering::Release);
             drop(owner);
+            // SAFETY: this stopped x2APIC owner published the cache rendezvous;
+            // every admitted peer owns R_INIT redirection for the broadcast wake.
             unsafe {
-                notify_native_startup();
+                send_native_notification();
             }
             if !unsafe { service(state, vmcb) } {
                 return false;

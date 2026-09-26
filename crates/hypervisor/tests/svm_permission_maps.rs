@@ -179,6 +179,33 @@ fn native_boot_protects_vmcr_hsave_and_scaling_at_architectural_slots() {
 }
 
 #[test]
+fn native_boot_allows_only_smram_configuration_reads_in_the_protected_block() {
+    let map = Msrpm::native_boot();
+    // Independent full-map byte fixture: APM2 physical p580, Table 15-8.
+    // The protected C00101xx block is FF except OSVW and the three readable
+    // SMRAM controls (57896-3.00_PPR physical pp213-215). Byte 1044h covers
+    // C0010110..113: clear read bits 2/4/6, retaining every write and 110h.
+    let mut expected = [0; MSRPM_BYTES];
+    expected[0x1800..].fill(0xff);
+    expected[0x1040..0x1080].fill(0xff);
+    expected[0x1044] = 0xab;
+    expected[0x1050] = 0xf0; // OSVW length/status retain native reads and writes.
+    expected[0x0820] = 0x03; // EFER.
+    expected[0x0841] = 0x03; // TSC_RATIO.
+    expected[0x003f] = 0x30; // MTRR_CAP.
+    expected[0x0080..0x0084].fill(0xff); // Variable MTRRs.
+    expected[0x0094] = 0x03; // Fixed MTRR 250h.
+    expected[0x0096] = 0x0f; // Fixed MTRRs 258h/259h.
+    expected[0x009a..0x009c].fill(0xff); // Fixed MTRRs 268h..26Fh.
+    expected[0x00bf] = 0xc0; // MTRR_DEF_TYPE.
+    expected[0x1004] = 0x03; // SYS_CFG.
+    expected[0x1005] = 0xf0; // IORR 16h/17h.
+    expected[0x1006] = 0x3f; // IORR 18h/19h and TOP_MEM.
+    expected[0x1007] = 0x0c; // TOM2.
+    assert_eq!(map.bytes(), &expected);
+}
+
+#[test]
 fn unsupported_msrs_cannot_alias_a_valid_range_or_reserved_storage() {
     let mut map = Msrpm::new();
     map.set(0x1fff, MsrAccess::Read, Permission::Allow).unwrap();

@@ -6,6 +6,8 @@
 
 use crate::memory::address::{AddressError, AddressPolicy, EncryptionState};
 
+pub(crate) const EXTENDED_PERFORMANCE_LEAF: u32 = 0x8000_0022;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CapabilityEvidence {
     pub vendor: CpuVendor,

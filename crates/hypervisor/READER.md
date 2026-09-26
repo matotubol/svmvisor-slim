@@ -1,6 +1,6 @@
 # Supplied-image memory reader
 
-The resident now also uses the bounded [local VMMCALL batch interface](../../LOCAL-READ.md)
+The resident now also uses the bounded [local VMMCALL batch interface](../live-reader/README.md)
 for same-PC process reads. The image-reader APIs below remain useful for offline
 captures and initial client-side discovery; repeated live samples execute in the
 resident batch engine.

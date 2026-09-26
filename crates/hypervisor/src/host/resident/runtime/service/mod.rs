@@ -8,10 +8,7 @@ use svmvisor_card_abi::batch::MAX_RESPONSE_BYTES;
 use crate::{
     host::{
         paging::{self, PagingConfig},
-        resident::runtime::{
-            NPT, State,
-            guest_reader::{GuestReader, nested_fragment},
-        },
+        resident::runtime::{NPT, State, guest_reader::GuestReader},
     },
     memory::address::PAGE_BYTES,
     reader::paging::PagingError,
@@ -25,8 +22,6 @@ mod tests;
 pub(super) struct LocalMemory {
     reader: GuestReader,
     guest: PagingConfig,
-    nested: PagingConfig,
-    tables: &'static [[u8; PAGE_BYTES]],
 }
 
 impl LocalMemory {
@@ -59,10 +54,7 @@ impl LocalMemory {
             pcid: cr4 & (1 << 17) != 0,
             page1gb: true,
         };
-        let nested = PagingConfig { cr3: root, pcid: false, nxe: true, ..guest };
-        // SAFETY: private NPT storage cannot change while this CPU remains stopped.
-        let tables = unsafe { &(*ptr::addr_of!(NPT)).0 };
-        Ok(Self { reader, guest, nested, tables })
+        Ok(Self { reader, guest })
     }
 
     pub(super) fn width(&self) -> u8 {
@@ -73,12 +65,13 @@ impl LocalMemory {
         if output.is_empty()
             || output.len() > PAGE_BYTES
             || (gpa as usize & (PAGE_BYTES - 1)) + output.len() > PAGE_BYTES
-            || !identity_fragment(self.nested, self.tables, gpa, output.len())
         {
             return Err(PagingError::PhysicalRead);
         }
-        // SAFETY: adapter retains stopped ownership; owned NPT proved identity, and copy
-        // independently admits RAM/cache/monitor exclusion and removes its alias before return.
+        // SAFETY: adapter retains stopped ownership. copy admits the entire backing page
+        // against the same owned NPT (identity/permissions/cache type), RAM, physical WB and
+        // monitor exclusion before creating its alias, and removes the alias before return.
+        // A second fragment walk here would repeat a subset of that immutable-NPT proof.
         unsafe { self.reader.copy(gpa, output) }.map_err(|_| PagingError::PhysicalRead)
     }
 
@@ -106,10 +99,9 @@ impl LocalMemory {
             va,
             source,
             |memory, address| memory.user_address(address, true),
-            |memory, physical, length| {
-                memory.reader.permits_output(physical, length)
-                    && writable_fragment(memory.nested, memory.tables, physical, length)
-            },
+            // permits_output includes the full-page writable identity-NPT proof. copy_to
+            // independently repeats admission at the actual write after the caller rewalk.
+            |memory, physical, length| memory.reader.permits_output(physical, length),
             |memory, physical, bytes| {
                 // SAFETY: current caller's complete range was admitted; this page was rewalked as
                 // writable user memory. Client retains allocations until return. copy_to rechecks
@@ -214,22 +206,4 @@ fn user_translation(
         return Err(());
     }
     Ok(translation.physical_address)
-}
-
-fn identity_fragment(
-    config: PagingConfig,
-    tables: &[[u8; PAGE_BYTES]],
-    gpa: u64,
-    length: usize,
-) -> bool {
-    nested_fragment(config, tables, gpa, length, false)
-}
-
-fn writable_fragment(
-    config: PagingConfig,
-    tables: &[[u8; PAGE_BYTES]],
-    gpa: u64,
-    length: usize,
-) -> bool {
-    nested_fragment(config, tables, gpa, length, true)
 }

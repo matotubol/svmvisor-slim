@@ -54,7 +54,9 @@ unsafe extern "C" {
 /// already captured/composed into guest_vmcb. The guest/native root is retained
 /// in that VMCB; host_cr3 is a different, privately owned root. Current and new
 /// host roots map the complete runtime transition instructions and context.
-/// Every host pointer remains mapped after switching CR3. Host stack is aligned,
+/// The guest VMCB is identity-mapped writable under the current root for the
+/// native branch-record capture at commit. Every host pointer remains mapped
+/// after switching CR3. Host stack is aligned,
 /// bounded, disjoint from guest stack/backing, and large enough for dispatch.
 /// VMCB/HSAVE/auxiliary pages are distinct aligned WB physical operands; their
 /// virtual aliases and the 112-byte GuestRegisters frame are prevalidated.
@@ -66,8 +68,11 @@ unsafe extern "C" {
 /// proof: linked-image instruction audit is mandatory. DR0–3 and clock MSRs
 /// remain guest-owned. The audited INIT commit clears live DR0-3 and resets
 /// VMCB DR6/7; ordinary exits and private notifications leave them untouched.
-/// Clock MSRs are untouched by host. Admit disabled hardware breakpoints
-/// and debug recording. All guest GPRs are captured before host scratch use.
+/// Clock MSRs are untouched by host. Admit disabled hardware breakpoints.
+/// Arm admits LBR virtualization and the native sixteen-entry branch stack;
+/// nonreturning entry preserves all current branch-record MSRs, freezes only
+/// the host recording controls and hands guest state to hardware switching.
+/// All guest GPRs are captured before host scratch use.
 /// The dispatcher may update only validated stopped guest state and keeps
 /// IF clear throughout and GIF clear except the opt-in redirected-INIT window.
 /// VM_CR.R_INIT and a private #SX(error1) gate own that notification. Guest

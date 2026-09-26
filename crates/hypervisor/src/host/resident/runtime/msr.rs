@@ -8,7 +8,7 @@ use crate::{
     host::resident::runtime::{
         State,
         guest_reader::fetch_instruction,
-        startup::{mailboxes, notify_native_startup},
+        startup::{mailboxes, route_native_startup, send_startup_notification},
         stop::stop,
     },
     svm::{
@@ -75,11 +75,14 @@ pub(super) unsafe fn handle_native_icr(
         let Some(icr) = state.icr.as_mut() else {
             return stop(state, exit.code, exit.rip, boundary, 4);
         };
-        if icr
-            .route_startup_write(value, unsafe { mailboxes(state.count) }, |_| unsafe {
-                notify_native_startup()
-            })
-            .is_err()
+        // SAFETY: the armed CPU owns the retained inventory and its complete mailbox slice.
+        let shared = unsafe { mailboxes(state.count) };
+        if route_native_startup(icr, value, shared, |notification| {
+            // SAFETY: routing admitted the peer destinations and published their queues;
+            // this stopped sender owns x2APIC with IF/GIF clear and peers own R_INIT.
+            unsafe { send_startup_notification(notification) }
+        })
+        .is_err()
         {
             return stop(state, exit.code, exit.rip, boundary, value);
         }

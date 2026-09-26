@@ -198,9 +198,9 @@ impl NativeIcr {
                 }
             }
         }
-        // The native notifier already broadcasts a private wake to all peers;
-        // only selected mailboxes carry guest commands. The sentinel tells
-        // other adapters to issue that all-excluding-self wake as well.
+        // A single selected mailbox needs only its physical CPU woken. Multiple
+        // destinations retain the all-excluding-self wake; only selected
+        // mailboxes carry guest commands. The sentinel is not an APIC identity.
         let single = !broadcast && targets.count_ones() == 1;
         kick(if single {
             self.inventory.ids()[targets.trailing_zeros() as usize]

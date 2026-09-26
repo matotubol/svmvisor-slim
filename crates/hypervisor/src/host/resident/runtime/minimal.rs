@@ -14,6 +14,11 @@ use crate::{
 
 /// Refuse profile drift before another entry, without changing guest state.
 pub(super) fn valid(vmcb: &Vmcb) -> bool {
+    vmcb.native_lbr_enabled() && valid_intercepts(vmcb)
+}
+
+/// Cold admission precedes configuring the branch-record hardware switch.
+pub(super) fn valid_intercepts(vmcb: &Vmcb) -> bool {
     !vmcb.instruction_intercept(InstructionIntercept::Cpuid)
         && !vmcb.cr3_intercepted()
         && [
@@ -92,9 +97,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_requires_branch_record_ownership_after_cold_intercept_admission() {
+        let mut vmcb = Vmcb::new();
+        vmcb.configure_native_boot_intercepts().unwrap();
+        assert!(valid_intercepts(&vmcb));
+        assert!(!valid(&vmcb));
+        assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
+        assert!(valid(&vmcb));
+    }
+
+    #[test]
     fn native_cpuid_preserves_cr3_and_required_svm_ownership() {
         let mut vmcb = Vmcb::new();
         vmcb.configure_native_boot_intercepts().unwrap();
+        assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
         assert!(valid(&vmcb));
         vmcb.set_instruction_intercept(InstructionIntercept::Cpuid, true);
         assert!(!valid(&vmcb));
@@ -104,6 +120,7 @@ mod tests {
     fn guest_init_and_sipi_preserve_native_cpuid_and_cr3_controls() {
         let mut vmcb = Vmcb::new();
         vmcb.configure_native_boot_intercepts().unwrap();
+        assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
         vmcb.initialize_ap_after_init();
         assert!(valid(&vmcb));
         vmcb.start_ap_from_sipi(8);
@@ -115,6 +132,7 @@ mod tests {
         for cr3 in [1u32 << 3, 1u32 << 19] {
             let mut vmcb = Vmcb::new();
             vmcb.configure_native_boot_intercepts().unwrap();
+            assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
             // SAFETY: exclusive inert VMCB and its in-bounds CR intercept dword.
             unsafe { ptr::from_mut(&mut vmcb).cast::<u32>().write(cr3) };
             let before = *vmcb.bytes();
@@ -134,6 +152,7 @@ mod tests {
         ] {
             let mut vmcb = Vmcb::new();
             vmcb.configure_native_boot_intercepts().unwrap();
+            assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
             vmcb.set_instruction_intercept(intercept, false);
             let before = *vmcb.bytes();
             assert!(!valid(&vmcb));

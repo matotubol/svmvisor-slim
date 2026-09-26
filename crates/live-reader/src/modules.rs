@@ -34,7 +34,7 @@ pub struct Module {
 impl Module {
     /// The virtual address `offset` bytes into the image, if that is inside it.
     pub fn address(&self, offset: u64) -> Option<u64> {
-        (offset < u64::from(self.size)).then(|| self.base + offset)
+        self.base.checked_add(offset).filter(|_| offset < u64::from(self.size))
     }
 
     /// The offset of `address` from the image base, if the address is inside the image.
@@ -102,11 +102,11 @@ fn walk(
     read: &mut Read<'_>,
     mut visit: impl FnMut(&Entry, &mut Read<'_>) -> Result<bool>,
 ) -> Result<()> {
-    let ldr = u64_at(read, peb + PEB_LDR)?;
+    let ldr = u64_at(read, peb.checked_add(PEB_LDR).ok_or_else(changed)?)?;
     if ldr == 0 {
         return Err(Error::new(ErrorKind::Unreadable, "the process loader has not started yet"));
     }
-    let head = ldr + LDR_LOAD_ORDER;
+    let head = ldr.checked_add(LDR_LOAD_ORDER).ok_or_else(changed)?;
     let mut link = u64_at(read, head)?;
     for _ in 0..MAX_MODULES {
         if link == head {
@@ -267,5 +267,22 @@ mod tests {
         assert!(module.contains(0xff0, 0x10));
         assert!(!module.contains(0xff0, 0x11));
         assert!(!module.contains(u64::MAX, 1));
+        let overflowing = Module { base: u64::MAX, ..module };
+        assert_eq!(overflowing.address(1), None);
+    }
+
+    #[test]
+    fn overflowing_loader_pointers_never_issue_a_wrapped_read() {
+        let error = list(u64::MAX, &mut |_, _| panic!("invalid PEB must not be read")).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unreadable);
+        let mut addresses = Vec::new();
+        let error = list(PEB, &mut |address, bytes| {
+            addresses.push(address);
+            bytes.copy_from_slice(&u64::MAX.to_le_bytes());
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unreadable);
+        assert_eq!(addresses, [PEB + PEB_LDR]);
     }
 }

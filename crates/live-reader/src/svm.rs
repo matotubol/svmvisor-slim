@@ -226,23 +226,23 @@ impl Svm {
         self.bridge.begin_phase("read", self.config.read_timeout).map_err(|m| self.ended(m))?;
         let mut staged: Vec<Vec<u8>> = shape.iter().map(|&(_, length)| vec![0; length]).collect();
         for request in &requests {
-            let ranges: Vec<_> = request.iter().map(|piece| piece.range).collect();
-            let bytes = self.bridge.sample(token, &ranges).map_err(|failure| match failure {
-                Failure::Unreadable => Error::new(
-                    ErrorKind::Unreadable,
-                    format!("PID {}: a requested address is not readable", handle.pid),
-                ),
-                Failure::Unbound => {
-                    self.open = None;
-                    Error::new(
-                        ErrorKind::ProcessGone,
-                        format!("PID {} exited or changed identity", handle.pid),
-                    )
-                }
-                Failure::Fatal(message) => self.ended(message),
-            })?;
+            let bytes =
+                self.bridge.sample(token, &request.ranges).map_err(|failure| match failure {
+                    Failure::Unreadable => Error::new(
+                        ErrorKind::Unreadable,
+                        format!("PID {}: a requested address is not readable", handle.pid),
+                    ),
+                    Failure::Unbound => {
+                        self.open = None;
+                        Error::new(
+                            ErrorKind::ProcessGone,
+                            format!("PID {} exited or changed identity", handle.pid),
+                        )
+                    }
+                    Failure::Fatal(message) => self.ended(message),
+                })?;
             let mut bytes = bytes.as_slice();
-            for piece in request {
+            for piece in &request.pieces {
                 let (part, rest) = bytes.split_at(piece.range.length as usize);
                 staged[piece.read][piece.offset..][..part.len()].copy_from_slice(part);
                 bytes = rest;
@@ -290,7 +290,9 @@ impl Svm {
         offset: u64,
         buffer: &mut [u8],
     ) -> Result<()> {
-        if !module.contains(offset, buffer.len()) {
+        let Some(address) =
+            module.base.checked_add(offset).filter(|_| module.contains(offset, buffer.len()))
+        else {
             return Err(Error::new(
                 ErrorKind::InvalidArgument,
                 format!(
@@ -300,8 +302,8 @@ impl Svm {
                     module.size
                 ),
             ));
-        }
-        self.read_process_memory(handle, module.base + offset, buffer)
+        };
+        self.read_process_memory(handle, address, buffer)
     }
 
     /// Reads one little-endian value `offset` bytes into `module`; see [`read`](Self::read).
@@ -324,6 +326,13 @@ impl Svm {
     /// Runtime requests made so far, including discovery.
     pub fn calls(&self) -> u64 {
         self.bridge.calls()
+    }
+
+    /// VMMCALL instructions issued by this connection so far, including probe, continuation
+    /// and abort calls. This observation issues no call and excludes unrelated VM exits.
+    /// Native connections return `Some`; an uninstrumented internal backend returns `None`.
+    pub fn hypercalls(&self) -> Option<u64> {
+        self.bridge.hypercalls()
     }
 
     /// False once the session has failed; every later call returns `SessionEnded`.

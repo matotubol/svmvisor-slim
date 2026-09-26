@@ -10,10 +10,12 @@ use std::collections::HashMap;
 use crate::json::Value;
 
 pub use capture::audit_entry_capture;
+pub use lbr::audit_lbr_capture;
 pub use msr_capture::audit_msr_capture;
 pub use tsc_ratio::audit_tsc_ratio_init;
 
 mod capture;
+mod lbr;
 mod msr_capture;
 mod tsc_ratio;
 

@@ -24,11 +24,17 @@ svmvisor-live-reader = { path = "../crates/live-reader" }
   from the image path the kernel recorded at process start. A listing costs a few
   dozen runtime requests per process, so refresh it when you need to, not every
   frame. `attach` refuses a listed PID that has since been reused.
-- **Batch whatever you can.** Every runtime request checks the process identity
-  before and after copying, so one request with eight ranges costs little more
-  than one with a single range. `read_batch` packs up to eight ranges and 4096
-  bytes per request; `read_process_memory` splits long reads the same way.
-  Pointer chains still need one call per hop.
+- **Batch whatever you can.** Each process sample checks the process identity
+  before and after copying. `read_batch` merges exactly adjacent consecutive
+  reads, then packs up to eight wire ranges and 4096 bytes per request;
+  `read_process_memory` splits long reads the same way. It reads no gap bytes
+  and does not merge overlapping ranges. Pointer chains need a separate read
+  for each dependent hop.
+- **Requests are not VM exits.** The synchronous VMMCALL transport deliberately
+  exits once per submit or continuation. A small process sample takes three
+  exits; an aligned 4096-byte sample takes six. `calls()` counts logical requests;
+  `hypercalls()` counts actual reader VMMCALL instructions on the native transport.
+  Reading either counter sends nothing. See [costs and validation](PERFORMANCE.md).
 - **Observations, not snapshots.** Values may change while a request copies, and
   separate requests are separate observations.
 - **Nothing partial.** On any error, no output buffer is changed.

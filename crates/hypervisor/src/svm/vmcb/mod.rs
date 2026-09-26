@@ -22,6 +22,7 @@ mod continuation;
 mod control;
 mod eraps;
 mod interrupt;
+mod lbr;
 mod reflection;
 #[cfg(test)]
 mod tests;

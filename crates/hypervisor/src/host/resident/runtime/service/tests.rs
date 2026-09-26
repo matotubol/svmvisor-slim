@@ -4,7 +4,10 @@ extern crate std;
 
 use std::vec::Vec;
 
-use crate::memory::npt::{TABLE_COUNT, TableStorage};
+use crate::{
+    host::resident::runtime::guest_reader::nested_fragment,
+    memory::npt::{TABLE_COUNT, TableStorage},
+};
 
 #[derive(Debug, PartialEq, Eq)]
 enum OutputCall {
@@ -129,11 +132,11 @@ fn caller_ranges_refuse_kernel_overflow_and_oversized_buffers_before_walk() {
 #[test]
 fn nested_admission_refuses_nonidentity_and_unowned_table_links() {
     let (config, mut tables) = fixture();
-    assert!(identity_fragment(config, &tables.0, 0x30_0000, 32));
+    assert!(nested_fragment(config, &tables.0, 0x30_0000, 32, false));
     tables.0[1][..8].copy_from_slice(&0x4000_0087u64.to_le_bytes());
-    assert!(!identity_fragment(config, &tables.0, 0x30_0000, 32));
+    assert!(!nested_fragment(config, &tables.0, 0x30_0000, 32, false));
     tables.0[0][..8].copy_from_slice(&0x9000_0007u64.to_le_bytes());
-    assert!(!identity_fragment(config, &tables.0, 0x30_0000, 32));
+    assert!(!nested_fragment(config, &tables.0, 0x30_0000, 32, false));
 }
 
 #[test]
@@ -143,30 +146,30 @@ fn nested_admission_walks_owned_runtime_splits_beyond_the_bootstrap_prefix() {
     tables[0][..8].copy_from_slice(&(config.cr3 + 9 * 4096 | 7).to_le_bytes());
     tables[9][..8].copy_from_slice(&(config.cr3 + 12 * 4096 | 7).to_le_bytes());
     tables[12][8..16].copy_from_slice(&0x20_0087u64.to_le_bytes());
-    assert!(identity_fragment(config, &tables, 0x30_0000, 32));
-    assert!(writable_fragment(config, &tables, 0x30_0000, 32));
+    assert!(nested_fragment(config, &tables, 0x30_0000, 32, false));
+    assert!(nested_fragment(config, &tables, 0x30_0000, 32, true));
     tables[12][8] &= !2;
-    assert!(identity_fragment(config, &tables, 0x30_0000, 32));
-    assert!(!writable_fragment(config, &tables, 0x30_0000, 32));
+    assert!(nested_fragment(config, &tables, 0x30_0000, 32, false));
+    assert!(!nested_fragment(config, &tables, 0x30_0000, 32, true));
 }
 
 #[test]
 fn nested_admission_refuses_absent_and_non_wb_leaf() {
     let (config, mut tables) = fixture();
     tables.0[1][..8].copy_from_slice(&0u64.to_le_bytes());
-    assert!(!identity_fragment(config, &tables.0, 0x30_0000, 32));
+    assert!(!nested_fragment(config, &tables.0, 0x30_0000, 32, false));
     tables.0[1][..8].copy_from_slice(&0x8fu64.to_le_bytes());
-    assert!(!identity_fragment(config, &tables.0, 0x30_0000, 32));
+    assert!(!nested_fragment(config, &tables.0, 0x30_0000, 32, false));
 }
 
 #[test]
 fn output_admission_requires_writable_nested_parents_and_leaf() {
     for level in [0, 1] {
         let (config, mut tables) = fixture();
-        assert!(writable_fragment(config, &tables.0, 0x30_0000, 32));
+        assert!(nested_fragment(config, &tables.0, 0x30_0000, 32, true));
         tables.0[level][0] &= !2;
-        assert!(identity_fragment(config, &tables.0, 0x30_0000, 32));
-        assert!(!writable_fragment(config, &tables.0, 0x30_0000, 32));
+        assert!(nested_fragment(config, &tables.0, 0x30_0000, 32, false));
+        assert!(!nested_fragment(config, &tables.0, 0x30_0000, 32, true));
     }
 }
 

@@ -1,6 +1,6 @@
 //! Windows allocation, affinity and the narrow user-mode VMMCALL ABI.
 
-use std::{arch::asm, ffi::c_void, marker::PhantomData, ptr, rc::Rc, time::Instant};
+use std::{arch::asm, cell::Cell, ffi::c_void, marker::PhantomData, ptr, rc::Rc, time::Instant};
 
 use svmvisor_card_abi::{
     batch::{MAX_RESPONSE_BYTES, REQUEST_BYTES},
@@ -36,6 +36,7 @@ pub(crate) struct NativeTransport {
     thread: *mut c_void,
     thread_id: u32,
     session: u64,
+    hypercalls: Cell<u64>,
     // Affinity and pseudohandle belong to the constructing thread.
     owner: PhantomData<Rc<()>>,
 }
@@ -88,8 +89,15 @@ impl NativeTransport {
         }
         // SAFETY: thread query has no pointer arguments or side effects.
         let thread_id = unsafe { GetCurrentThreadId() };
-        let transport =
-            Self { memory, previous, thread, thread_id, session: 0, owner: PhantomData };
+        let transport = Self {
+            memory,
+            previous,
+            thread,
+            thread_id,
+            session: 0,
+            hypercalls: Cell::new(0),
+            owner: PhantomData,
+        };
         // SAFETY: caller's explicit runtime-v2 acknowledgement permits this first VMMCALL.
         // A legacy runtime may stop: this is version negotiation, not safe absence detection.
         let (status, version) = unsafe { transport.call(local::PROBE) };
@@ -104,6 +112,7 @@ impl NativeTransport {
     unsafe fn call(&self, operation: u64) -> (u64, u64) {
         let mut status = local::MAGIC;
         let mut length = self.memory as u64;
+        self.hypercalls.set(self.hypercalls.get().saturating_add(1));
         // SAFETY: redesigned runtime ABI preserves every register except RAX/RDX. Buffers
         // are private, page-aligned and locked; memory effects prevent compiler reordering.
         unsafe {
@@ -117,6 +126,10 @@ impl NativeTransport {
 }
 
 impl Exchange for NativeTransport {
+    fn hypercalls(&self) -> Option<u64> {
+        Some(self.hypercalls.get())
+    }
+
     fn context(&mut self, session: u64, deadline: Instant) -> Result<Vec<u8>, String> {
         // SAFETY: pure query; buffers and affinity belong to this exact thread.
         if unsafe { GetCurrentThreadId() } != self.thread_id || self.session != session {

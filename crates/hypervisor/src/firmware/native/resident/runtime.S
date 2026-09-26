@@ -18,6 +18,63 @@ svmvisor_resident_enter:
     cli
     clgi
     mov %rcx, %r10
+    /* Native-to-resident commit. Arm admitted LbrVirt and a 16-entry stack.
+     * The caller proved this entire arena identity-mapped and writable under
+     * the current root. Preserve original controls before freezing recording;
+     * neither a branch nor a call intervenes before both recording bits clear.
+     * Preserve every other DebugCtl bit. Afterward host recording stays off,
+     * while VMRUN/VMEXIT exchange the guest controls and records automatically
+     * (APM2 physical pp602,807-808; target PPR pp124-125,190,234-235).
+     * No fallible return follows this point; this capture is at commit, not at
+     * the earlier EFI callback boundary. R10 remains the host context. */
+.globl svmvisor_resident_lbr_capture
+svmvisor_resident_lbr_capture:
+    mov 16(%r10), %r11
+    mov $0x1d9, %ecx
+    rdmsr
+    mov %eax, 0x670(%r11)
+    mov %edx, 0x674(%r11)
+    and $-2, %eax
+    wrmsr
+    mov $0xc000010f, %ecx
+    rdmsr
+    mov %eax, 0x698(%r11)
+    mov %edx, 0x69c(%r11)
+    and $-65, %eax
+    wrmsr
+    mov $0x1db, %ecx
+    rdmsr
+    mov %eax, 0x678(%r11)
+    mov %edx, 0x67c(%r11)
+    inc %ecx
+    rdmsr
+    mov %eax, 0x680(%r11)
+    mov %edx, 0x684(%r11)
+    inc %ecx
+    rdmsr
+    mov %eax, 0x688(%r11)
+    mov %edx, 0x68c(%r11)
+    inc %ecx
+    rdmsr
+    mov %eax, 0x690(%r11)
+    mov %edx, 0x694(%r11)
+    mov $0xc000010e, %ecx
+    rdmsr
+    mov %eax, 0xb70(%r11)
+    mov %edx, 0xb74(%r11)
+    lea 0xa70(%r11), %rdi
+    mov $0xc0010300, %ecx
+.globl svmvisor_resident_lbr_stack_capture
+svmvisor_resident_lbr_stack_capture:
+    rdmsr
+    mov %eax, (%rdi)
+    mov %edx, 4(%rdi)
+    add $8, %rdi
+    inc %ecx
+    cmp $0xc0010320, %ecx
+    jb svmvisor_resident_lbr_stack_capture
+.globl svmvisor_resident_lbr_capture_end
+svmvisor_resident_lbr_capture_end:
     /* Commit point: guest original EFER/CR0 are already in its VMCB. Host
      * private NX/WP permissions require these host-only enablements before
      * using the private paging root. APM2 3.1/5.3 and 15.5/15.6. */

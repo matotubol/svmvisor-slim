@@ -27,8 +27,24 @@ pub(crate) const ICR_RESERVED: u64 = 0xfff0_0000 | (3 << 16) | (3 << 12);
 #[cfg(feature = "resident-runtime")]
 pub(crate) const ID_MSR: u32 = msr(ID);
 pub const ICR_MSR: u32 = msr(ICR);
+const ICR_INIT: u64 = 5 << 8;
+const ICR_ALL_EXCLUDING_SELF: u64 = 3 << 18;
+const ICR_DESTINATION_SHIFT: u32 = 32;
 pub const LVTS: [u16; 6] =
     [LVT_TIMER, LVT_THERMAL, LVT_PERFORMANCE, LVT_LINT0, LVT_LINT1, LVT_ERROR];
 pub const fn msr(offset: u16) -> u32 {
     0x800 + (offset as u32 >> 4)
+}
+
+/// Encode a private INIT wake for an admitted physical APIC ID. The software
+/// sentinel `u32::MAX` means all other CPUs, never an admitted destination ID.
+/// APM2 rev3.44 physical pp706,722-723 and PPR57896 rev3.00 p179: edge INIT
+/// permits a physical destination or the all-excluding-self shorthand.
+/// The caller owns R_INIT redirection and publishes the mailbox before sending.
+pub const fn init_notification_icr(destination: u32) -> u64 {
+    if destination == u32::MAX {
+        ICR_ALL_EXCLUDING_SELF | ICR_INIT
+    } else {
+        ((destination as u64) << ICR_DESTINATION_SHIFT) | ICR_INIT
+    }
 }

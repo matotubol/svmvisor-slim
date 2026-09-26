@@ -4,7 +4,10 @@
 //! These values supply aligned storage, not physical allocation, WB mappings,
 //! or a live VMCB. IOIO_PROT/MSR_PROT must also be enabled by the caller.
 
-use crate::arch::x86_64::msr::{EFER, TSC_RATIO};
+use crate::{
+    arch::x86_64::msr::{EFER, TSC_RATIO},
+    svm::control_msrs::{SMM_ADDR, SMM_BASE, SMM_MASK},
+};
 
 pub const IOPM_BYTES: usize = 12 * 1024;
 pub const MSRPM_BYTES: usize = 8 * 1024;
@@ -68,7 +71,9 @@ impl Msrpm {
     /// Trusted native first boot: execute covered native MSRs directly except
     /// EFER and monitor/SVM controls. APM2 rev3.44 15.11/Table15-8 and 15.30.
     /// Protect C00101xx by default, including VM_CR, VM_HSAVE_PA, lock keys
-    /// and encrypted-guest controls. Its ordinary OSVW registers stay native.
+    /// and encrypted-guest controls. OSVW accesses and SMRAM configuration reads
+    /// stay native. Activation requires the exact target CPU and locked SMRAM
+    /// admitted by HsaveAddressPolicy; this map does not establish that evidence.
     /// TSC_RATIO accesses use guest-owned register state; physical scaling stays
     /// at unity. Nested scaling remains unsupported. Other intercepted indices
     /// need their own emulation owners; out-of-map indices intercept in hardware.
@@ -90,6 +95,13 @@ impl Msrpm {
             for access in [MsrAccess::Read, MsrAccess::Write] {
                 map.set(index, access, Permission::Allow).expect("covered OSVW MSR");
             }
+        }
+        // 57896-3.00_PPR physical pp213-215: these firmware-owned registers
+        // remain readable with SmmLock set. The monitor does not modify them;
+        // let hardware return its native values without an unowned MSR exit.
+        // Writes and every other protected SMM/SVM control remain intercepted.
+        for index in [SMM_BASE, SMM_ADDR, SMM_MASK] {
+            map.set(index, MsrAccess::Read, Permission::Allow).expect("covered SMRAM MSR");
         }
         // Physical cache/routing controls remain permanently host-owned;
         // both reads and writes use the core-shared logical cache bank.

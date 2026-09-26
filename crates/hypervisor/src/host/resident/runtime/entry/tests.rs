@@ -16,6 +16,7 @@ fn put(vmcb: &mut Vmcb, offset: usize, value: u64, bytes: usize) {
 fn guest() -> Vmcb {
     let mut vmcb = Vmcb::new();
     vmcb.configure_native_boot_intercepts().unwrap();
+    assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
     for (offset, value, bytes) in [
         (0x090, 1, 8),
         (0x058, 1, 4),
