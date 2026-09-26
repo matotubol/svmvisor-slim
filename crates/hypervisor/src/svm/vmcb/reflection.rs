@@ -59,7 +59,6 @@ impl Vmcb {
             return Err(ReflectionError::NestedDeliveryUnsupported);
         }
         self.write_u64::<0x0a8>(0);
-        self.invalidate_all();
         Ok(())
     }
 
@@ -86,7 +85,7 @@ impl Vmcb {
     /// undefined; both are refused as `Unsupported`. A re-injected NMI sets
     /// V_NMI_MASK on the next VMRUN under NMI virtualization (15.21.10 p537).
     /// RIP, RSP, RFLAGS, RAX and EXITINTINFO are retained (they are uncached,
-    /// 15.15.3 p528); success writes only EVENTINJ and the clean bits.
+    /// 15.15.3 p528); success writes only the explicitly uncached EVENTINJ.
     pub fn reinject_interrupted_delivery(&mut self) -> ReinjectOutcome {
         let interrupted = self.read_u64::<0x088>();
         if interrupted & (1 << 31) == 0 {
@@ -117,7 +116,6 @@ impl Vmcb {
             return ReinjectOutcome::Conflict;
         }
         self.write_u64::<0x0a8>(event);
-        self.invalidate_all();
         ReinjectOutcome::Reinjected { kind, vector: interrupted as u8 }
     }
 }

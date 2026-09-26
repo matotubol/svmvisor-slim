@@ -31,6 +31,10 @@ pub const EFER_SVME: u64 = 1 << 12;
 
 pub const TSC_AUX: u32 = 0xc000_0103;
 pub const TSC_RATIO: u32 = 0xc000_0104;
+/// Unity in the 8.32 fixed-point TSC ratio (APM2 physical pages 647-648).
+pub const TSC_RATIO_UNITY: u64 = 1 << 32;
+/// Bits 39:0 are read-write; bits 63:40 are MBZ (APM2 physical page 648).
+pub const TSC_RATIO_DEFINED: u64 = (1 << 40) - 1;
 
 pub const SYS_CFG: u32 = 0xc001_0010;
 pub const HWCR: u32 = 0xc001_0015;

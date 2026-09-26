@@ -23,10 +23,12 @@ use crate::{
         npt::{CACHE_TABLE_COUNT, CacheTableStorage},
     },
     svm::{
+        control_msrs::VisibleSvmControls,
         dispatch::NativeEfer,
+        instructions::NativeSvmInstructions,
         permission_maps::{Iopm, Msrpm},
         startup::{NativeIcr, NativeStartupState},
-        vmcb::Vmcb,
+        vmcb::{Vmcb, VmcbCacheOwner},
     },
 };
 
@@ -58,6 +60,7 @@ mod exit;
 mod guest_reader;
 mod interrupt;
 mod local;
+mod maintenance;
 mod minimal;
 mod msr;
 mod service;
@@ -70,15 +73,19 @@ const INITIAL_STATE: State = State {
     prepared: false,
     armed: false,
     capabilities: None,
+    vmcb_cache: VmcbCacheOwner::new(),
     ack: None,
     efer: None,
     vmcr: None,
+    svm_controls: None,
+    svm_instructions: None,
     icr: None,
     icr_value: 0,
     host_apic_base: 0,
     startup_owned: false,
     startup: NativeStartupState::Running,
     guest_started: false,
+    pause_filter_supported: false,
     slot: 0,
     count: 0,
     pending_fault: false,
@@ -215,9 +222,13 @@ struct State {
     prepared: bool,
     armed: bool,
     capabilities: Option<ValidatedCapabilities>,
+    /// Same-CPU, same-VMCB reuse evidence established only by the audited entry path.
+    vmcb_cache: VmcbCacheOwner,
     ack: Option<NativeBootstrapAck>,
     efer: Option<NativeEfer>,
     vmcr: Option<crate::svm::vmcr::VisibleVmCr>,
+    svm_controls: Option<VisibleSvmControls>,
+    svm_instructions: Option<NativeSvmInstructions>,
     icr: Option<NativeIcr>,
     /// Last guest ICR value, separate from the host's private startup notifications.
     icr_value: u64,
@@ -228,6 +239,8 @@ struct State {
     startup: NativeStartupState,
     /// Latched by `startup::finish_guest_startup`: ICR passthrough, quiet progress.
     guest_started: bool,
+    /// Same-CPU PAUSE filtering admission; only maintenance work needs this exit.
+    pause_filter_supported: bool,
     slot: usize,
     count: usize,
     pending_fault: bool,

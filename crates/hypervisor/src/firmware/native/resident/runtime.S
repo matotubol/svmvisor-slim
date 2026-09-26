@@ -79,6 +79,16 @@ svmvisor_resident_enter:
     shr $32, %rdx
     mov $0xc0010117, %ecx
     wrmsr
+    /* Arm captured this CPU's original TSC_RATIO and required CPUID.TscRateMsr.
+     * The logical guest runs as a native host, whose own clock is not scaled by
+     * its ratio MSR (APM2 physical p647; PPR57896 p189). Keep the physical
+     * multiplier at 1.0; intercepted guest writes update software state only. */
+.globl svmvisor_resident_tsc_ratio_init
+svmvisor_resident_tsc_ratio_init:
+    mov $0xc0000104, %ecx
+    xor %eax, %eax
+    mov $1, %edx
+    wrmsr
     mov 32(%r10), %rax
     vmsave %rax
 .Lresident_resume:
@@ -173,20 +183,22 @@ svmvisor_resident_exit_capture:
     movq $-1, 104(%rdi)
     movq $-1, 120(%rdi)
     movq $0, 152(%rdi)
+.globl svmvisor_resident_msr_capture
+svmvisor_resident_msr_capture:
     cmpq $0x7c, 56(%rdi)
-    jne .Lraw_capture_complete
-    /* The admitted platform uses an 8-bit initial APIC ID. CPUID is native
-     * here; its clobbered GPRs are already saved. Optional physical MSR reads
-     * are restricted to the reviewed target's actual SYS_CFG boundary. */
+    jne svmvisor_resident_raw_capture_commit
+    cmpl $0xc0010010, 128(%rdi)
+    jne svmvisor_resident_raw_capture_commit
+    /* Only SYS_CFG diagnostics consume physical CPU/cache evidence. Select
+     * that boundary before serializing with CPUID on the native host. The
+     * guest GPRs are already saved; ordinary MSR exits skip this entire sample. */
     mov $1, %eax
     xor %ecx, %ecx
     cpuid
     shr $24, %ebx
     mov %rbx, 120(%rdi)
     cmp $0x00b40f40, %eax
-    jne .Lraw_capture_complete
-    cmpl $0xc0010010, 128(%rdi)
-    jne .Lraw_capture_complete
+    jne svmvisor_resident_raw_capture_commit
     mov $0x2ff, %ecx
     rdmsr
     shl $32, %rdx
@@ -198,7 +210,8 @@ svmvisor_resident_exit_capture:
     or %rdx, %rax
     mov %rax, 104(%rdi)
     movq $1, 152(%rdi)
-.Lraw_capture_complete:
+.globl svmvisor_resident_raw_capture_commit
+svmvisor_resident_raw_capture_commit:
     mov 0(%rdi), %r11
     mov %r11, 8(%rdi) /* Commit the tuple last; no writer until next entry. */
 .globl svmvisor_resident_exit_capture_end

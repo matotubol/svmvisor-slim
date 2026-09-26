@@ -21,7 +21,7 @@ linked. The output directory must not exist; it keeps every artifact and one
 `<step>.log` per tool invocation, also when a step fails.
 
 1. Hash and copy every build input into `source/` (`source-manifest.json`).
-2. `cargo rustc --lib --features resident-runtime` the `crates/hypervisor` staticlib for `x86_64-unknown-none`
+2. `cargo rustc --locked --no-default-features --lib --features resident-runtime` the `crates/hypervisor` staticlib for `x86_64-unknown-none`
    (`-C relocation-model=static -C code-model=small`) -> `payload.a`.
 3. `clang --target=x86_64-unknown-none` assembles `runtime.S`, `nmi.S` and
    `fault.S` from `crates/hypervisor/src/firmware/native/resident/`.
@@ -35,9 +35,10 @@ linked. The output directory must not exist; it keeps every artifact and one
    symbols are present and the one-shot experiment's entry symbols are
    absent; over the `llvm-objdump` disassembly, no FP/SIMD/xstate
    instruction, debug registers touched only by the exact DR0-3 reset helper,
-   all 256 host fault frames, the capture sequence, the returning NMI gate and
+   all 256 host fault frames, the capture sequence, SYS_CFG selection before
+   physical CPUID/MSR sampling, the returning NMI gate and
    the #SX shape.
-7. `cargo build --locked -p svmvisor-hypervisor --target x86_64-unknown-uefi
+7. `cargo build --locked --no-default-features -p svmvisor-hypervisor --target x86_64-unknown-uefi
    --release --bin svmvisor-hypervisor`
    -> `driver.efi`, which must be an EFI runtime driver (PE subsystem 12).
 8. Audit `physical.S` (the copied AP wait span lives in `.rdata`, has no COFF
@@ -57,8 +58,10 @@ cargo xtask card-dev --entry-trial
 The second command builds and packages the experimental card payload and runs offline
 flash checks. It does not flash without `--flash`. Both commands select
 `native-entry-trial`; the experiment remains dormant until its explicit VMMCALL ARM.
-The linked-symbol audit requires the experiment's request/final/complete handlers in
-this profile and forbids them in a standard build. `summary.json` records `entry_trial`
+Both build stages disable default features, so only the explicitly selected payload
+profile supplies optional interfaces. The linked-symbol audit requires the experiment's
+request/final/complete handlers in this profile and rejects every
+`svmvisor_entry_trial_` export in a standard build. `summary.json` records `entry_trial`
 and `payload_features`; `card-dev.json` also records `entry_trial`. A later standard
 build does not contain the experiment, even when built from this merged workspace.
 

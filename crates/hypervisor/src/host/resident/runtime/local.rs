@@ -192,7 +192,7 @@ impl LocalChannel {
             return (protocol::INVALID, 0);
         }
         self.steps += 1;
-        self.engine.advance(&mut |address, bytes| memory.read_physical(address, bytes));
+        self.engine.advance_bounded(&mut |address, bytes| memory.read_physical(address, bytes));
         let Some(response) = self.engine.response() else {
             return (protocol::PENDING, 0);
         };
@@ -257,6 +257,17 @@ pub(super) unsafe fn handle(
     registers: &mut GuestRegisters,
 ) -> bool {
     if vmcb.event_injection() != 0 {
+        return true;
+    }
+    // This ABI admits only user-mode callers. An unclaimed VMMCALL raises #UD in
+    // every privilege level (APM2 physical page 593; APM3 physical page 536).
+    // Fault before the API's TF/continuation checks: no instruction has completed,
+    // so neither NRIPS nor a guest-memory fetch is needed and all operands survive.
+    if vmcb.guest_cpl() != 3 {
+        if vmcb.queue_vmmcall_invalid_opcode().is_err() {
+            return false;
+        }
+        state.pending_fault = true;
         return true;
     }
     // A caller using TF needs architectural single-step delivery that this API does not own.
@@ -368,6 +379,13 @@ mod tests {
         memory::address::EncryptionState,
     };
 
+    fn put(vmcb: &mut Vmcb, offset: usize, value: u64) {
+        // SAFETY: these fixtures exclusively own an inert VMCB and use in-bounds fields.
+        unsafe {
+            ptr::from_mut(vmcb).cast::<u8>().add(offset).cast::<u64>().write_unaligned(value);
+        }
+    }
+
     fn probe(nrip: bool) -> (State, Vmcb, GuestRegisters) {
         let mut state = INITIAL_STATE;
         state.capabilities = Some(
@@ -434,6 +452,98 @@ mod tests {
         assert_eq!(vmcb.guest_rax(), protocol::MAGIC);
         assert_eq!(vmcb.guest_rip(), 0x2000);
         assert!(state.pending_fault);
+    }
+
+    #[test]
+    fn unsupported_privilege_faults_before_debug_continuation_or_memory_admission() {
+        for cpl in 0..3 {
+            for flags in [2, 2 | (1 << 8), 2 | (1 << 16), 2 | (1 << 8) | (1 << 16)] {
+                for nrip in [None, Some(0), Some(u64::MAX), Some(0x2003)] {
+                    let (mut state, mut vmcb, mut frame) = probe(nrip.is_some());
+                    if nrip.is_none() {
+                        state.capabilities = None;
+                    }
+                    state.exits = 41;
+                    state.routing_retries = 7;
+                    frame = GuestRegisters {
+                        rbx: 1,
+                        rcx: frame.rcx,
+                        rdx: 3,
+                        rsi: 4,
+                        rdi: 5,
+                        rbp: 6,
+                        r8: 7,
+                        r9: 8,
+                        r10: 9,
+                        r11: 10,
+                        r12: 11,
+                        r13: 12,
+                        r14: 13,
+                        r15: 14,
+                    };
+                    put(&mut vmcb, 0x4c8, cpl << 24);
+                    put(&mut vmcb, 0x0c8, nrip.unwrap_or(u64::MAX));
+                    put(&mut vmcb, 0x570, flags);
+                    put(&mut vmcb, 0x0c0, 0xffff);
+                    put(&mut vmcb, 0x5d8, 0x7654_3000);
+                    put(&mut vmcb, 0x640, 0x7654_1000);
+                    let registers = frame;
+                    let mut expected = *vmcb.bytes();
+                    expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0306u64.to_le_bytes());
+                    // EVENTINJ is uncached; privilege faults preserve clean bits.
+                    // SAFETY: privilege rejection uses only inert VMCB state. Poisoned/no
+                    // continuation and no NPT root must not reach a memory adapter or LOCAL.
+                    assert!(unsafe { handle(&mut state, &mut vmcb, &mut frame) });
+                    assert_eq!(*vmcb.bytes(), expected);
+                    assert_eq!(frame, registers);
+                    assert!(state.pending_fault);
+                    assert!(!state.stopped_valid);
+                    assert_eq!((state.exits, state.routing_retries), (41, 7));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_privilege_keeps_pending_delivery_before_retry() {
+        for cpl in 0..3 {
+            for event in [0x8000_0051, 0x8000_0202, 0x0000_0030_8000_0b0d] {
+                for pending_fault in [false, true] {
+                    let (mut state, mut vmcb, mut frame) = probe(false);
+                    state.pending_fault = pending_fault;
+                    put(&mut vmcb, 0x4c8, cpl << 24);
+                    put(&mut vmcb, 0x570, 2 | (1 << 8) | (1 << 16));
+                    put(&mut vmcb, 0x088, event);
+                    put(&mut vmcb, 0x0a8, event);
+                    let before = *vmcb.bytes();
+                    let registers = frame;
+                    // SAFETY: pending delivery returns before any guest or host access.
+                    assert!(unsafe { handle(&mut state, &mut vmcb, &mut frame) });
+                    assert_eq!(*vmcb.bytes(), before);
+                    assert_eq!(frame, registers);
+                    assert_eq!(state.pending_fault, pending_fault);
+                    assert!(!state.stopped_valid);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_privilege_refuses_conflicting_fault_state_without_mutation() {
+        for (offset, value) in
+            [(0x070, 0x80), (0x088, 0x8000_0051), (0x060, 1 << 8), (0x060, 1 << 63), (0x090, 2)]
+        {
+            let (mut state, mut vmcb, mut frame) = probe(false);
+            put(&mut vmcb, 0x4c8, 0);
+            put(&mut vmcb, offset, value);
+            let before = *vmcb.bytes();
+            let registers = frame;
+            // SAFETY: malformed inert event/control fixtures refuse before fault commit.
+            assert!(!unsafe { handle(&mut state, &mut vmcb, &mut frame) });
+            assert_eq!(*vmcb.bytes(), before);
+            assert_eq!(frame, registers);
+            assert!(!state.pending_fault && !state.stopped_valid);
+        }
     }
 
     fn hello(session: u64, sequence: u64) -> BatchRequest {

@@ -71,7 +71,6 @@ impl Vmcb {
         policy.validate(msrpm, MSRPM_BYTES as u64, 4096)?;
         self.write_u64::<IOPM_BASE>(iopm);
         self.write_u64::<MSRPM_BASE>(msrpm);
-        self.invalidate_all();
         Ok(())
     }
 
@@ -95,16 +94,14 @@ impl Vmcb {
         } else {
             self.update_intercept::<INTERCEPT_MISC2>(mask, enabled);
         }
-        self.invalidate_all();
     }
 
     /// Set only the selected event intercept; preserve all other
-    /// controls and invalidate cached VMCB fields. This is an inert byte edit,
+    /// controls and invalidate the cached intercept group. This is an inert byte edit,
     /// not activation or evidence that hardware will honor the SMI intercept.
     pub fn set_event_intercept(&mut self, intercept: EventIntercept, enabled: bool) {
         let mask = intercept.mask();
         self.update_intercept::<INTERCEPT_MISC1>(mask, enabled);
-        self.invalidate_all();
     }
 
     /// Trusted single-CPU native continuation, APM2 rev3.44 15.5–15.7,
@@ -129,7 +126,6 @@ impl Vmcb {
         self.write_u32::<INTERCEPT_MISC1>((1 << 26) | (1 << 28) | (1 << 31));
         self.write_u32::<INTERCEPT_MISC2>(0x7f);
         self.write_u32::<0x014>(0);
-        self.invalidate_all();
         Ok(())
     }
 
@@ -178,7 +174,6 @@ impl Vmcb {
     /// emulated paging controls. This is a request, not a completed shootdown.
     pub(crate) fn request_full_tlb_flush(&mut self) {
         self.bytes[0x05c] = 1;
-        self.invalidate_all();
     }
 
     /// Consume only the request submitted to the preceding successful entry.
@@ -195,7 +190,6 @@ impl Vmcb {
         }
         if self.bytes[0x05c] == 1 {
             self.bytes[0x05c] = 0;
-            self.invalidate_all();
         }
     }
 }

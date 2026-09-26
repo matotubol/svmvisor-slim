@@ -5,6 +5,7 @@ use crate::{
     arch::x86_64::{capabilities::ValidatedCapabilities, registers::GuestRegisters},
     host::resident::runtime::State,
     svm::{
+        control_msrs::{handle_visible_svm_controls, handle_visible_svm_controls_with_nrip},
         dispatch::{NativeMsrOutcome, NativeVmCrError},
         vmcb::{InstructionIntercept, Vmcb},
         vmcr::{handle_visible_vmcr, handle_visible_vmcr_with_nrip},
@@ -50,6 +51,38 @@ pub(super) fn vmcr_with_nrip(
     let owner = state.vmcr.as_ref().ok_or(NativeVmCrError::UnsupportedInitialState)?;
     let efer = state.efer.as_ref().ok_or(NativeVmCrError::UnsupportedInitialState)?;
     handle_visible_vmcr_with_nrip(owner, efer, vmcb, frame, capabilities, state.startup_owned)
+}
+
+pub(super) fn control_msrs(
+    state: &mut State,
+    vmcb: &mut Vmcb,
+    frame: &mut GuestRegisters,
+    instruction: &[u8],
+) -> Result<NativeMsrOutcome, NativeVmCrError> {
+    let owner = state.svm_controls.as_mut().ok_or(NativeVmCrError::UnsupportedInitialState)?;
+    let vmcr = state.vmcr.as_ref().ok_or(NativeVmCrError::UnsupportedInitialState)?;
+    let efer = state.efer.as_ref().ok_or(NativeVmCrError::UnsupportedInitialState)?;
+    handle_visible_svm_controls(owner, vmcr, efer, vmcb, frame, instruction, state.startup_owned)
+}
+
+pub(super) fn control_msrs_with_nrip(
+    state: &mut State,
+    vmcb: &mut Vmcb,
+    frame: &mut GuestRegisters,
+    capabilities: &ValidatedCapabilities,
+) -> Result<NativeMsrOutcome, NativeVmCrError> {
+    let owner = state.svm_controls.as_mut().ok_or(NativeVmCrError::UnsupportedInitialState)?;
+    let vmcr = state.vmcr.as_ref().ok_or(NativeVmCrError::UnsupportedInitialState)?;
+    let efer = state.efer.as_ref().ok_or(NativeVmCrError::UnsupportedInitialState)?;
+    handle_visible_svm_controls_with_nrip(
+        owner,
+        vmcr,
+        efer,
+        vmcb,
+        frame,
+        capabilities,
+        state.startup_owned,
+    )
 }
 
 #[cfg(test)]

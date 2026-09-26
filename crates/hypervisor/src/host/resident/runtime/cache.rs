@@ -481,6 +481,7 @@ pub(super) unsafe fn handle(
             LOCAL.visibility = change.visibility;
         }
         vmcb.request_full_tlb_flush();
+        vmcb.request_rap_clear_after_cache_msr_write(index);
         vmcb.commit_emulated_instruction(vmcb.guest_rax(), next);
         vmcb.complete_native_instruction_state();
         return true;

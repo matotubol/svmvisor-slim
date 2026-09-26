@@ -27,9 +27,9 @@ impl RawVmexitCapture {
         expected_vmcb: u64,
         assigned_apic_id: u32,
     ) -> Option<(u8, [u64; 6])> {
-        // Assembly captures GPR/VMCB provenance and physical APIC identity on
-        // every MSR exit. Only the optional physical cache sample is SYS_CFG-
-        // specific; other owned registers must not depend on that sample.
+        // Assembly captures GPR/VMCB provenance on every exit. Physical APIC
+        // identity and the optional cache sample are SYS_CFG-specific; other
+        // owned registers must not depend on that sample.
         let index = self.guest_rcx as u32;
         if self.code != 0x7c || index != SYS_CFG || self.physical_cache_valid != 1 {
             return None;

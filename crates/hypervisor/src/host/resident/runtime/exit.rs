@@ -27,9 +27,11 @@ use crate::{
         terminal::{self},
     },
     svm::{
+        control_msrs,
         dispatch::{self, NativeMsrOutcome},
         events::DeliveryError,
         exit::ExitSnapshot,
+        instructions::handle_native_svm_instruction,
         vmcb::Vmcb,
     },
 };
@@ -52,6 +54,14 @@ pub(super) unsafe extern "win64" fn dispatch(context: *mut BridgeContext) -> boo
         stop(state, exit.code, exit.rip, 0xf10a, context as u64);
         unsafe { terminal_finish(state) };
         return false;
+    }
+    // The nonmigrating assembly returned on this image's sole VMCB. Establish
+    // reusable cached groups and consume the old RAP request before trial
+    // restoration, event handling or any emulation can change guest state.
+    let vmcb = unsafe { &mut *ptr::addr_of_mut!(VMCB) };
+    unsafe {
+        state.vmcb_cache.after_exit(vmcb, super::ASSIGNED_APIC_ID, ptr::addr_of!(VMCB) as u64);
+        vmcb.consume_rap_clear_after_exit();
     }
     #[cfg(feature = "native-entry-trial")]
     let trial_exit = match unsafe { super::entry::complete(state, &mut *ptr::addr_of_mut!(VMCB)) } {
@@ -130,8 +140,26 @@ pub(super) unsafe extern "win64" fn dispatch(context: *mut BridgeContext) -> boo
             return false;
         }
         unsafe { route_physical_nmi_to_guest(vmcb) };
+        // No host GIF window follows this decision on the ordinary entry path.
+        // Preserve opportunistic exits only while an existing service needs them.
+        super::maintenance::prepare_pause(
+            vmcb,
+            state.pause_filter_supported,
+            state.guest_started,
+            super::svmvisor_resident_nmi_pending.load(core::sync::atomic::Ordering::Acquire) != 0,
+            unsafe { configuration::pending(state) },
+        );
         #[cfg(feature = "native-entry-trial")]
-        return unsafe { super::entry::final_entry(state, vmcb) };
+        if !unsafe { super::entry::final_entry(state, vmcb) } {
+            return false;
+        }
+        // Last software boundary before assembly VMLOAD/VMRUN, including any
+        // one-shot trial edits. No VMCB reference survives the world switch.
+        state.vmcb_cache.prepare_entry(
+            vmcb,
+            unsafe { super::ASSIGNED_APIC_ID },
+            ptr::addr_of!(VMCB) as u64,
+        );
     }
     resume
 }
@@ -297,7 +325,7 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
     };
     // A still-intercepted ICR write in this exit has already been routed above.
     if resume {
-        unsafe { finish_guest_startup(context.state) };
+        unsafe { finish_guest_startup(context.state, context.vmcb) };
     }
     resume
 }
@@ -364,6 +392,22 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
                 return true;
             }
         }
+        0x7a | 0x80 | 0x82..=0x86 => {
+            // Complete interrupted delivery first, then retry the original
+            // instruction. Never replace a pending event with a fresh fault.
+            if vmcb.event_injection() & (1 << 31) != 0 {
+                return true;
+            }
+            if let (Some(owner), Some(efer)) =
+                (state.svm_instructions.as_ref(), state.efer.as_ref())
+                && handle_native_svm_instruction(owner, efer, vmcb).is_ok()
+            {
+                state.pending_fault = true;
+                return true;
+            }
+            // A legal instruction still needs its own execution owner. Keep
+            // the actual exit intact instead of inventing an architectural fault.
+        }
         0x77 => {
             // Reenter unchanged: VMRUN replenishes the nonzero PAUSE count,
             // and hardware executes this instruction, including debug state.
@@ -402,6 +446,10 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
             if let Some(resume) = unsafe { handle_mcax_msr(state, vmcb, frame) } {
                 return resume;
             }
+            let svm_control = control_msrs::owned_msr(frame.rcx as u32);
+            if svm_control && vmcb.event_injection() & (1 << 31) != 0 {
+                return true;
+            }
             // Actual same-CPU MSR exit plus NRIPS owns the decoded instruction
             // length, including prefixes. Route owned MSRs before guest-byte fetch.
             // Other MSRs and non-long64 profiles retain their existing byte owner.
@@ -409,8 +457,12 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
                 caps.optional_features().nrip_save
                     && vmcb.guest_in_64_bit_code()
                     && vmcb.bytes()[0x4cb] == 0
-                    && matches!(frame.rcx as u32, EFER | VM_CR)
+                    && (svm_control || matches!(frame.rcx as u32, EFER | VM_CR))
             });
+            if svm_control && let Some(caps) = hardware_nrip {
+                let result = super::minimal::control_msrs_with_nrip(state, vmcb, frame, &caps);
+                return complete_control_msr_exit(state, vmcb, frame, result);
+            }
             if frame.rcx as u32 == VM_CR
                 && let Some(caps) = hardware_nrip
             {
@@ -457,6 +509,10 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
                 }
                 Err(reason) => return stop(state, exit.code, exit.rip, 0xf001, reason as u64),
             };
+            if svm_control {
+                let result = super::minimal::control_msrs(state, vmcb, frame, &instruction);
+                return complete_control_msr_exit(state, vmcb, frame, result);
+            }
             if frame.rcx as u32 == VM_CR {
                 let result = super::minimal::vmcr(state, vmcb, frame, &instruction);
                 match result {
@@ -522,6 +578,28 @@ fn vmcr_value(state: &State) -> u64 {
     state.vmcr.as_ref().map_or(0, |owner| owner.logical())
 }
 
+fn complete_control_msr_exit(
+    state: &mut State,
+    vmcb: &Vmcb,
+    frame: &GuestRegisters,
+    result: Result<NativeMsrOutcome, dispatch::NativeEferError>,
+) -> bool {
+    match result {
+        Ok(NativeMsrOutcome::Completed) => {
+            state.routing_retries = 0;
+            true
+        }
+        Ok(NativeMsrOutcome::GeneralProtectionPrepared) => {
+            state.pending_fault = true;
+            true
+        }
+        Err(_) => {
+            let exit = vmcb.exit_snapshot();
+            stop(state, exit.code, exit.rip, 0xf104, frame.rcx)
+        }
+    }
+}
+
 unsafe fn handle_diagnostic_ecam(
     state: &mut State,
     vmcb: &mut Vmcb,
@@ -564,7 +642,14 @@ unsafe fn handle_diagnostic_ecam(
 mod tests {
     use super::*;
 
-    use crate::{host::resident::runtime::INITIAL_STATE, svm::events::ExternalInterruptError};
+    use crate::{
+        arch::x86_64::msr::{TSC_RATIO, TSC_RATIO_DEFINED, TSC_RATIO_UNITY},
+        host::resident::runtime::INITIAL_STATE,
+        svm::{
+            control_msrs::{SVM_LOCK_KEY, VM_HSAVE_PA},
+            events::ExternalInterruptError,
+        },
+    };
 
     fn put(vmcb: &mut Vmcb, offset: usize, value: u64) {
         // SAFETY: tests exclusively own these inert VMCB bytes and use in-bounds field offsets.
@@ -618,9 +703,219 @@ mod tests {
     fn dispatch_unclaimed(state: &mut State, vmcb: &mut Vmcb, frame: &mut GuestRegisters) -> bool {
         let exit = vmcb.exit_snapshot();
         let mut context = ExitContext { state, vmcb, frame, exit };
-        // SAFETY: these tests select only inert VMMCALL rejection or pending-delivery paths.
+        // SAFETY: these tests select only inert instruction/MSR emulation or refusal paths.
         // They never activate SVM, fetch guest memory or touch a resident channel.
         unsafe { handle_exit(&mut context) }
+    }
+
+    fn stopped_svm() -> (State, Vmcb, GuestRegisters) {
+        use crate::{
+            arch::x86_64::{
+                capabilities::{CapabilityEvidence, CpuVendor, EvidenceFlag, OptionalFeatures},
+                msr::TARGET_SIGNATURE,
+            },
+            memory::address::EncryptionState,
+            svm::{
+                control_msrs::{HsaveAddressPolicy, VisibleSvmControls},
+                dispatch::NativeEfer,
+                instructions::NativeSvmInstructions,
+                vmcr::VisibleVmCr,
+            },
+        };
+        let (mut state, mut vmcb, frame) = stopped(0, 0);
+        let caps = CapabilityEvidence {
+            vendor: CpuVendor::Amd,
+            svm: EvidenceFlag::Set,
+            nested_paging: EvidenceFlag::Set,
+            svm_revision: Some(1),
+            asid_count: Some(16),
+            physical_address_bits: Some(48),
+            vm_cr_svmdis: EvidenceFlag::Clear,
+            hypervisor_present: EvidenceFlag::Clear,
+            encryption: EncryptionState::Unencrypted { encryption_bit: None },
+            optional: OptionalFeatures { nrip_save: true, ..OptionalFeatures::default() },
+        }
+        .validate()
+        .unwrap();
+        state.efer = Some(
+            NativeEfer::admit_native_visible_svm(
+                0x500,
+                1 << 2,
+                (1 << 11) | (1 << 20) | (1 << 29),
+                0,
+                None,
+            )
+            .unwrap(),
+        );
+        let vmcr = VisibleVmCr::admit(8).unwrap();
+        let policy = HsaveAddressPolicy::admit_target(TARGET_SIGNATURE, 48, 1, 0, 0).unwrap();
+        state.svm_controls = Some(
+            VisibleSvmControls::admit_firmware_zero_key(
+                0x1234_5000,
+                TSC_RATIO_UNITY,
+                policy,
+                &vmcr,
+            )
+            .unwrap(),
+        );
+        state.vmcr = Some(vmcr);
+        state.svm_instructions =
+            Some(NativeSvmInstructions::admit_native(&caps, (1 << 2) | (1 << 12), 1 << 2).unwrap());
+        state.capabilities = Some(caps);
+        put(&mut vmcb, 0x078, 0);
+        put(&mut vmcb, 0x080, 0);
+        put(&mut vmcb, 0x0c8, 0x3000);
+        put(&mut vmcb, 0x570, 2);
+        (state, vmcb, frame)
+    }
+
+    #[test]
+    fn svm_instruction_dispatch_faults_disabled_vmrun_but_keeps_legal_stgi_unsupported() {
+        let (mut state, mut vmcb, mut frame) = stopped_svm();
+        put(&mut vmcb, 0x070, 0x80);
+        let registers = frame;
+        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!(vmcb.event_injection(), 0x8000_0306);
+        assert_eq!(vmcb.guest_rip(), 0x2ffe);
+        assert_eq!(frame, registers);
+        assert!(state.pending_fault && !state.stopped_valid);
+
+        let (mut state, mut vmcb, mut frame) = stopped_svm();
+        put(&mut vmcb, 0x070, 0x84);
+        let before = *vmcb.bytes();
+        assert!(!dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!(*vmcb.bytes(), before);
+        assert!(state.stopped_valid && !state.pending_fault);
+    }
+
+    #[test]
+    fn hsave_and_key_dispatch_use_guest_owner_and_hardware_nrip() {
+        let (mut state, mut vmcb, mut frame) = stopped_svm();
+        put(&mut vmcb, 0x070, 0x7c);
+        frame.rcx = u64::from(VM_HSAVE_PA);
+        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!(vmcb.guest_rax(), 0x1234_5000);
+        assert_eq!(frame.rdx, 0);
+        assert_eq!(vmcb.guest_rip(), 0x3000);
+
+        put(&mut vmcb, 0x078, 1);
+        put(&mut vmcb, 0x0c8, 0x3002);
+        put(&mut vmcb, 0x5f8, 0x8765_4000);
+        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!(state.svm_controls.unwrap().hsave_pa(), 0x8765_4000);
+        assert_eq!(vmcb.guest_efer(), 0x1500);
+        let (other, _, _) = stopped_svm();
+        assert_eq!(other.svm_controls.unwrap().hsave_pa(), 0x1234_5000);
+
+        put(&mut vmcb, 0x078, 0);
+        put(&mut vmcb, 0x0c8, 0x3004);
+        frame.rcx = u64::from(SVM_LOCK_KEY);
+        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!((vmcb.guest_rax(), frame.rdx), (0, 0));
+        assert!(!state.pending_fault && !state.stopped_valid);
+    }
+
+    #[test]
+    fn tsc_ratio_dispatch_reads_and_writes_guest_state_without_changing_clock_controls() {
+        let (mut state, mut vmcb, mut frame) = stopped_svm();
+        put(&mut vmcb, 0x070, 0x7c);
+        frame.rcx = u64::from(TSC_RATIO);
+        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!((vmcb.guest_rax(), frame.rdx), (0, 1));
+        assert_eq!(vmcb.guest_rip(), 0x3000);
+        let clock_offset: [u8; 8] = vmcb.bytes()[0x050..0x058].try_into().unwrap();
+        for value in [0, 1, 0x2_8000_0000, TSC_RATIO_DEFINED] {
+            put(&mut vmcb, 0x078, 1);
+            let next = vmcb.guest_rip() + 2;
+            put(&mut vmcb, 0x0c8, next);
+            put(&mut vmcb, 0x5f8, u64::from(value as u32));
+            frame.rdx = value >> 32;
+            assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+            assert_eq!(state.svm_controls.unwrap().tsc_ratio(), value);
+            assert_eq!(vmcb.guest_rip(), next);
+
+            put(&mut vmcb, 0x078, 0);
+            put(&mut vmcb, 0x0c8, next + 2);
+            assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+            assert_eq!(vmcb.guest_rax() | (frame.rdx << 32), value);
+            assert_eq!(&vmcb.bytes()[0x050..0x058], &clock_offset);
+            assert!(!state.pending_fault && !state.stopped_valid);
+        }
+        let (other, _, _) = stopped_svm();
+        assert_eq!(other.svm_controls.unwrap().tsc_ratio(), TSC_RATIO_UNITY);
+    }
+
+    #[test]
+    fn tsc_ratio_dispatch_preserves_events_and_faults_reserved_writes_transactionally() {
+        let (mut state, mut vmcb, mut frame) = stopped_svm();
+        put(&mut vmcb, 0x070, 0x7c);
+        put(&mut vmcb, 0x078, 1);
+        put(&mut vmcb, 0x5f8, 0);
+        frame.rcx = u64::from(TSC_RATIO);
+        frame.rdx = 1 << 8; // Reserved ratio bit 40.
+        put(&mut vmcb, 0x0a8, 0x8000_0051);
+        let before = *vmcb.bytes();
+        let owner = state.svm_controls;
+        let registers = frame;
+        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!(*vmcb.bytes(), before);
+        assert_eq!(state.svm_controls, owner);
+        assert_eq!(frame, registers);
+        assert!(!state.pending_fault && !state.stopped_valid);
+
+        put(&mut vmcb, 0x0a8, 0);
+        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!(vmcb.event_injection(), 0x8000_0b0d);
+        assert_eq!(vmcb.guest_rip(), 0x2ffe);
+        assert_eq!(state.svm_controls, owner);
+        assert_eq!(frame, registers);
+        assert!(state.pending_fault && !state.stopped_valid);
+    }
+
+    #[test]
+    fn hsave_dispatch_faults_invalid_write_and_refuses_invalid_nrip_without_fetch() {
+        let (mut state, mut vmcb, mut frame) = stopped_svm();
+        put(&mut vmcb, 0x070, 0x7c);
+        put(&mut vmcb, 0x078, 1);
+        put(&mut vmcb, 0x5f8, 1);
+        frame.rcx = u64::from(VM_HSAVE_PA);
+        frame.rdx = 0;
+        let owner = state.svm_controls;
+        let registers = frame;
+        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!(vmcb.event_injection(), 0x8000_0b0d);
+        assert_eq!(vmcb.guest_rip(), 0x2ffe);
+        assert_eq!(state.svm_controls, owner);
+        assert_eq!(frame, registers);
+        assert!(state.pending_fault && !state.stopped_valid);
+
+        let (mut state, mut vmcb, mut frame) = stopped_svm();
+        put(&mut vmcb, 0x070, 0x7c);
+        put(&mut vmcb, 0x0c8, 0);
+        frame.rcx = u64::from(VM_HSAVE_PA);
+        let before = *vmcb.bytes();
+        assert!(!dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!(*vmcb.bytes(), before);
+        assert!(state.stopped_valid && !state.pending_fault);
+    }
+
+    #[test]
+    fn svm_dispatch_retries_pending_delivery_without_mutating_controls_or_operands() {
+        for code in [0x7a, 0x80, 0x82, 0x83, 0x84, 0x85, 0x86, 0x7c] {
+            let (mut state, mut vmcb, mut frame) = stopped_svm();
+            put(&mut vmcb, 0x070, code);
+            put(&mut vmcb, 0x088, 0x8000_0051);
+            put(&mut vmcb, 0x0a8, 0x8000_0051);
+            frame.rcx = u64::from(VM_HSAVE_PA);
+            let before = *vmcb.bytes();
+            let registers = frame;
+            let owner = state.svm_controls;
+            assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+            assert_eq!(*vmcb.bytes(), before);
+            assert_eq!(frame, registers);
+            assert_eq!(state.svm_controls, owner);
+            assert!(!state.pending_fault && !state.stopped_valid);
+        }
     }
 
     #[test]
@@ -631,7 +926,7 @@ mod tests {
                 let mut expected = *vmcb.bytes();
                 let registers = frame;
                 expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0306u64.to_le_bytes());
-                expected[0x0c0..0x0c4].fill(0);
+                // EVENTINJ is uncached; queuing #UD preserves cached state.
                 assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
                 assert_eq!(*vmcb.bytes(), expected);
                 assert_eq!(frame, registers);
@@ -664,6 +959,35 @@ mod tests {
         assert_eq!(vmcb.event_injection(), 0x8000_0b0d);
         assert_eq!(vmcb.guest_rip(), 0x2ffe);
         assert!(state.pending_fault && !state.stopped_valid);
+    }
+
+    #[test]
+    fn privileged_local_hypercall_dispatch_faults_without_completing_the_abi() {
+        for cpl in 0..3 {
+            for flags in [2, 0x10102] {
+                let (mut state, mut vmcb, mut frame) =
+                    stopped(svmvisor_card_abi::local::MAGIC, cpl);
+                put(&mut vmcb, 0x570, flags);
+                // The fixture has no capabilities and poisoned NRIP. A hardware-decoded
+                // VMMCALL fault must not depend on a continuation or guest memory.
+                let mut expected = *vmcb.bytes();
+                expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0306u64.to_le_bytes());
+                // EVENTINJ is uncached; queuing #UD preserves cached state.
+                let registers = frame;
+                assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+                assert_eq!(*vmcb.bytes(), expected);
+                assert_eq!(frame, registers);
+                assert!(state.pending_fault && !state.stopped_valid);
+
+                // Model successful fault delivery followed by another exit. The existing
+                // dispatcher lifecycle consumes the injection without completing VMMCALL.
+                put(&mut vmcb, 0x070, 0x77);
+                assert!(check_exit_event(&mut state, &mut vmcb));
+                assert!(!state.pending_fault && !state.stopped_valid);
+                assert_eq!(vmcb.event_injection(), 0);
+                assert_eq!(vmcb.guest_rip(), 0x2ffe);
+            }
+        }
     }
 
     #[test]

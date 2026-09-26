@@ -14,7 +14,10 @@ use crate::{
             CapabilityEvidence, CpuVendor, EvidenceFlag, OptionalFeatures, ValidatedCapabilities,
         },
         encryption::NativeEncryptionPlan,
-        msr::{MMIO_CFG_BASE_ADDR, TARGET_SIGNATURE, VM_CR, VM_CR_R_INIT, VM_CR_SVMDIS},
+        msr::{
+            HWCR, MMIO_CFG_BASE_ADDR, TARGET_SIGNATURE, TSC_RATIO, VM_CR, VM_CR_R_INIT,
+            VM_CR_SVMDIS,
+        },
     },
     boot::memory::{MAX_DESCRIPTORS, MemoryDescriptor, ValidatedMemoryMap},
     guest::continuation::NativeBootstrapAck,
@@ -34,7 +37,9 @@ use crate::{
         },
     },
     svm::{
+        control_msrs::{HsaveAddressPolicy, SMM_ADDR, SMM_MASK, VM_HSAVE_PA, VisibleSvmControls},
         dispatch::NativeEfer,
+        instructions::NativeSvmInstructions,
         permission_maps::{MsrAccess, Msrpm, Permission},
         startup::{NativeDestinationMode, NativeIcr, NativeStartupMailbox, try_lock_routes},
     },
@@ -218,7 +223,8 @@ pub unsafe extern "win64" fn prepare(
 /// identity, 2 CPU capabilities, 3 EFER, 4 bootstrap ACK sites, 5 VMCB
 /// controls, 6 memory map, 7 CPU inventory, 8 native x2APIC admission,
 /// 9 startup ownership and its commit, 10 terminal endpoint, 13 VM_CR outside
-/// the visible profile (11 and 12 keep their historical meanings).
+/// the visible profile, 14 cache capture, 15 guest SVM control admission
+/// (11 and 12 keep their historical meanings).
 /// Refusals occur before physical VM_CR INIT redirection is committed.
 unsafe extern "win64" fn arm(
     efer: u64,
@@ -309,7 +315,8 @@ unsafe extern "win64" fn arm(
     // Capture only enumerated same-CPU features, before the first guest entry.
     // Guest FXSR and INVLPG execute directly; VMRUN/VMEXIT owns EFER switching.
     let extended = __cpuid_count(0x8000_0001, 0);
-    let extended21 = if __cpuid_count(0x8000_0000, 0).eax >= 0x8000_0021 {
+    let maximum_extended_leaf = __cpuid_count(0x8000_0000, 0).eax;
+    let extended21 = if maximum_extended_leaf >= 0x8000_0021 {
         Some(__cpuid_count(0x8000_0021, 0).eax)
     } else {
         None
@@ -334,6 +341,32 @@ unsafe extern "win64" fn arm(
             return 13;
         };
         owner
+    };
+    // Capture guest state before runtime.S installs the host's private save area
+    // and unity TSC scaling. capabilities() gates the TSC ratio MSR via CPUID.
+    // Exact-target admission above gates these SMRAM reads. Firmware must have
+    // locked SMRAM and supplied the zero-key SVM profile documented by the PPR.
+    let Ok(hsave_policy) = HsaveAddressPolicy::admit_target(
+        TARGET_SIGNATURE,
+        caps.address_policy().physical_bits(),
+        unsafe { read_msr(HWCR) },
+        unsafe { read_msr(SMM_ADDR) },
+        unsafe { read_msr(SMM_MASK) },
+    ) else {
+        return 15;
+    };
+    let Ok(svm_controls) = VisibleSvmControls::admit_firmware_zero_key(
+        unsafe { read_msr(VM_HSAVE_PA) },
+        unsafe { read_msr(TSC_RATIO) },
+        hsave_policy,
+        &vmcr,
+    ) else {
+        return 15;
+    };
+    let Ok(svm_instructions) =
+        NativeSvmInstructions::admit_native(&caps, extended.ecx, __cpuid_count(0x8000_000a, 0).edx)
+    else {
+        return 2;
     };
     let Ok(ack_owner) = NativeBootstrapAck::new(vmcb, frame, resume, ack, after) else {
         return 4;
@@ -405,6 +438,8 @@ unsafe extern "win64" fn arm(
     state.ack = Some(ack_owner);
     state.efer = Some(owner);
     state.vmcr = Some(vmcr);
+    state.svm_controls = Some(svm_controls);
+    state.svm_instructions = Some(svm_instructions);
     state.icr = Some(icr_owner);
     state.icr_value = interrupts.icr_value();
     state.host_apic_base = interrupts.host_apic_base();
@@ -412,9 +447,16 @@ unsafe extern "win64" fn arm(
     state.slot = ids.iter().position(|&id| id == assigned_id).unwrap();
     state.count = id_count;
     state.terminal_endpoint = endpoint;
-    // PAUSE filtering is optional; unsupported CPUs retain direct PAUSE.
-    vmcb.configure_native_pause_filter(__cpuid_count(0x8000_000a, 0).edx);
+    // Retain the maintenance opportunity through startup. Steady-state entry
+    // disables it unless a deferred NMI or configuration window still needs it.
+    state.pause_filter_supported =
+        vmcb.configure_native_pause_filter(__cpuid_count(0x8000_000a, 0).edx);
     vmcb.set_event_intercept(crate::svm::vmcb::EventIntercept::Init, true);
+    vmcb.configure_native_eraps(maximum_extended_leaf, extended21.unwrap_or(0));
+    state.vmcb_cache.configure(__cpuid_count(0x8000_000a, 0).edx);
+    // This relocated image and its VMCB never migrate. The physical APIC identity
+    // was checked on this CPU above, and the resident uses identity host mappings.
+    state.vmcb_cache.prepare_entry(vmcb, assigned_id, ptr::addr_of!(VMCB) as u64);
     state.capabilities = Some(caps);
     state.armed = true;
     0
@@ -442,7 +484,7 @@ unsafe fn capabilities() -> Option<ValidatedCapabilities> {
     if one.ecx >> 31 != 0
         || extone.ecx & 4 == 0
         || extone.edx & ((1 << 20) | (1 << 26)) != ((1 << 20) | (1 << 26))
-        || svm.edx & 1 != 1
+        || svm.edx & ((1 << 4) | 1) != ((1 << 4) | 1)
         || svm.eax != 1
     {
         return None;

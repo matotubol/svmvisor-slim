@@ -6,12 +6,19 @@ use svmvisor_hypervisor::{
     arch::x86_64::{
         apic,
         msr::{
-            EFER, MTRR_CAP, SEV_STATUS, SYS_CFG, SYS_CFG_DEFINED, SYS_CFG_ENCRYPTION,
-            TARGET_PHYSICAL_BITS, TARGET_SIGNATURE, TOM2, VM_CR, VM_CR_LOCK, VM_CR_R_INIT,
+            EFER, HWCR, MTRR_CAP, SEV_STATUS, SYS_CFG, SYS_CFG_DEFINED, SYS_CFG_ENCRYPTION,
+            TARGET_PHYSICAL_BITS, TARGET_SIGNATURE, TOM2, TSC_RATIO, TSC_RATIO_DEFINED, VM_CR,
+            VM_CR_LOCK, VM_CR_R_INIT,
         },
     },
     host::paging::PagingConfig,
-    svm::vmcr::VisibleVmCr,
+    svm::{
+        control_msrs::{
+            HsaveAddressPolicy, SMM_ADDR, SMM_MASK, SvmControlAdmissionError, VM_HSAVE_PA,
+            VisibleSvmControls,
+        },
+        vmcr::VisibleVmCr,
+    },
 };
 
 use super::physical_boot;
@@ -61,7 +68,7 @@ pub(super) unsafe fn cpu() -> Result<Cpu, u64> {
         || one.edx & 0x07011020 != 0x07011020
         || ext.ecx & 4 == 0
         || ext.edx & 0x24100000 != 0x24100000
-        || svm.edx & 1 != 1
+        || svm.edx & ((1 << 4) | 1) != ((1 << 4) | 1)
         || svm.ebx < 2
         || svm.eax != 1
     {
@@ -73,8 +80,8 @@ pub(super) unsafe fn cpu() -> Result<Cpu, u64> {
             (2, ext.ecx, 4)
         } else if ext.edx & 0x24100000 != 0x24100000 {
             (3, ext.edx, 0x24100000)
-        } else if svm.edx & 1 != 1 {
-            (4, svm.edx, 1)
+        } else if svm.edx & ((1 << 4) | 1) != ((1 << 4) | 1) {
+            (4, svm.edx, (1 << 4) | 1)
         } else if svm.ebx < 2 {
             (5, svm.ebx, 2)
         } else {
@@ -128,13 +135,40 @@ pub(super) unsafe fn cpu() -> Result<Cpu, u64> {
     // Refuse before INIT what the runtime's visible VM_CR owner refuses at arm
     // (SVMDIS, reserved bits); R_INIT keeps its own preparation/observer checks.
     let vm_cr = unsafe { rdmsr(VM_CR) };
-    if VisibleVmCr::admit(vm_cr & !VM_CR_R_INIT).is_err() {
+    let Ok(vmcr_owner) = VisibleVmCr::admit(vm_cr & !VM_CR_R_INIT) else {
         admission_hint(151, VM_CR as u64, vm_cr, !(VM_CR_LOCK | VM_CR_R_INIT));
         return Err(4);
-    }
+    };
     let efer = unsafe { rdmsr(EFER) };
     if efer & (1 << 12) != 0 {
         admission_hint(152, EFER as u64, efer, 1 << 12);
+        return Err(4);
+    }
+    // Match the resident's exact-target register policy before destructive AP
+    // startup, and before reading any target-specific SMRAM register.
+    if one.eax != TARGET_SIGNATURE || width != TARGET_PHYSICAL_BITS {
+        admission_hint(159, one.eax as u64, width as u64, TARGET_SIGNATURE as u64);
+        return Err(4);
+    }
+    let hsave = unsafe { rdmsr(VM_HSAVE_PA) };
+    // The CPUID admission above includes TscRateMsr. Sample before runtime entry
+    // fixes physical scaling at unity; arm captures each CPU's guest value again.
+    let tsc_ratio = unsafe { rdmsr(TSC_RATIO) };
+    let policy = HsaveAddressPolicy::admit_target(
+        one.eax,
+        width,
+        unsafe { rdmsr(HWCR) },
+        unsafe { rdmsr(SMM_ADDR) },
+        unsafe { rdmsr(SMM_MASK) },
+    );
+    if let Err(error) = policy.and_then(|policy| {
+        VisibleSvmControls::admit_firmware_zero_key(hsave, tsc_ratio, policy, &vmcr_owner)
+    }) {
+        if error == SvmControlAdmissionError::InvalidInitialTscRatio {
+            admission_hint(161, TSC_RATIO as u64, tsc_ratio, TSC_RATIO_DEFINED);
+        } else {
+            admission_hint(160, VM_HSAVE_PA as u64, hsave, 0);
+        }
         return Err(4);
     }
     Ok(Cpu { physical_bits: width, apic_id: one.ebx >> 24, encryption })

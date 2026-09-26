@@ -10,8 +10,12 @@ use std::collections::HashMap;
 use crate::json::Value;
 
 pub use capture::audit_entry_capture;
+pub use msr_capture::audit_msr_capture;
+pub use tsc_ratio::audit_tsc_ratio_init;
 
 mod capture;
+mod msr_capture;
+mod tsc_ratio;
 
 const ERROR_CODE_VECTORS: [u32; 10] = [8, 10, 11, 12, 13, 14, 17, 21, 29, 30];
 const NMI_VECTOR: i64 = 2;

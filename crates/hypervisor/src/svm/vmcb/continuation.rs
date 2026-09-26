@@ -16,7 +16,6 @@ impl Vmcb {
     /// RAX is uninterpreted register data.
     pub fn set_guest_rax(&mut self, rax: u64) {
         self.write_u64::<GUEST_RAX>(rax);
-        self.invalidate_all();
     }
 
     /// Core-only application of the native adapter's prepared bootstrap state.
@@ -77,6 +76,9 @@ impl Vmcb {
             (self.virtual_interrupt_control() & !0xf) | r.cr8,
         );
         self.request_full_tlb_flush();
+        // Initial context replaces cached and VMLOAD-only state, including
+        // raw auxiliary copies and CPL. Never reuse an earlier page occupant.
+        self.invalidate_all();
         Ok(())
     }
 
@@ -101,7 +103,6 @@ impl Vmcb {
         }
         self.write_u64::<GUEST_S_CET>(s_cet);
         self.write_u64::<GUEST_ISST_ADDR>(isst_addr);
-        self.invalidate_all();
         Ok(())
     }
 
@@ -110,14 +111,21 @@ impl Vmcb {
     pub(crate) fn commit_emulated_instruction(&mut self, rax: u64, next: ResumeCandidate) {
         self.write_u64::<GUEST_RAX>(rax);
         self.write_u64::<GUEST_RIP>(next.address());
-        self.invalidate_all();
     }
 
     /// EFER policy has checked the logical value and its architectural faults.
     /// Preserve mandatory hardware SVME and invalidate translations after a
     /// paging-permission change (APM2 15.16, Appendix B TLB_CONTROL=1).
     pub(crate) fn commit_native_efer(&mut self, logical: u64) {
-        self.write_u64::<GUEST_EFER>(logical | (1 << 12));
+        let backing = logical | (1 << 12);
+        let previous = self.guest_efer();
+        self.write_u64::<GUEST_EFER>(backing);
+        // APM2 physical p591 lists NXE/LMA/LME as paging state. A legal
+        // guest WRMSR preserves LMA (PPR57896 p186); keeping it here also
+        // covers any future owner that commits a complete mode transition.
+        if (previous ^ backing) & ((1 << 8) | (1 << 10) | (1 << 11)) != 0 {
+            self.request_guest_rap_clear();
+        }
         self.request_full_tlb_flush();
     }
 
@@ -128,6 +136,5 @@ impl Vmcb {
     pub(crate) fn complete_native_instruction_state(&mut self) {
         self.write_u64::<0x068>(self.read_u64::<0x068>() & !1);
         self.write_u64::<GUEST_RFLAGS>(self.guest_rflags() & !(1 << 16));
-        self.invalidate_all();
     }
 }

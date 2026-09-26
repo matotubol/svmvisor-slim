@@ -1,4 +1,4 @@
-//! Transport-independent process batches, bounded to one phase per service opportunity.
+//! Transport-independent process batches with bounded service opportunities.
 //! Identity checks are observations, not page pins or atomic snapshots.
 
 use svmvisor_card_abi::batch::{
@@ -16,6 +16,9 @@ use crate::{
 pub const SLICE_BYTES: usize = 256;
 /// Six metadata ranges, at most two pages and five physical callbacks per page.
 pub const MAX_SLICE_CALLS: usize = 60;
+/// A local call may group four data fragments, but never mix them with metadata validation.
+/// Four four-level translations plus their data reads need at most twenty callbacks.
+pub const MAX_DATA_SLICES_PER_CALL: usize = 4;
 /// Eight ranges add at most sixteen alignment fragments to sixteen full data slices.
 pub const MAX_SERVICE_STEPS: usize = 34;
 
@@ -275,6 +278,35 @@ impl BatchEngine {
         self.phase == BatchPhase::Complete
     }
 
+    /// Service one metadata phase or at most four data fragments (at most 1024 data bytes).
+    /// Metadata validation stays on each side of the data, in separate opportunities.
+    /// The whole call retains the single-phase callback ceiling; grouping never grants a
+    /// fresh callback budget per fragment. This bounds work, not elapsed time: callers
+    /// must separately validate their worst-case interrupt latency on the target machine.
+    pub fn advance_bounded(
+        &mut self,
+        read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
+    ) -> bool {
+        let limit = if self.phase == BatchPhase::Data { MAX_DATA_SLICES_PER_CALL } else { 1 };
+        let mut calls = 0;
+        let mut bounded = |address, bytes: &mut [u8]| {
+            if calls == MAX_SLICE_CALLS || bytes.len() > SLICE_BYTES {
+                return Err(PagingError::PhysicalRead);
+            }
+            calls += 1;
+            read(address, bytes)
+        };
+        for _ in 0..limit {
+            if self.advance(&mut bounded) {
+                return true;
+            }
+            if self.phase != BatchPhase::Data {
+                break;
+            }
+        }
+        false
+    }
+
     pub fn reset_response(&mut self) {
         self.data.fill(0);
         self.response.fill(0);
@@ -336,7 +368,10 @@ enum BatchPhase {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+    use std::vec::Vec;
     use svmvisor_card_abi::batch::{BatchRange, BindingEvidence};
 
     fn request(operation: Operation, sequence: u64) -> BatchRequest {
@@ -432,6 +467,207 @@ mod tests {
         request.ranges[0] = BatchRange { address: 0x8ff0, length: 1024 };
         request.ranges[1] = BatchRange { address: 0x9800, length: 3072 };
         request
+    }
+
+    fn four_level_image() -> [u8; 0x10000] {
+        let mut image = image();
+        put(&mut image, 0x3000, 0x4003);
+        for page in 0..16 {
+            put(&mut image, 0x4000 + page * 8, (page as u64 * 4096) | 3);
+        }
+        for (index, byte) in image[0x8000..0xb000].iter_mut().enumerate() {
+            *byte = (index ^ (index >> 8)) as u8;
+        }
+        image
+    }
+
+    fn pending(operation: Operation, ranges: &[BatchRange], image: &[u8]) -> BatchEngine {
+        let mut engine = BatchEngine::new();
+        hello(&mut engine);
+        let token = if operation == Operation::Sample { bind(&mut engine, image) } else { 0 };
+        let mut request = request(operation, 3);
+        request.token = token;
+        request.count = ranges.len();
+        request.ranges[..ranges.len()].copy_from_slice(ranges);
+        engine.begin(request, 7, config()).unwrap();
+        engine
+    }
+
+    fn finish_traced(
+        engine: &mut BatchEngine,
+        image: &[u8],
+        grouped: bool,
+        fail_at: Option<u64>,
+    ) -> Vec<Vec<(u64, usize)>> {
+        let mut opportunities = Vec::new();
+        loop {
+            let phase = engine.phase;
+            let mut trace = Vec::new();
+            let mut read = |address, bytes: &mut [u8]| {
+                trace.push((address, bytes.len()));
+                assert!(bytes.len() <= SLICE_BYTES);
+                if Some(address) == fail_at {
+                    bytes.fill(0xee);
+                    return Err(PagingError::PhysicalRead);
+                }
+                let start = address as usize;
+                let source =
+                    image.get(start..start + bytes.len()).ok_or(PagingError::PhysicalRead)?;
+                bytes.copy_from_slice(source);
+                Ok(())
+            };
+            let complete =
+                if grouped { engine.advance_bounded(&mut read) } else { engine.advance(&mut read) };
+            assert!(trace.len() <= MAX_SLICE_CALLS);
+            if grouped && phase == BatchPhase::Data {
+                assert!(trace.len() <= MAX_DATA_SLICES_PER_CALL * 5);
+                assert!(
+                    trace.iter().filter(|(address, _)| *address >= 0x8000).count()
+                        <= MAX_DATA_SLICES_PER_CALL
+                );
+                assert!(
+                    trace
+                        .iter()
+                        .filter(|(address, _)| *address >= 0x8000)
+                        .map(|(_, length)| *length)
+                        .sum::<usize>()
+                        <= 1024
+                );
+            }
+            opportunities.push(trace);
+            assert!(opportunities.len() <= MAX_SERVICE_STEPS);
+            if complete {
+                return opportunities;
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_calls_preserve_bytes_and_reads_with_fewer_continuations() {
+        let image = four_level_image();
+        for (operation, ranges, old_calls, new_calls) in [
+            (Operation::Physical, std::vec![BatchRange { address: 0x8000, length: 4096 }], 16, 4),
+            (Operation::Sample, std::vec![BatchRange { address: 0x8000, length: 4096 }], 18, 6),
+            (Operation::Physical, std::vec![BatchRange { address: 0x8001, length: 4096 }], 17, 5),
+            (Operation::Sample, std::vec![BatchRange { address: 0x8001, length: 4096 }], 19, 7),
+            (
+                Operation::Physical,
+                std::vec![BatchRange { address: 0x8fff, length: 512 }; MAX_RANGES],
+                24,
+                6,
+            ),
+            (
+                Operation::Sample,
+                std::vec![BatchRange { address: 0x8fff, length: 512 }; MAX_RANGES],
+                26,
+                8,
+            ),
+        ] {
+            let mut single = pending(operation, &ranges, &image);
+            let mut grouped = pending(operation, &ranges, &image);
+            let old = finish_traced(&mut single, &image, false, None);
+            let new = finish_traced(&mut grouped, &image, true, None);
+            assert_eq!(old.len(), old_calls);
+            assert_eq!(new.len(), new_calls);
+            assert_eq!(
+                old.iter().flatten().collect::<Vec<_>>(),
+                new.iter().flatten().collect::<Vec<_>>()
+            );
+            assert_eq!(single.response(), grouped.response());
+            assert_eq!(status(&grouped), Status::Success as u32);
+            let expected: Vec<_> = ranges
+                .iter()
+                .flat_map(|range| {
+                    image[range.address as usize..range.address as usize + range.length as usize]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            assert_eq!(&grouped.response().unwrap()[64..64 + expected.len()], expected);
+            if operation == Operation::Sample {
+                assert!(new.first().unwrap().iter().all(|(address, _)| *address < 0x8000));
+                assert!(new.last().unwrap().iter().all(|(address, _)| *address < 0x8000));
+                assert_eq!(new[1].len(), 20);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_calls_stop_at_first_failure_and_discard_partial_data() {
+        let image = four_level_image();
+        let ranges = [BatchRange { address: 0x8000, length: 4096 }];
+        for operation in [Operation::Physical, Operation::Sample] {
+            for fail_at in [0x8000, 0x8100, 0x8300, 0x8400, 0x8f00] {
+                let mut single = pending(operation, &ranges, &image);
+                let mut grouped = pending(operation, &ranges, &image);
+                let old = finish_traced(&mut single, &image, false, Some(fail_at));
+                let new = finish_traced(&mut grouped, &image, true, Some(fail_at));
+                assert_eq!(
+                    old.iter().flatten().collect::<Vec<_>>(),
+                    new.iter().flatten().collect::<Vec<_>>()
+                );
+                assert_eq!(single.response(), grouped.response());
+                assert_eq!(status(&grouped), Status::Read as u32);
+                assert_eq!(grouped.response().unwrap().len(), 68);
+                assert!(grouped.data.iter().all(|byte| *byte == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_calls_keep_both_identity_checks_outside_the_data_group() {
+        for before in [true, false] {
+            let mut image = four_level_image();
+            let mut engine =
+                pending(Operation::Sample, &[BatchRange { address: 0x8000, length: 4096 }], &image);
+            if !before {
+                while engine.phase != BatchPhase::After {
+                    assert!(!engine.advance_bounded(&mut |address, bytes| {
+                        let start = address as usize;
+                        bytes.copy_from_slice(&image[start..start + bytes.len()]);
+                        Ok(())
+                    }));
+                }
+                assert_eq!(engine.length, 4096);
+            }
+            put(&mut image, 0x6020, 100);
+            assert!(engine.advance_bounded(&mut |address, bytes| {
+                assert!(address < 0x8000);
+                let start = address as usize;
+                bytes.copy_from_slice(&image[start..start + bytes.len()]);
+                Ok(())
+            }));
+            assert_eq!(status(&engine), Status::Binding as u32);
+            assert_eq!(engine.response().unwrap().len(), 68);
+            assert!(engine.binding.is_none());
+            assert!(engine.data.iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn bounded_calls_do_not_reset_phase_or_request_limits() {
+        let image = four_level_image();
+        let mut engine =
+            pending(Operation::Physical, &[BatchRange { address: 0x8000, length: 4096 }], &image);
+        engine.steps = MAX_SERVICE_STEPS - 2;
+        let mut calls = 0;
+        assert!(engine.advance_bounded(&mut |_, bytes| {
+            calls += 1;
+            bytes.fill(0xaa);
+            Ok(())
+        }));
+        assert_eq!(calls, 2);
+        assert_eq!(status(&engine), Status::Read as u32);
+        assert!(engine.data.iter().all(|byte| *byte == 0));
+        for (count, length) in [(1, 4097), (MAX_RANGES + 1, 1)] {
+            let mut engine = BatchEngine::new();
+            hello(&mut engine);
+            let mut request = request(Operation::Physical, 2);
+            request.count = count;
+            request.ranges.fill(BatchRange { address: 0x8000, length });
+            assert_eq!(engine.begin(request, 7, config()), Err(Status::Shape));
+            assert!(!engine.advance_bounded(&mut |_, _| panic!("refused request must not read")));
+        }
     }
 
     #[test]

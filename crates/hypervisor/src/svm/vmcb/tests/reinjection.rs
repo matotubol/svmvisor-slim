@@ -18,7 +18,9 @@ fn interrupted_intr_nmi_and_exception_are_copied_verbatim_to_eventinj() {
         ReinjectOutcome::Reinjected { kind: 0, vector: 0x51 }
     );
     assert_eq!(vmcb.event_injection(), 0x8000_0051);
-    assert_eq!(vmcb.bytes[CLEAN_BITS..CLEAN_BITS + 4], [0; 4]);
+    // EVENTINJ is explicitly uncached (APM2 physical p590), so reinjection
+    // must preserve the already-established cache groups.
+    assert_eq!(vmcb.read_u32::<CLEAN_BITS>(), u32::MAX);
     // TYPE 2 NMI: vector field ignored, no error code.
     let mut vmcb = vmcb_with(0x400, 0x8000_0202, 0);
     assert_eq!(

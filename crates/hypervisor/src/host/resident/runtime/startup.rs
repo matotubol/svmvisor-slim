@@ -1,4 +1,6 @@
 //! Native INIT/SIPI destination service with hardware-owned ordinary interrupts.
+//! Guest SVM control MSRs survive INIT (APM2 physical p544, Table 14-1);
+//! only their processor RESET path requires fresh admission.
 use crate::{
     arch::x86_64::{apic, registers::GuestRegisters},
     host::resident::{
@@ -129,7 +131,7 @@ pub(super) unsafe fn service_startup(
 /// which the next VMRUN on this CPU reads.
 /// # Safety
 /// This CPU's armed dispatcher with its guest stopped and IF/GIF clear.
-pub(super) unsafe fn finish_guest_startup(state: &mut State) {
+pub(super) unsafe fn finish_guest_startup(state: &mut State, vmcb: &mut Vmcb) {
     if state.guest_started
         || !state.startup_owned
         || !guest_started_all_application_processors(unsafe { mailboxes(state.count) })
@@ -141,6 +143,8 @@ pub(super) unsafe fn finish_guest_startup(state: &mut State) {
         // The x2APIC ICR lies in the covered 0000_0000h-0000_1FFFh range.
         let _ = map.set(apic::ICR_MSR, access, Permission::Allow);
     }
+    // Hardware may retain permission-map state even though the base is unchanged.
+    vmcb.permission_maps_changed();
     diagnostics::quiet_progress();
     state.guest_started = true;
 }

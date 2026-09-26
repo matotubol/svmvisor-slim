@@ -108,6 +108,62 @@ mod tests {
     }
 
     #[test]
+    fn grouped_reader_finishes_four_kib_with_one_submit_and_three_steps() {
+        use svmvisor_card_abi::batch::{
+            BatchRange, BatchRequest, BindingEvidence, MAX_RANGES, Operation, Status,
+        };
+        use svmvisor_hypervisor::reader::{batch::BatchEngine, paging::PagingConfig};
+
+        let config = PagingConfig::new(48, true, true).unwrap();
+        let mut engine = BatchEngine::new();
+        let mut request = BatchRequest {
+            operation: Operation::Hello,
+            session: 1,
+            boot: 0,
+            sequence: 1,
+            token: 0,
+            count: 0,
+            ranges: [BatchRange::EMPTY; MAX_RANGES],
+            binding: BindingEvidence::EMPTY,
+        };
+        engine.begin(request, 7, config).unwrap();
+        engine.reset_response();
+        request.operation = Operation::Physical;
+        request.boot = 7;
+        request.sequence = 2;
+        request.count = 1;
+        request.ranges[0] = BatchRange { address: 0x8000, length: 4096 };
+        let mut operations = Vec::new();
+        let length = complete(Instant::now() + Duration::from_secs(1), |operation| {
+            operations.push(operation);
+            if operation == local::SUBMIT {
+                engine.begin(request, 7, config).unwrap();
+            } else {
+                assert_eq!(operation, local::STEP);
+            }
+            engine.advance_bounded(&mut |address, bytes| {
+                for (offset, byte) in bytes.iter_mut().enumerate() {
+                    *byte = (address + offset as u64) as u8;
+                }
+                Ok(())
+            });
+            match engine.response() {
+                Some(response) => (local::COMPLETE, response.len() as u64),
+                None => (local::PENDING, 0),
+            }
+        })
+        .unwrap();
+        assert_eq!(operations, [local::SUBMIT, local::STEP, local::STEP, local::STEP]);
+        assert_eq!(length, 4164);
+        let response = engine.response().unwrap();
+        assert_eq!(
+            u32::from_le_bytes(response[40..44].try_into().unwrap()),
+            Status::Success as u32
+        );
+        assert!(response[64..4160].iter().enumerate().all(|(offset, byte)| *byte == offset as u8));
+    }
+
+    #[test]
     fn refusal_or_expired_deadline_aborts_without_retry() {
         for expired in [true, false] {
             let mut operations = Vec::new();

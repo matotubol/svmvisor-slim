@@ -163,10 +163,12 @@ pub(super) unsafe fn request(
     Some(true)
 }
 
-/// Last Rust operation before returning to the audited VMRUN loop.
+/// Final trial-state operation before returning to the audited VMRUN loop.
 /// # Safety
 /// Owning CPU with IF/GIF clear, after outer late-NMI routing. No later producer
-/// or callback may mutate VMCB, frame, NPT, LAPIC timer, or startup state.
+/// or callback may mutate guest/control state, frame, NPT, LAPIC timer, or startup
+/// state. Only the CPU-local cache owner's final CLEAN_BITS bookkeeping follows;
+/// it can require fresh loads but cannot change the state admitted by this trial.
 #[unsafe(export_name = "svmvisor_entry_trial_final")]
 #[inline(never)]
 pub(super) unsafe fn final_entry(state: &mut State, vmcb: &mut Vmcb) -> bool {

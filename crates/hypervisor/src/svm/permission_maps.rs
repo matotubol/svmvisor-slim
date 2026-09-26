@@ -4,6 +4,8 @@
 //! These values supply aligned storage, not physical allocation, WB mappings,
 //! or a live VMCB. IOIO_PROT/MSR_PROT must also be enabled by the caller.
 
+use crate::arch::x86_64::msr::{EFER, TSC_RATIO};
+
 pub const IOPM_BYTES: usize = 12 * 1024;
 pub const MSRPM_BYTES: usize = 8 * 1024;
 
@@ -67,24 +69,28 @@ impl Msrpm {
     /// EFER and monitor/SVM controls. APM2 rev3.44 15.11/Table15-8 and 15.30.
     /// Protect C00101xx by default, including VM_CR, VM_HSAVE_PA, lock keys
     /// and encrypted-guest controls. Its ordinary OSVW registers stay native.
-    /// TSC_RATIO is protected host scaling state; guest access/nested scaling
-    /// is unsupported even though native CPUID still exposes physical SVM features.
-    /// This intercept is not a guest register emulation owner. Out-of-map
-    /// indices still intercept in hardware.
+    /// TSC_RATIO accesses use guest-owned register state; physical scaling stays
+    /// at unity. Nested scaling remains unsupported. Other intercepted indices
+    /// need their own emulation owners; out-of-map indices intercept in hardware.
     /// Requires the native VMCB intercept profile; not a sandbox MSR policy.
     pub fn native_boot() -> Self {
         let mut map = Self::new();
         map.bytes[..0x1800].fill(0);
-        // Two adjacent access bits at the Table15-8 EFER and TSC_RATIO slots.
-        map.bytes[0x820] = 3;
-        map.bytes[0x841] = 3;
-        // C0010100..C00101ff: 256 registers, two bits each.
-        map.bytes[0x1040..0x1080].fill(0xff);
+        // Express the policy in MSR indices; `set` owns the byte/bit layout.
+        // C0010100..C00101ff occupies bytes 0x1040..0x1080 (end exclusive).
+        for index in [EFER, TSC_RATIO].into_iter().chain(0xc001_0100..=0xc001_01ff) {
+            for access in [MsrAccess::Read, MsrAccess::Write] {
+                map.set(index, access, Permission::Intercept).expect("covered monitor MSR");
+            }
+        }
         // PPR57896 rev3.00 pp.87/217: advertised OSVW length/status are RW
         // hardware state, not monitor controls. Preserve firmware values and
         // native write/fault semantics; do not synthesize workaround metadata.
-        // Exact C0010140/141 slots share the low four bits of this byte.
-        map.bytes[0x1050] = 0xf0;
+        for index in [0xc001_0140, 0xc001_0141] {
+            for access in [MsrAccess::Read, MsrAccess::Write] {
+                map.set(index, access, Permission::Allow).expect("covered OSVW MSR");
+            }
+        }
         // Physical cache/routing controls remain permanently host-owned;
         // both reads and writes use the core-shared logical cache bank.
         for index in (0x200..=0x20f)
@@ -121,6 +127,10 @@ impl Msrpm {
             MsrAccess::Read => 0,
             MsrAccess::Write => 1,
         };
+        // APM2 rev3.44 section 15.11/Table 15-8 (24593_3.44_APM_Vol2 p580):
+        // four MSRs per byte, with read then write in each pair. `set_bit`
+        // divides this absolute bit offset by 8, giving byte_base + index / 4
+        // and bit 2 * (index % 4) + access_bit for every covered index.
         let bit = byte_base * 8 + index as usize * 2 + access_bit;
         set_bit(&mut self.bytes, bit, permission);
         Ok(())

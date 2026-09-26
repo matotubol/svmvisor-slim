@@ -78,6 +78,14 @@ pub(super) unsafe fn publication_blocked() -> bool {
     unsafe { terminal_control() }.configuration_pending()
 }
 
+/// Whether this CPU must retain the existing opportunistic PAUSE exit until
+/// its next exit closes an ECAM write window. This is not a timer guarantee.
+pub(super) unsafe fn pending(state: &State) -> bool {
+    state.armed
+        && diagnostics::available()
+        && unsafe { terminal_control() }.configuration_open(state.slot)
+}
+
 /// Only this CPU's active identity root may have an open configuration window.
 unsafe fn set_permissions(vmcb: &Vmcb, base: u64, bytes: u64, writable: bool) -> bool {
     let root = vmcb.nested_root();

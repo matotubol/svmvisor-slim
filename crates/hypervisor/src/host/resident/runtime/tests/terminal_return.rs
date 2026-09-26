@@ -61,10 +61,10 @@ fn interrupted_delivery_is_reinjected_through_eventinj_before_resume() {
         assert!(check_exit_event(&mut state, &mut vmcb));
         assert!(!state.pending_fault && !state.stopped_valid);
         // EXITINTINFO is retained; EVENTINJ now carries the same event and
-        // the clean bits are cleared.
+        // cached state remains reusable because EVENTINJ is explicitly uncached.
         assert_eq!(vmcb.event_injection(), interrupted);
         assert_eq!(u64::from_le_bytes(vmcb.bytes()[0x88..0x90].try_into().unwrap()), interrupted);
-        assert_eq!(vmcb.bytes()[0xc0..0xc4], [0; 4]);
+        assert_eq!(vmcb.bytes()[0xc0..0xc4], u32::MAX.to_le_bytes());
     }
 }
 

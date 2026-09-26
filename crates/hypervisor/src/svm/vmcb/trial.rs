@@ -97,6 +97,7 @@ impl<'a> Trial<'a> {
         vmcb.write_u64::<NESTED_CONTROL>(1 | GMET);
         vmcb.write_u32::<EXCEPTIONS>(PF);
         vmcb.request_full_tlb_flush();
+        vmcb.invalidate_all();
         Ok(Self {
             vmcb,
             guest_root,
@@ -128,7 +129,9 @@ impl<'a> Trial<'a> {
     /// # Safety
     /// Pointer is valid only during this exclusive borrow. Caller must perform
     /// exactly one same-CPU entry/exit, preserve external GPRs, and never mutate
-    /// controls or queue events after this guard. Caller handles host NMI,
+    /// semantic controls or queue events after this guard. Final cache-owner
+    /// bookkeeping may only clear CLEAN_BITS, without altering guest state or
+    /// event/control semantics. Caller handles host NMI,
     /// startup and stop requests before calling. This is a virtual pointer;
     /// physical address resolution and hardware ownership are caller duties.
     pub unsafe fn entry_pointer(&mut self) -> Result<*mut Vmcb, Error> {
@@ -228,6 +231,8 @@ impl<'a> Trial<'a> {
             self.vmcb.update_intercept::<0x00c>(1, false);
         }
         self.vmcb.request_full_tlb_flush();
+        // Experimental control ownership always returns through a cold VMCB.
+        self.vmcb.invalidate_all();
     }
 }
 
@@ -258,7 +263,9 @@ impl Ticket {
     /// # Safety
     /// Same requirements as `Trial::begin`, plus an admitted physical timer
     /// capable of forcing INTR within a bounded interval. The native assembly
-    /// must run exactly once next, with no intervening control/event mutation.
+    /// must run exactly once next, with no intervening guest state or semantic
+    /// control/event mutation. Final `VmcbCacheOwner::prepare_entry` may only
+    /// clear CLEAN_BITS before that entry.
     pub unsafe fn arm(vmcb: &mut Vmcb, features: u32) -> Result<Self, Error> {
         if vmcb.read_u32::<0x00c>() & 1 != 0 {
             return Err(Error::Admission);

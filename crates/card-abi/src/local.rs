@@ -1,4 +1,5 @@
 //! Same-guest VMMCALL transport for the bounded batch reader.
+//! The installed reader is a CPL3 interface; CPL0-2 calls retain VMMCALL's native #UD.
 //! RAX is the magic, RCX the operation, RDX the request VA, R8 the response VA,
 //! and R9 the response capacity. R10 carries the session for submit, step, abort, and context
 //! (zero for probe). RAX returns status and RDX length (version for probe); other registers survive.

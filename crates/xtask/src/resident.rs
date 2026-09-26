@@ -130,6 +130,8 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
         "rustc".as_ref(),
         "--manifest-path".as_ref(),
         &payload_manifest,
+        "--locked".as_ref(),
+        "--no-default-features".as_ref(),
         "--lib".as_ref(),
         "--crate-type".as_ref(),
         "staticlib".as_ref(),
@@ -239,6 +241,8 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
     )?;
     let debug_reset_audit = audit::audit_debug_reset(&text)?;
     let entry_capture_audit = audit::audit_entry_capture(&text)?;
+    let tsc_ratio_audit = audit::audit_tsc_ratio_init(&text)?;
+    let msr_capture_audit = audit::audit_msr_capture(&text)?;
     let host_fault_audit = audit::audit_host_fault(&text)?;
     let count = audit::audit_extended_state(&text)?;
 
@@ -247,6 +251,7 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
             "cargo".as_ref(),
             "build".as_ref(),
             "--locked".as_ref(),
+            "--no-default-features".as_ref(),
             "-p".as_ref(),
             "svmvisor-hypervisor".as_ref(),
             "--bin".as_ref(),
@@ -332,6 +337,8 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
         ("bootstrap_audit".into(), bootstrap_audit),
         ("debug_reset_audit".into(), debug_reset_audit),
         ("entry_capture_audit".into(), entry_capture_audit),
+        ("tsc_ratio_audit".into(), tsc_ratio_audit),
+        ("msr_capture_audit".into(), msr_capture_audit),
         ("host_fault_audit".into(), host_fault_audit),
         ("no_fp_simd_xstate_instructions".into(), Value::Bool(true)),
         ("undefined_symbols".into(), Value::Int(0)),
@@ -390,6 +397,19 @@ pub(crate) fn which(tool: &str) -> Option<PathBuf> {
 }
 
 fn audit_entry_trial_symbols(symbols: &str, enabled: bool) -> Result<(), String> {
+    // Reject future experiment exports as well as the three current adapters.
+    // The feature selection and this linked-artifact check are independent:
+    // defaults must not silently widen the production profile.
+    if !enabled {
+        if let Some(symbol) = symbols
+            .lines()
+            .filter_map(|line| line.split_whitespace().last())
+            .find(|symbol| symbol.starts_with("svmvisor_entry_trial_"))
+        {
+            return Err(format!("entry-trial interface linked into production: {symbol}"));
+        }
+        return Ok(());
+    }
     for symbol in [
         "svmvisor_entry_trial_request",
         "svmvisor_entry_trial_final",
@@ -494,6 +514,21 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn production_rejects_each_experimental_export_independently() {
+        for symbol in [
+            "svmvisor_entry_trial_request",
+            "svmvisor_entry_trial_final",
+            "svmvisor_entry_trial_complete",
+            "svmvisor_entry_trial_future_adapter",
+        ] {
+            let error =
+                audit_entry_trial_symbols(&format!("100000 T {symbol}\n"), false).unwrap_err();
+            assert!(error.contains(symbol));
+        }
+        assert!(audit_entry_trial_symbols("100000 T svmvisor_local_read_service\n", false).is_ok());
     }
 
     #[test]

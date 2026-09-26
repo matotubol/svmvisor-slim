@@ -15,9 +15,12 @@ use crate::{
 };
 
 pub use crate::svm::vmcb::{control::native_pause_retry_ready, reflection::ReinjectOutcome};
+pub use cache::VmcbCacheOwner;
 
+mod cache;
 mod continuation;
 mod control;
+mod eraps;
 mod interrupt;
 mod reflection;
 #[cfg(test)]
@@ -145,10 +148,10 @@ impl Vmcb {
         self.read_u64::<GUEST_EFER>() & (1 << 10) != 0 && self.bytes[0x413] & 2 != 0
     }
 
-    /// Conservatively declare all cached fields dirty. No clean-bit setter is
-    /// exposed until CPU-local reuse and state-cache ownership are implemented.
+    /// Declare all groups dirty for first use, bulk replacement or lost cache
+    /// provenance. Only `VmcbCacheOwner` may publish successful-entry reuse.
     pub fn invalidate_all(&mut self) {
-        self.write_u32::<CLEAN_BITS>(0);
+        self.set_clean_bits(0);
     }
 
     #[inline(always)]
@@ -166,6 +169,7 @@ impl Vmcb {
         for (dst, src) in self.bytes.iter_mut().skip(OFFSET).zip(bytes) {
             *dst = src;
         }
+        self.dirty_for_write(OFFSET, 16);
     }
 
     #[inline(always)]
@@ -212,6 +216,7 @@ impl Vmcb {
         for (dst, src) in self.bytes.iter_mut().skip(OFFSET).zip(value.to_le_bytes()) {
             *dst = src;
         }
+        self.dirty_for_write(OFFSET, 2);
     }
 
     #[inline(always)]
@@ -222,6 +227,7 @@ impl Vmcb {
         for (dst, src) in self.bytes.iter_mut().skip(OFFSET).zip(value.to_le_bytes()) {
             *dst = src;
         }
+        self.dirty_for_write(OFFSET, 4);
     }
 
     #[inline(always)]
@@ -232,6 +238,7 @@ impl Vmcb {
         for (dst, src) in self.bytes.iter_mut().skip(OFFSET).zip(value.to_le_bytes()) {
             *dst = src;
         }
+        self.dirty_for_write(OFFSET, 8);
     }
 
     fn update_intercept<const OFFSET: usize>(&mut self, mask: u32, enabled: bool) {
@@ -247,7 +254,6 @@ impl Vmcb {
         self.validate_external_interrupt_conflicts()?;
         self.validate_virtual_interrupt_controls()?;
         self.write_u64::<0x0a8>((1 << 31) | (2 << 8) | 2);
-        self.invalidate_all();
         Ok(())
     }
 }
@@ -269,6 +275,26 @@ impl Vmcb {
     /// APM2 15.20: fault injection preserves the faulting RIP and all GPRs.
     pub(crate) fn queue_native_general_protection(&mut self) -> Result<(), ExternalInterruptError> {
         self.queue_instruction_fault(ReflectedException::GeneralProtection { error_code: 0 })
+    }
+
+    /// The SVM instruction owner has established a mode, enable or privilege
+    /// fault. Bind that decision to this stopped hardware-decoded instruction;
+    /// no continuation address or guest operand is invented for fault delivery.
+    pub(crate) fn queue_svm_instruction_fault(
+        &mut self,
+        instruction: super::instructions::NativeSvmInstruction,
+        fault: super::instructions::NativeSvmInstructionOutcome,
+    ) -> Result<(), ExternalInterruptError> {
+        use super::instructions::NativeSvmInstructionOutcome;
+        if self.exit_snapshot().code != instruction.exit_code() {
+            return Err(ExternalInterruptError::ControlMismatch);
+        }
+        self.queue_instruction_fault(match fault {
+            NativeSvmInstructionOutcome::InvalidOpcodePrepared => ReflectedException::InvalidOpcode,
+            NativeSvmInstructionOutcome::GeneralProtectionPrepared => {
+                ReflectedException::GeneralProtection { error_code: 0 }
+            }
+        })
     }
 
     /// Reject an intercepted VMMCALL that no installed ABI claims, using the non-intercepted
@@ -294,7 +320,6 @@ impl Vmcb {
             return Err(ExternalInterruptError::PendingVirtualInterrupt);
         }
         self.write_u64::<0x0a8>(exception.encoding());
-        self.invalidate_all();
         Ok(())
     }
 }
@@ -340,7 +365,10 @@ impl Vmcb {
         // keeps V_NMI_ENABLE armed, matching Table 14-1's NMI reset: a fresh AP
         // takes NMIs once started (APM2 15.21.10 p537).
         self.write_u64::<0x068>(0); // interrupt shadow
+        self.request_guest_rap_clear();
         self.request_full_tlb_flush();
+        // Whole architectural INIT, including the raw CPL/auxiliary stores.
+        self.invalidate_all();
     }
 
     /// APM2 15.27.8: vector gives upper8 of20-bit address,16-bit real mode,
@@ -353,7 +381,6 @@ impl Vmcb {
             base: (vector as u64) << 12,
         });
         self.write_u64::<GUEST_RIP>(0);
-        self.invalidate_all();
     }
 }
 
