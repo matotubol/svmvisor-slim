@@ -15,10 +15,10 @@
 //! image relocation must not rewrite the monitor's physical host pointers.
 use crate::{
     boot::memory::MemoryDescriptor,
-    host::resident::MAX_RESIDENT_CPUS,
+    host::resident::{MAX_RESIDENT_CPUS, pool_bytes_for_processors},
     memory::address::{self, AddressPolicy},
 };
-use svmvisor_card_abi::package::{ARENA_BYTES, Package, PackageError, is_valid_arena};
+use svmvisor_card_abi::package::{ARENA_BYTES, Package, PackageError};
 use uefi_raw::{
     Status,
     table::boot::{AllocateType, BootServices, MemoryType},
@@ -27,8 +27,9 @@ use uefi_raw::{
 use crate::firmware::native::resident::memory::{ResidentMemoryError, validate_runtime_coverage};
 
 const PAGE_BYTES: u64 = address::PAGE_BYTES as u64;
+#[cfg(test)]
 const ARENA_PAGES: usize = ARENA_BYTES / PAGE_BYTES as usize;
-const RESERVATION_PAGES: usize = ARENA_PAGES * 2;
+const ALIGNMENT_PAGES: usize = 512;
 const LOW_RUNTIME_MAX: u64 = 0x3fff_ffff;
 const PLATFORM_MAXIMUM: Option<u64> = Some(LOW_RUNTIME_MAX);
 
@@ -46,7 +47,7 @@ impl RuntimeArena<'_> {
         self.owned.keep_pages * PAGE_BYTES as usize
     }
     pub const fn processors(&self) -> usize {
-        self.owned.keep_pages / ARENA_PAGES
+        self.owned.processors
     }
     pub fn slot_base(&self, slot: usize) -> Option<u64> {
         (slot < self.processors()).then(|| self.base() + slot as u64 * ARENA_BYTES as u64)
@@ -137,6 +138,7 @@ struct OwnedPages<S: PageServices> {
     base: u64,
     pages: usize,
     keep_pages: usize,
+    processors: usize,
 }
 
 impl<S: PageServices> OwnedPages<S> {
@@ -157,11 +159,13 @@ impl<S: PageServices> OwnedPages<S> {
         if !(1..=MAX_RESIDENT_CPUS).contains(&count) {
             return Err(AllocationError::Address(0));
         }
-        let keep_pages = count * ARENA_PAGES;
-        let reservation = if count == 1 { RESERVATION_PAGES } else { keep_pages + 512 };
+        let keep_pages = pool_bytes_for_processors(count).ok_or(AllocationError::Address(0))?
+            as usize
+            / PAGE_BYTES as usize;
+        let reservation = keep_pages + ALIGNMENT_PAGES;
         let base =
             services.allocate_code(reservation, maximum).map_err(AllocationError::Firmware)?;
-        let mut owned = Self { services, base, pages: reservation, keep_pages };
+        let mut owned = Self { services, base, pages: reservation, keep_pages, processors: count };
         let placement = if maximum.is_some_and(|limit| {
             base.checked_add(reservation as u64 * PAGE_BYTES - 1).is_none_or(|end| end > limit)
         }) {
@@ -180,8 +184,8 @@ impl<S: PageServices> OwnedPages<S> {
     }
 
     fn trim(&mut self) -> Result<(), AllocationError> {
-        let arena = select_pool(self.base, self.keep_pages / ARENA_PAGES)
-            .ok_or(AllocationError::Address(self.base))?;
+        let arena =
+            select_pool(self.base, self.processors).ok_or(AllocationError::Address(self.base))?;
         let prefix = ((arena - self.base) / PAGE_BYTES) as usize;
         if prefix != 0 {
             self.services
@@ -259,29 +263,13 @@ pub unsafe fn allocate_for_processors(
 }
 
 fn select_pool(base: u64, count: usize) -> Option<u64> {
-    if count == 1 {
-        return select_arena(base);
-    }
-    if !(2..=MAX_RESIDENT_CPUS).contains(&count) || base & 4095 != 0 {
+    if !(1..=MAX_RESIDENT_CPUS).contains(&count) || base & 4095 != 0 {
         return None;
     }
-    let chosen = base.max(0x100000).checked_add(0x1fffff)? & !0x1fffff;
-    let bytes = count as u64 * ARENA_BYTES as u64;
+    let chosen = base.max(0x200000).checked_add(0x1fffff)? & !0x1fffff;
+    let bytes = pool_bytes_for_processors(count)?;
     let end = chosen.checked_add(bytes)?;
     (end <= 0x40000000 && end <= base.checked_add(bytes + 0x200000)?).then_some(chosen)
-}
-
-fn select_arena(base: u64) -> Option<u64> {
-    if base & (PAGE_BYTES - 1) != 0 {
-        return None;
-    }
-    let allocation_end = base.checked_add((RESERVATION_PAGES as u64) * PAGE_BYTES)?;
-    let mut selected = base.max(0x100000);
-    if selected & 0x1fffff > 0x100000 {
-        selected = selected.checked_add(0x1fffff)? & !0x1fffff;
-    }
-    (is_valid_arena(selected) && selected.checked_add(ARENA_BYTES as u64)? <= allocation_end)
-        .then_some(selected)
 }
 
 #[cfg(test)]
@@ -292,13 +280,13 @@ mod tests {
 
     #[test]
     fn platform_pool_limits_full_reservation_and_reports_real_failure() {
-        // Exact highest legal 26MiB reservation for this 24-CPU target.
-        let base = 0x40000000 - 26 * 0x100000;
+        // Exact highest reservation: 24 images, 0x3262000-byte tail and 2MiB slack.
+        let base = 0x40000000 - 0x4c62000;
         let (provider, record) = mock(base, 0);
         let owner = OwnedPages::allocate_count_at(provider, 24, Some(LOW_RUNTIME_MAX)).unwrap();
-        assert_eq!(owner.pages, 24 * ARENA_PAGES);
+        assert_eq!(owner.pages, 19042);
         assert_eq!(record.borrow().maximums, [Some(LOW_RUNTIME_MAX)]);
-        assert_eq!(owner.base + owner.pages as u64 * PAGE_BYTES, 0x3fe00000);
+        assert_eq!(owner.base + owner.pages as u64 * PAGE_BYTES, 0x3fe62000);
         drop(owner);
         assert!(record.borrow().live.is_empty());
 
@@ -315,7 +303,7 @@ mod tests {
         let error =
             OwnedPages::allocate_count_at(provider, 24, Some(LOW_RUNTIME_MAX)).err().unwrap();
         assert_eq!(error.diagnostic(), (1, Status::OUT_OF_RESOURCES.0 as u64, 0));
-        assert_eq!(record.borrow().calls, [Call::Allocate(26 * 256)]);
+        assert_eq!(record.borrow().calls, [Call::Allocate(19554)]);
     }
 
     #[test]
@@ -330,17 +318,18 @@ mod tests {
 
     #[test]
     fn processor_pools_preserve_exact_contiguous_ownership_and_slot_layout() {
-        for count in [2, 3, 24, 32] {
+        for count in [1, 2, 3, 24, 32] {
             for base in [0x180000, 0x200000, 0x3ff000] {
                 let (provider, record) = mock(base, 0);
                 let owner = OwnedPages::allocate_count(provider, count).unwrap();
                 assert_eq!(owner.base & 0x1fffff, 0);
-                assert_eq!(owner.pages, count * ARENA_PAGES);
+                assert_eq!(owner.pages, count * ARENA_PAGES + 12898);
+                assert_eq!(owner.processors, count);
                 for slot in 0..count {
                     assert!(crate::host::resident::is_valid_pool_slot(
                         owner.base + slot as u64 * ARENA_BYTES as u64,
                         owner.base,
-                        count as u64 * ARENA_BYTES as u64,
+                        count as u64 * ARENA_BYTES as u64 + 0x3262000,
                         slot as u64,
                         slot as u64
                     ));
@@ -365,8 +354,9 @@ mod tests {
             assert!(OwnedPages::allocate_count(provider, 24).is_err());
             assert!(record.borrow().live.is_empty());
         }
-        assert_eq!(select_pool(0x3e000000, 32), Some(0x3e000000));
-        assert_eq!(select_pool(0x3e001000, 32), None);
+        assert_eq!(select_pool(0x3ac00000, 32), Some(0x3ac00000));
+        assert_eq!(select_pool(0x3ac01000, 32), None);
+        assert_eq!(select_pool(0x3e000000, 32), None);
         assert_eq!(select_pool(u64::MAX & !4095, 2), None);
     }
 
@@ -423,16 +413,17 @@ mod tests {
     }
 
     #[test]
-    fn every_page_offset_selects_one_contiguous_megabyte_in_one_window() {
+    fn every_page_offset_keeps_image_and_tail_in_the_owned_reservation() {
         for base in (0..0x600000).step_by(4096) {
-            let selected = select_arena(base).unwrap();
-            assert!(is_valid_arena(selected));
+            let selected = select_pool(base, 1).unwrap();
+            assert_eq!(selected & 0x1fffff, 0);
             assert!(selected >= base);
-            assert!(selected + ARENA_BYTES as u64 <= base + 0x200000);
+            assert!(selected + 0x3362000 <= base + 0x3562000);
+            assert_eq!((selected + 0x3361fff) / 0x200000, selected / 0x200000 + 25);
         }
-        assert_eq!(select_arena(0x3ff00000), Some(0x3ff00000));
-        for base in [0x3ff01000, 0x40000000, u64::MAX & !4095, 0x200001] {
-            assert_eq!(select_arena(base), None);
+        assert_eq!(select_pool(0x3cc00000, 1), Some(0x3cc00000));
+        for base in [0x3cc01000, 0x3ff00000, 0x40000000, u64::MAX & !4095, 0x200001] {
+            assert_eq!(select_pool(base, 1), None);
         }
     }
 
@@ -441,14 +432,14 @@ mod tests {
         let (mock, record) = mock(0x380000, 0);
         let owner = OwnedPages::allocate(mock).unwrap();
         assert_eq!(owner.base, 0x400000);
-        assert_eq!(owner.pages, ARENA_PAGES);
+        assert_eq!(owner.pages, 13154);
         assert_eq!(
             record.borrow().calls.as_slice(),
-            &[Call::Allocate(512), Call::Free(0x380000, 128), Call::Free(0x500000, 128),]
+            &[Call::Allocate(13666), Call::Free(0x380000, 128), Call::Free(0x3762000, 384),]
         );
         owner.publish();
         assert_eq!(record.borrow().calls.len(), 3, "publication must not free");
-        assert_eq!(record.borrow().live.len(), ARENA_PAGES);
+        assert_eq!(record.borrow().live.len(), 13154);
     }
 
     #[test]
@@ -460,7 +451,7 @@ mod tests {
         drop(owner);
         let r = record.borrow();
         assert!(r.live.is_empty());
-        assert_eq!(r.calls.last(), Some(&Call::Free(0x400000, 256)));
+        assert_eq!(r.calls.last(), Some(&Call::Free(0x400000, 13154)));
         assert_eq!(r.calls.len(), 4);
     }
 
@@ -474,8 +465,11 @@ mod tests {
             ));
             let r = record.borrow();
             assert!(r.live.is_empty());
-            let remaining =
-                if fail_mask == 1 { Call::Free(0x380000, 512) } else { Call::Free(0x400000, 384) };
+            let remaining = if fail_mask == 1 {
+                Call::Free(0x380000, 13666)
+            } else {
+                Call::Free(0x400000, 13538)
+            };
             assert_eq!(r.calls.last(), Some(&remaining));
         }
     }
@@ -483,7 +477,7 @@ mod tests {
     #[test]
     fn failed_cleanup_retains_ownership_for_drop_retry_and_reports_failure() {
         // Prefix succeeds, suffix and explicit rollback fail, Drop then frees
-        // the remaining 384 pages exactly once.
+        // the remaining 13538 pages exactly once.
         let (mock, record) = mock(0x380000, 0b110);
         assert!(matches!(
             OwnedPages::allocate(mock),
@@ -491,7 +485,7 @@ mod tests {
         ));
         let r = record.borrow();
         assert!(r.live.is_empty());
-        assert_eq!(r.calls[3..], [Call::Free(0x400000, 384), Call::Free(0x400000, 384)]);
+        assert_eq!(r.calls[3..], [Call::Free(0x400000, 13538), Call::Free(0x400000, 13538)]);
     }
 
     #[test]
@@ -499,8 +493,8 @@ mod tests {
         let (mock, record) = mock(0x400000, 0b10);
         let mut owner = OwnedPages::allocate(mock).unwrap();
         assert_eq!(owner.release(), Err(Status::DEVICE_ERROR));
-        assert_eq!(owner.pages, ARENA_PAGES);
-        assert_eq!(record.borrow().live.len(), ARENA_PAGES);
+        assert_eq!(owner.pages, 13154);
+        assert_eq!(record.borrow().live.len(), 13154);
         owner.release().unwrap();
         assert!(record.borrow().live.is_empty());
     }
@@ -511,7 +505,7 @@ mod tests {
         assert!(matches!(OwnedPages::allocate(mock), Err(AllocationError::Address(0x40000000))));
         let r = record.borrow();
         assert!(r.live.is_empty());
-        assert_eq!(r.calls.as_slice(), &[Call::Allocate(512), Call::Free(0x40000000, 512)]);
+        assert_eq!(r.calls.as_slice(), &[Call::Allocate(13666), Call::Free(0x40000000, 13666)]);
     }
 
     #[test]
@@ -522,7 +516,7 @@ mod tests {
             OwnedPages::allocate(mock),
             Err(AllocationError::Firmware(Status::OUT_OF_RESOURCES))
         ));
-        assert_eq!(record.borrow().calls.as_slice(), &[Call::Allocate(512)]);
+        assert_eq!(record.borrow().calls.as_slice(), &[Call::Allocate(13666)]);
     }
 
     mod firmware_boundary_tests {
@@ -596,19 +590,19 @@ mod tests {
             let owner = unsafe { allocate_for_processors(&table, 24) }.unwrap();
             assert_eq!(
                 (owner.base(), owner.bytes(), owner.processors()),
-                (0x400000, 0x1800000, 24)
+                (0x400000, 0x4a62000, 24)
             );
             drop(owner);
             let expected_policy = (1, 0x3fff_ffff);
             FIRMWARE.with(|record| {
                 let record = record.borrow();
                 // Independent UEFI numeric values: AnyPages=0, MaxAddress=1,
-                // RuntimeServicesCode=5; 24 MiB plus 2 MiB alignment slack.
+                // RuntimeServicesCode=5; 24MiB images, 0x3262000-byte tail, 2MiB slack.
                 assert_eq!(
                     record.allocation,
-                    Some((expected_policy.0, 5, 6656, expected_policy.1))
+                    Some((expected_policy.0, 5, 19554, expected_policy.1))
                 );
-                assert_eq!(record.frees, [(0x380000, 128), (0x1c00000, 384), (0x400000, 6144)]);
+                assert_eq!(record.frees, [(0x380000, 128), (0x4e62000, 384), (0x400000, 19042)]);
             });
 
             let table = services(0x40000000, false);
@@ -616,7 +610,7 @@ mod tests {
                 unsafe { allocate_for_processors(&table, 24) },
                 Err(AllocationError::Address(0x40000000))
             ));
-            FIRMWARE.with(|record| assert_eq!(record.borrow().frees, [(0x40000000, 6656)]));
+            FIRMWARE.with(|record| assert_eq!(record.borrow().frees, [(0x40000000, 19554)]));
 
             let table = services(0, true);
             assert!(matches!(

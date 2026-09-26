@@ -1,12 +1,14 @@
-//! Scalar PCI configuration I/O for the diagnostic endpoint lifetime owner.
+//! Stopped scalar I/O preparation for the permanent configuration-route owner.
 //! APM2 rev3.44 15.10.1-.3/Figure15-2: hardware supplies scalar width,
 //! direction, port and following RIP. No instruction-memory read is required.
-//! No hardware operation occurs here. The runtime serializes selector/data
-//! access with live publication, revokes publication before configuration data writes, and
-//! then faithfully executes the admitted native IN/OUT. Unsupported encodings
-//! are explicit stopped refusals, never fabricated CPU exceptions.
+//! No hardware operation occurs here. Operand preparation is separate from
+//! effect admission: only aligned DWORD CF8 selector I/O has an admitted native
+//! effect. Configuration data, CF9/reset and other overlapping accesses remain
+//! explicit stopped refusals. This historical module name grants no diagnostic
+//! exception to the permanent owner.
 
 use crate::svm::{
+    configuration::{LegacySelector, ScalarError},
     events::ExternalInterruptError,
     exit::{IoDecodeError, IoIntercept, IoWidth, ResumeCandidate, ResumeError},
     vmcb::Vmcb,
@@ -37,9 +39,24 @@ impl PreparedIo<'_> {
     pub fn output_value(&self) -> u32 {
         self.vmcb.guest_rax() as u32
     }
+    /// Admit only a documented CF8 selector cycle. This must succeed before
+    /// native I/O; a prepared operand alone does not authorize a hardware cycle.
+    /// Every other overlapping access includes unowned data/reset effects.
+    pub fn selector_access(&self) -> Result<SelectorAccess, ConfigError> {
+        if self.io.port() != 0xcf8 || self.io.width() != IoWidth::Dword {
+            return Err(ConfigError::UnsupportedEffect);
+        }
+        if self.io.input() {
+            Ok(SelectorAccess::Read)
+        } else {
+            LegacySelector::admit(self.output_value())
+                .map(SelectorAccess::Write)
+                .map_err(ConfigError::Selector)
+        }
+    }
     /// PPR57896 rev3.00 p203 HWCR.IoCfgGpFault: scalar accesses touching
     /// CF8..CFF fault when set. Caller sampled that bit on the owning CPU;
-    /// no physical port access or publication revocation may precede this.
+    /// no physical port access may precede this.
     pub fn fault_if_disabled(self) -> Result<(), ExternalInterruptError> {
         self.vmcb.queue_native_general_protection()
     }
@@ -67,16 +84,26 @@ pub enum ConfigError {
     UnsupportedMode,
     StringOrRep,
     PortOrWidth,
+    UnsupportedEffect,
+    Selector(ScalarError),
     Pending(ExternalInterruptError),
     Continuation(ResumeError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectorAccess {
+    Read,
+    Write(LegacySelector),
 }
 
 /// Prepare an actual stopped native IOIO operation. Dropping the token leaves
 /// the entire VMCB unchanged. Supported scope: CPL0 long64 scalar B/W/D port
 /// accesses overlapping the intercepted CF8..CFF range, including CF9 reset.
 /// APM2 15.10.2 checks every operand byte; an access may start before the range.
-/// Forward the original port/width, with no assumed chipset register semantics.
-/// Revoke publication before every OUT except the standard CF8 DWORD selector.
+/// Preparation does not authorize forwarding: `selector_access` is the only
+/// presently admitted native effect. In particular, CF9 is never forwarded.
+/// The retained revoke flag classifies OUTs other than the standard CF8 DWORD
+/// selector for offline callers; it does not enable a runtime publisher.
 /// The caller must check HWCR.IoCfgGpFault before any native I/O.
 pub fn prepare_io(vmcb: &mut Vmcb) -> Result<PreparedIo<'_>, ConfigError> {
     let io = vmcb.exit_snapshot().ioio().map_err(ConfigError::Decode)?;

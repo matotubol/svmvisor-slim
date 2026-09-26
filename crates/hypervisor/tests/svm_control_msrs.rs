@@ -6,7 +6,8 @@ use svmvisor_hypervisor::{
             CapabilityEvidence, CpuVendor, EvidenceFlag, OptionalFeatures, ValidatedCapabilities,
         },
         msr::{
-            TARGET_PHYSICAL_BITS, TARGET_SIGNATURE, TSC_RATIO, TSC_RATIO_DEFINED, TSC_RATIO_UNITY,
+            AVIC_DOORBELL, SMM_CTL, TARGET_PHYSICAL_BITS, TARGET_SIGNATURE, TSC_RATIO,
+            TSC_RATIO_DEFINED, TSC_RATIO_UNITY, VIRTUAL_TOM,
         },
         registers::GuestRegisters,
     },
@@ -22,6 +23,15 @@ use svmvisor_hypervisor::{
         vmcr::VisibleVmCr,
     },
 };
+
+// Literal indices from PPR57896 physical pages 117/216 and APM2 physical page 641.
+const FAULTING_MSRS: [(u32, bool); 5] = [
+    (0xc001_011b, false),
+    (0xc001_0116, false),
+    (0xc001_0116, true),
+    (0xc001_0135, false),
+    (0xc001_0135, true),
+];
 
 fn policy(base: u64, mask: u64) -> HsaveAddressPolicy {
     HsaveAddressPolicy::admit_target(TARGET_SIGNATURE, TARGET_PHYSICAL_BITS, 1, base, mask).unwrap()
@@ -120,6 +130,121 @@ fn access(
             if write { &[0x0f, 0x30] } else { &[0x0f, 0x32] },
             false,
         )
+    }
+}
+
+#[test]
+fn documented_invalid_accesses_prepare_gp_without_completing_the_instruction() {
+    assert_eq!((AVIC_DOORBELL, SMM_CTL, VIRTUAL_TOM), (0xc001_011b, 0xc001_0116, 0xc001_0135));
+    let vmcr = VisibleVmCr::admit(8).unwrap();
+    for (index, write) in FAULTING_MSRS {
+        assert!(owned_msr(index));
+        for hardware in [false, true] {
+            for length in [2, 15] {
+                let mut owner = owner(&vmcr);
+                let (mut vmcb, mut frame) = stopped(index, write, u64::MAX);
+                // The byte path needs no NRIP; the hardware path admits prefixes.
+                put(&mut vmcb, 0x0c8, if hardware { 0x4000 + length } else { u64::MAX });
+                put(&mut vmcb, 0x0c0, u64::from(u32::MAX));
+                put(&mut vmcb, 0x570, 0x10102); // TF and RF survive fault preparation.
+                put(&mut vmcb, 0x640, 0x1234_5678); // #GP must not modify CR2.
+                let before = (owner, frame);
+                let mut expected = *vmcb.bytes();
+                expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0b0d_u64.to_le_bytes());
+                assert_eq!(
+                    access(&mut owner, &vmcr, &mut vmcb, &mut frame, write, hardware),
+                    Ok(NativeMsrOutcome::GeneralProtectionPrepared),
+                );
+                assert_eq!((owner, frame), before);
+                // Includes RIP, RAX, flags, exception intercepts and all clean bits.
+                assert_eq!(*vmcb.bytes(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_access_faults_require_valid_backing_events_and_unencrypted_profile() {
+    let vmcr = VisibleVmCr::admit(8).unwrap();
+    for (index, write) in FAULTING_MSRS {
+        for hardware in [false, true] {
+            for (offset, value) in [
+                (0x070, 0x81),
+                (0x078, 2),
+                (0x0a8, 0x8000_0b0d),
+                (0x088, 0x8000_0202),
+                (0x060, 1 << 8),       // Pending V_IRQ is not owned by this profile.
+                (0x090, 1 | (1 << 1)), // SEV
+                (0x090, 1 | (1 << 2)), // SEV-ES
+                (0x090, 1 | (1 << 3)), // Guest-mode execute trap (GMET)
+                (0x4d0, 0x1501),
+            ] {
+                let mut owner = owner(&vmcr);
+                let (mut vmcb, mut frame) = stopped(index, write, 0);
+                put(&mut vmcb, offset, value);
+                let before = (owner, *vmcb.bytes(), frame);
+                assert!(access(&mut owner, &vmcr, &mut vmcb, &mut frame, write, hardware).is_err());
+                assert_eq!((owner, *vmcb.bytes(), frame), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_access_faults_do_not_accept_bad_instruction_evidence() {
+    let vmcr = VisibleVmCr::admit(8).unwrap();
+    for (index, write) in FAULTING_MSRS {
+        let mut owner = owner(&vmcr);
+        let (mut vmcb, mut frame) = stopped(index, write, 0);
+        for next in [0, 0x4000, 0x4001, 0x4010, u64::MAX] {
+            put(&mut vmcb, 0x0c8, next);
+            let before = (owner, *vmcb.bytes(), frame);
+            assert!(access(&mut owner, &vmcr, &mut vmcb, &mut frame, write, true).is_err());
+            assert_eq!((owner, *vmcb.bytes(), frame), before);
+        }
+        let before = (owner, *vmcb.bytes(), frame);
+        assert!(
+            handle_visible_svm_controls(
+                &mut owner,
+                &vmcr,
+                &efer(),
+                &mut vmcb,
+                &mut frame,
+                if write { &[0x0f, 0x32] } else { &[0x0f, 0x30] },
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!((owner, *vmcb.bytes(), frame), before);
+    }
+}
+
+#[test]
+fn doorbell_writes_and_unowned_adjacent_msrs_remain_unsupported() {
+    for lock in [0, 8] {
+        let vmcr = VisibleVmCr::admit(lock).unwrap();
+        for hardware in [false, true] {
+            for (index, write) in [
+                (AVIC_DOORBELL, true),
+                (0xc001_0115, false),
+                (0xc001_0119, true),
+                (0xc001_011a, false),
+                (0xc001_011c, true),
+                (0xc001_0134, false),
+                (0xc001_0136, true),
+            ] {
+                for value in [0, 0x1234_5678_abcd_ef00, u64::MAX] {
+                    let mut owner = owner(&vmcr);
+                    let (mut vmcb, mut frame) = stopped(index, write, value);
+                    let before = (owner, *vmcb.bytes(), frame);
+                    assert_eq!(
+                        access(&mut owner, &vmcr, &mut vmcb, &mut frame, write, hardware),
+                        Err(NativeSvmControlError::UnsupportedMsr { index, write }),
+                    );
+                    assert_eq!((owner, *vmcb.bytes(), frame), before);
+                }
+            }
+        }
     }
 }
 

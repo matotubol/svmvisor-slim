@@ -12,6 +12,8 @@ pub struct Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    /// Live reading is disabled. No profile was opened and no runtime call was made.
+    ReaderDisabled,
     /// An argument or configuration value is out of range. Nothing was sent.
     InvalidArgument,
     /// The kernel/PDB files do not match the recorded profile. Nothing was sent.

@@ -5,8 +5,8 @@
 use crate::memory::address::{PAGE_BYTES, is_canonical_48};
 
 use super::{
-    paging::{PagingConfig, PagingError},
-    read::{self, ReadError},
+    paging::PagingConfig,
+    read::{self, ReadError, VirtualRead},
 };
 
 pub const MAX_PROCESS_NODES: usize = 4096;
@@ -63,6 +63,33 @@ impl ProcessProfile {
     pub const fn layout(self) -> ProcessLayoutEvidence {
         self.layout
     }
+
+    /// Worst-case physical callbacks for one revalidation, including four-level walks.
+    /// Neighbor words are aligned and each fits a page. No translation is cached.
+    pub(crate) fn revalidation_calls(self, object: u64) -> Option<usize> {
+        let layout = self.layout;
+        let pages = |offset: u32, length: u32| {
+            let start = object.checked_add(u64::from(offset))?;
+            let end = start.checked_add(u64::from(length) - 1)?;
+            Some((end / PAGE_BYTES as u64 - start / PAGE_BYTES as u64 + 1) as usize)
+        };
+        validate_pointer(object, layout.eprocess_bytes).ok()?;
+        let range = identity_range(layout);
+        let mut count = match range {
+            Some((start, end)) => pages(start, end - start)?,
+            None => {
+                pages(layout.active_links_offset, LINK_BYTES)?
+                    + pages(layout.pid_offset, WORD_BYTES)?
+            }
+        };
+        if let Some(offset) = layout.create_time_offset {
+            if range.is_none_or(|(start, end)| offset < start || offset + WORD_BYTES > end) {
+                count += pages(offset, WORD_BYTES)?;
+            }
+        }
+        count += pages(layout.directory_root_offset, WORD_BYTES)? + 2;
+        Some(count * 5)
+    }
 }
 
 /// Caller-supplied, independently verified x64 EPROCESS field locations.
@@ -109,21 +136,72 @@ pub struct ProcessNode {
     pub pid: u64,
 }
 
+/// Inputs for a complete process-list traversal without a PID filter.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessListRequest {
+    pub kernel_root_pa: u64,
+    pub list_head_va: u64,
+    pub max_nodes: usize,
+}
+
+/// Caller-owned scratch for one EPROCESS range, including its PID and both active links.
+/// Bytes are overwritten for every node and are not a coherent snapshot of live memory.
+pub struct ProcessFields<'a> {
+    pub offset: u32,
+    pub bytes: &'a mut [u8],
+}
+
 struct ImageReader<'a, F> {
     config: PagingConfig,
     root_pa: u64,
     read: &'a mut F,
 }
 
-impl<F: FnMut(u64, &mut [u8]) -> Result<(), PagingError>> ImageReader<'_, F> {
+impl<F: VirtualRead> ImageReader<'_, F> {
+    fn read_node_fields(
+        &mut self,
+        layout: ProcessLayoutEvidence,
+        eprocess_va: u64,
+        fields: &mut ProcessFields<'_>,
+    ) -> Result<(u64, u64, u64, bool), ProcessError> {
+        let report = self.read.read_virtual(
+            self.config,
+            self.root_pa,
+            eprocess_va + u64::from(fields.offset),
+            fields.bytes,
+        );
+        let required_end =
+            (layout.pid_offset + WORD_BYTES).max(layout.active_links_offset + LINK_BYTES);
+        if report.bytes_read < (required_end - fields.offset) as usize {
+            return Err(report
+                .error
+                .map(ProcessError::Read)
+                .unwrap_or(ProcessError::IncompleteRead));
+        }
+        // A failed later page must not erase the already-read PID and links. Metadata is
+        // withheld in that case; no second read or translation cache repairs the observation.
+        let word = |offset: u32| {
+            let index = (offset - fields.offset) as usize;
+            read_u64(&fields.bytes[index..index + WORD_BYTES as usize])
+        };
+        let forward = word(layout.active_links_offset);
+        let backward = word(layout.active_links_offset + WORD_BYTES);
+        validate_pointer(forward, LINK_BYTES)?;
+        validate_pointer(backward, LINK_BYTES)?;
+        Ok((
+            word(layout.pid_offset),
+            forward,
+            backward,
+            report.error.is_none() && report.bytes_read == fields.bytes.len(),
+        ))
+    }
+
     fn read_identity_links(
         &mut self,
         layout: ProcessLayoutEvidence,
         eprocess_va: u64,
     ) -> Result<(u64, Option<u64>, u64, u64), ProcessError> {
-        let mut start = layout.pid_offset.min(layout.active_links_offset);
-        let mut end = (layout.pid_offset + WORD_BYTES).max(layout.active_links_offset + LINK_BYTES);
-        if end - start > MAX_FIELD_BYTES {
+        let Some((start, end)) = identity_range(layout) else {
             let (forward, backward) =
                 self.read_links(eprocess_va + u64::from(layout.active_links_offset))?;
             let pid = self.read_word(eprocess_va + u64::from(layout.pid_offset))?;
@@ -132,14 +210,7 @@ impl<F: FnMut(u64, &mut [u8]) -> Result<(), PagingError>> ImageReader<'_, F> {
                 None => None,
             };
             return Ok((pid, create_time, forward, backward));
-        }
-        let grouped_time = layout
-            .create_time_offset
-            .filter(|&offset| end.max(offset + WORD_BYTES) - start.min(offset) <= MAX_FIELD_BYTES);
-        if let Some(offset) = grouped_time {
-            start = start.min(offset);
-            end = end.max(offset + WORD_BYTES);
-        }
+        };
 
         // Every field lies inside the checked object extent. Only this bounded local range is
         // coalesced; read_exact still translates each touched page afresh.
@@ -155,7 +226,7 @@ impl<F: FnMut(u64, &mut [u8]) -> Result<(), PagingError>> ImageReader<'_, F> {
         validate_pointer(forward, LINK_BYTES)?;
         validate_pointer(backward, LINK_BYTES)?;
         let create_time = match layout.create_time_offset {
-            Some(offset) if grouped_time.is_some() => Some(word(offset)),
+            Some(offset) if offset >= start && offset + WORD_BYTES <= end => Some(word(offset)),
             Some(offset) => Some(self.read_word(eprocess_va + u64::from(offset))?),
             None => None,
         };
@@ -180,7 +251,7 @@ impl<F: FnMut(u64, &mut [u8]) -> Result<(), PagingError>> ImageReader<'_, F> {
     }
 
     fn read_exact(&mut self, va: u64, bytes: &mut [u8]) -> Result<(), ProcessError> {
-        let report = read::read_virtual(self.config, self.root_pa, va, bytes, self.read);
+        let report = self.read.read_virtual(self.config, self.root_pa, va, bytes);
         if let Some(error) = report.error {
             return Err(error.into());
         }
@@ -225,15 +296,16 @@ impl From<ReadError> for ProcessError {
 /// retry occurs. A later read through an observed root requires the same stable image to relate
 /// its bytes to this observation; PID, object address, and root reuse are not prevented.
 ///
-/// At most `max_nodes` nodes (capped at `MAX_PROCESS_NODES`) are read. Each node needs two
-/// virtual reads, plus at most two reads for the matching PID. Head links need one read.
-/// Every field read is at most 16 bytes and can cross at most two mapped pages. There are
+/// At most `max_nodes` nodes (capped at `MAX_PROCESS_NODES`) are read. Nearby PID and link
+/// fields share one virtual read of at most 64 bytes; distant fields need two reads.
+/// The matching PID needs at most two additional reads. Head links need one read.
+/// Every range can cross at most two mapped pages. There are
 /// no retries, allocations, process modifications, or live-memory acquisition operations.
 pub fn find(
     config: PagingConfig,
     profile: ProcessProfile,
     request: ProcessRequest,
-    read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
+    read: &mut impl VirtualRead,
 ) -> Result<Option<ProcessObservation>, ProcessError> {
     if request.max_nodes == 0 || request.max_nodes > MAX_PROCESS_NODES {
         return Err(ProcessError::InvalidNodeLimit);
@@ -246,7 +318,8 @@ pub fn find(
         layout,
         request.list_head_va,
         request.max_nodes,
-        &mut |image, eprocess_va, pid| {
+        None,
+        &mut |image, ProcessNode { eprocess_va, pid }, _| {
             if pid != request.pid {
                 return Ok(());
             }
@@ -270,36 +343,84 @@ pub fn find(
 /// Inspect the complete circular list and copy every node into `nodes`, in list order,
 /// returning how many were copied. The link checks, bounds and caveats are those of `find`;
 /// `nodes.len()` (at most `MAX_PROCESS_NODES`) is the node limit. Duplicate PIDs are copied as
-/// found. Each node needs two virtual reads.
+/// found. Nearby PID and links share one virtual read; distant fields need two.
 pub fn list(
     config: PagingConfig,
     profile: ProcessProfile,
     kernel_root_pa: u64,
     list_head_va: u64,
     nodes: &mut [ProcessNode],
-    read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
+    read: &mut impl VirtualRead,
 ) -> Result<usize, ProcessError> {
     if nodes.is_empty() || nodes.len() > MAX_PROCESS_NODES {
         return Err(ProcessError::InvalidNodeLimit);
     }
     let mut image = ImageReader { config, root_pa: kernel_root_pa, read };
     let mut count = 0;
-    walk(&mut image, profile.layout, list_head_va, nodes.len(), &mut |_, eprocess_va, pid| {
-        nodes[count] = ProcessNode { eprocess_va, pid };
+    walk(&mut image, profile.layout, list_head_va, nodes.len(), None, &mut |_, node, _| {
+        nodes[count] = node;
         count += 1;
         Ok(())
     })?;
     Ok(count)
 }
 
+/// Walk the complete list while sampling extra EPROCESS fields with its PID and links.
+/// The range must fit the object and include the PID and both links. Each touched page is
+/// translated afresh. If a later page fails after the PID and links were read, the visitor
+/// receives `None` for the extra fields and traversal continues. Earlier failures stop it.
+///
+/// Visitors run before the final list check. Callers must discard accumulated results if
+/// this function returns an error; follow-up reads can be deferred until the walk succeeds.
+/// Bounds, backlink checks and live-memory caveats are otherwise those of `list`.
+pub fn visit_fields(
+    config: PagingConfig,
+    profile: ProcessProfile,
+    request: ProcessListRequest,
+    fields: &mut ProcessFields<'_>,
+    read: &mut impl VirtualRead,
+    visit: &mut impl FnMut(ProcessNode, Option<&[u8]>) -> Result<(), ProcessError>,
+) -> Result<(), ProcessError> {
+    if request.max_nodes == 0 || request.max_nodes > MAX_PROCESS_NODES {
+        return Err(ProcessError::InvalidNodeLimit);
+    }
+    let layout = profile.layout;
+    let end = u64::from(fields.offset) + fields.bytes.len() as u64;
+    if fields.bytes.is_empty()
+        || fields.bytes.len() > read::MAX_READ_BYTES
+        || end > u64::from(layout.eprocess_bytes)
+        || fields.offset > layout.pid_offset.min(layout.active_links_offset)
+        || end
+            < u64::from(
+                (layout.pid_offset + WORD_BYTES).max(layout.active_links_offset + LINK_BYTES),
+            )
+    {
+        return Err(ProcessError::InvalidProfile);
+    }
+    let mut image = ImageReader { config, root_pa: request.kernel_root_pa, read };
+    walk(
+        &mut image,
+        layout,
+        request.list_head_va,
+        request.max_nodes,
+        Some(fields),
+        &mut |_, node, bytes| visit(node, bytes),
+    )
+}
+
 /// Visit every node of the circular list with its object address and PID, then check that the
 /// head's backlink names the last node. Any visitor error stops the walk.
-fn walk<'a, F: FnMut(u64, &mut [u8]) -> Result<(), PagingError>>(
+fn walk<'a, F: VirtualRead>(
     image: &mut ImageReader<'a, F>,
     layout: ProcessLayoutEvidence,
     list_head_va: u64,
     max_nodes: usize,
-    visit: &mut impl FnMut(&mut ImageReader<'a, F>, u64, u64) -> Result<(), ProcessError>,
+    mut fields: Option<&mut ProcessFields<'_>>,
+    visit: &mut impl FnMut(
+        &mut ImageReader<'a, F>,
+        ProcessNode,
+        Option<&[u8]>,
+    ) -> Result<(), ProcessError>,
 ) -> Result<(), ProcessError> {
     validate_pointer(list_head_va, LINK_BYTES)?;
     let (mut current, last) = image.read_links(list_head_va)?;
@@ -312,12 +433,20 @@ fn walk<'a, F: FnMut(u64, &mut [u8]) -> Result<(), PagingError>>(
             .checked_sub(u64::from(layout.active_links_offset))
             .ok_or(ProcessError::InvalidPointer)?;
         validate_pointer(eprocess_va, layout.eprocess_bytes)?;
-        let (next, backward) = image.read_links(current)?;
+        let (pid, next, backward, complete) = if let Some(fields) = fields.as_deref_mut() {
+            image.read_node_fields(layout, eprocess_va, fields)?
+        } else {
+            let (pid, _, next, backward) = image.read_identity_links(
+                ProcessLayoutEvidence { create_time_offset: None, ..layout },
+                eprocess_va,
+            )?;
+            (pid, next, backward, false)
+        };
         if backward != previous || next == current {
             return Err(ProcessError::CorruptLinks);
         }
-        let pid = image.read_word(eprocess_va + u64::from(layout.pid_offset))?;
-        visit(image, eprocess_va, pid)?;
+        let bytes = fields.as_ref().filter(|_| complete).map(|fields| &*fields.bytes);
+        visit(image, ProcessNode { eprocess_va, pid }, bytes)?;
         previous = current;
         current = next;
     }
@@ -350,7 +479,7 @@ pub fn revalidate(
     profile: ProcessProfile,
     kernel_root_pa: u64,
     expected: ProcessObservation,
-    read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
+    read: &mut impl VirtualRead,
 ) -> Result<ProcessObservation, ProcessError> {
     let layout = profile.layout;
     validate_pointer(expected.eprocess_va, layout.eprocess_bytes)?;
@@ -391,6 +520,21 @@ fn finish(previous: u64, last: u64) -> Result<(), ProcessError> {
         return Err(ProcessError::CorruptLinks);
     }
     Ok(())
+}
+
+fn identity_range(layout: ProcessLayoutEvidence) -> Option<(u32, u32)> {
+    let mut start = layout.pid_offset.min(layout.active_links_offset);
+    let mut end = (layout.pid_offset + WORD_BYTES).max(layout.active_links_offset + LINK_BYTES);
+    if end - start > MAX_FIELD_BYTES {
+        return None;
+    }
+    if let Some(offset) = layout.create_time_offset {
+        if end.max(offset + WORD_BYTES) - start.min(offset) <= MAX_FIELD_BYTES {
+            start = start.min(offset);
+            end = end.max(offset + WORD_BYTES);
+        }
+    }
+    Some((start, end))
 }
 
 fn normalize_root(

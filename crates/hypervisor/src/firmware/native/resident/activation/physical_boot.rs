@@ -548,6 +548,43 @@ pub(super) unsafe extern "efiapi" fn start() -> u64 {
             core::hint::spin_loop();
         }
     }
+    // All firmware CPUs must first reach the owned release wait. A slot claim
+    // is a CPU rendezvous only: it is explicitly NOT evidence of DMA silence.
+    // The complete enabled/healthy inventory was admitted before broadcast;
+    // hotplug or any undiscovered processor remains outside this boot profile.
+    for slot in 0..count {
+        if slot == unsafe { BSP } {
+            continue;
+        }
+        let claimed = unsafe { &*((boot_address(slot) + 104) as *const AtomicU32) };
+        let mut parked = false;
+        for _ in 0..20_000_000 {
+            if svmvisor_ap_discovery_failed.load(Ordering::Acquire) != 0
+                || AP_FAILED.load(Ordering::Acquire) != 0
+            {
+                return 45;
+            }
+            if claimed.load(Ordering::Acquire) == 1 {
+                parked = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !parked {
+            return 34;
+        }
+    }
+    match unsafe { super::iommu_takeover::take_over() } {
+        Ok(()) => super::iommu_takeover::PROTECTED_GUEST_CONTRACT_PENDING,
+        Err(reason) => reason,
+    }
+}
+
+/// The existing guest continuation is retained for the eventual complete
+/// virtual-IOMMU profile. Physical protection alone cannot call it: this boot
+/// profile holds AP releases and the BSP until that separate contract exists.
+#[allow(dead_code)]
+unsafe fn release_guests(count: usize) -> u64 {
     for slot in 0..count {
         if slot == unsafe { BSP } {
             continue;

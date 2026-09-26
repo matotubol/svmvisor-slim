@@ -2,7 +2,11 @@
 //! APM2 physical pp207/211/215: PAT is bit7 in a PTE, bit12 in a large leaf.
 //! APM2 pp615-616: nested selectors index the host PAT, not the guest PAT.
 
-use crate::memory::address::{ADDRESS_MASK, NX, PAGE_BYTES, PRESENT, WRITE};
+use crate::memory::{
+    address::{ADDRESS_MASK, AddressError, AddressPolicy, NX, PAGE_BYTES, PRESENT, WRITE},
+    npt::denial::{ControlPageDenialError, ControlPageDenials},
+    npt::table_guard::TableWriteDenials,
+};
 
 const PS: u64 = 1 << 7;
 const LARGE_PAT: u64 = 1 << 12;
@@ -82,6 +86,9 @@ pub enum CacheNptError {
     Storage,
     Entry,
     NonIdentity,
+    Address(AddressError),
+    ControlDenial(ControlPageDenialError),
+    GuestAddressOutsideDomain,
     MemoryType,
     NonUniformPage,
 }
@@ -114,25 +121,112 @@ pub fn retype_identity_policy(
     source: &[[u8; PAGE_BYTES]],
     destination: &mut [[u8; PAGE_BYTES]],
     table_base: u64,
+    select: impl FnMut(u64, u64) -> Result<Option<CacheMapping>, CacheNptError>,
+) -> Result<usize, CacheNptError> {
+    rebuild(
+        source,
+        destination,
+        table_base,
+        None,
+        &ControlPageDenials::EMPTY,
+        TableWriteDenials::EMPTY,
+        select,
+    )
+}
+
+/// Reapply the retained CPU denial policy while constructing inactive tables.
+/// This also removes ranges from a legacy identity tree or a recoverable cache
+/// quarantine. All present/recoverable source leaves must be identity mappings;
+/// physical aliases are rejected even if their GPA lies in a denied range.
+///
+/// A denial becomes an ordinary zero hole before the memory-type callback can
+/// restore it. Subsequent legacy retypes also preserve that zero permanently.
+/// The physical policy validates both entire assigned backing spans, every leaf
+/// and the denial plan. The caller still owns allocation/protection, installation
+/// and all-CPU TLB invalidation. A returned error never changes the source; after
+/// a failed emission the destination is cleared and must not be installed.
+pub fn retype_identity_policy_with_denials(
+    source: &[[u8; PAGE_BYTES]],
+    destination: &mut [[u8; PAGE_BYTES]],
+    table_base: u64,
+    policy: AddressPolicy,
+    denied: &ControlPageDenials,
+    select: impl FnMut(u64, u64) -> Result<Option<CacheMapping>, CacheNptError>,
+) -> Result<usize, CacheNptError> {
+    denied.validate(policy).map_err(CacheNptError::ControlDenial)?;
+    rebuild(source, destination, table_base, Some(policy), denied, TableWriteDenials::EMPTY, select)
+}
+
+/// Preserve separate readable table-source guards through cache reconstruction.
+pub fn retype_identity_policy_with_guards(
+    source: &[[u8; PAGE_BYTES]],
+    destination: &mut [[u8; PAGE_BYTES]],
+    table_base: u64,
+    policy: AddressPolicy,
+    denied: &ControlPageDenials,
+    write_denied: TableWriteDenials<'_>,
+    select: impl FnMut(u64, u64) -> Result<Option<CacheMapping>, CacheNptError>,
+) -> Result<usize, CacheNptError> {
+    denied.validate(policy).map_err(CacheNptError::ControlDenial)?;
+    TableWriteDenials::new(policy, write_denied.pages())?;
+    rebuild(source, destination, table_base, Some(policy), denied, write_denied, select)
+}
+
+fn rebuild(
+    source: &[[u8; PAGE_BYTES]],
+    destination: &mut [[u8; PAGE_BYTES]],
+    table_base: u64,
+    policy: Option<AddressPolicy>,
+    denied: &ControlPageDenials,
+    write_denied: TableWriteDenials<'_>,
     mut select: impl FnMut(u64, u64) -> Result<Option<CacheMapping>, CacheNptError>,
 ) -> Result<usize, CacheNptError> {
     if source.is_empty()
         || destination.is_empty()
+        || source.len() > CACHE_TABLE_COUNT
+        || destination.len() > CACHE_TABLE_COUNT
         || table_base & 4095 != 0
         || table_base & !ADDRESS_MASK != 0
         || table_base
-            .checked_add((destination.len() as u64) * PAGE_BYTES as u64)
+            .checked_add((source.len().max(destination.len()) * PAGE_BYTES) as u64)
             .is_none_or(|end| end > ADDRESS_MASK + PAGE_BYTES as u64)
     {
         return Err(CacheNptError::Storage);
     }
+    if let Some(policy) = policy {
+        policy
+            .validate(table_base, (source.len() * PAGE_BYTES) as u64, PAGE_BYTES as u64)
+            .map_err(CacheNptError::Address)?;
+        policy
+            .validate(table_base, (destination.len() * PAGE_BYTES) as u64, PAGE_BYTES as u64)
+            .map_err(CacheNptError::Address)?;
+    }
     for page in destination.iter_mut() {
         page.fill(0);
     }
-    let mut builder = Builder { source, destination, table_base, used: 1, select: &mut select };
+    let mut builder = Builder {
+        source,
+        destination,
+        table_base,
+        policy,
+        denied,
+        write_denied,
+        used: 1,
+        select: &mut select,
+    };
     for index in 0..512 {
-        let entry = builder.entry(0, index)?;
-        let value = builder.node(entry, 4, (index as u64) << 39)?;
+        let result =
+            builder.entry(0, index).and_then(|entry| builder.node(entry, 4, (index as u64) << 39));
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                // No stale PRESENT link survives a partially emitted image.
+                for page in builder.destination.iter_mut() {
+                    page.fill(0);
+                }
+                return Err(error);
+            }
+        };
         builder.put(0, index, value);
     }
     Ok(builder.used)
@@ -142,6 +236,9 @@ struct Builder<'a, F> {
     source: &'a [[u8; PAGE_BYTES]],
     destination: &'a mut [[u8; PAGE_BYTES]],
     table_base: u64,
+    policy: Option<AddressPolicy>,
+    denied: &'a ControlPageDenials,
+    write_denied: TableWriteDenials<'a>,
     used: usize,
     select: &'a mut F,
 }
@@ -167,15 +264,35 @@ impl<F: FnMut(u64, u64) -> Result<Option<CacheMapping>, CacheNptError>> Builder<
             if address != start {
                 return Err(CacheNptError::NonIdentity);
             }
-            if let Some(mapping) = (self.select)(start, start + length)? {
+            if let Some(policy) = self.policy {
+                policy.validate(address, length, length).map_err(CacheNptError::Address)?;
+                if start + length > 1u64 << policy.physical_bits().min(40) {
+                    return Err(CacheNptError::GuestAddressOutsideDomain);
+                }
+            }
+            if self.denied.covers(start, start + length) {
+                return Ok(0);
+            }
+            let table_source = self.write_denied.intersects(start, start + length);
+            let mapping =
+                if self.denied.intersects(start, start + length) || (table_source && level > 1) {
+                    None
+                } else {
+                    (self.select)(start, start + length)?
+                };
+            if let Some(mapping) = mapping {
                 let index = match mapping {
-                    CacheMapping::Quarantine => return Ok((entry & !PRESENT) | QUARANTINED),
+                    CacheMapping::Quarantine => {
+                        return Ok((entry & !(PRESENT | if table_source { WRITE } else { 0 }))
+                            | QUARANTINED);
+                    }
                     CacheMapping::Pat(index) => index,
                 };
                 if index > 7 {
                     return Err(CacheNptError::MemoryType);
                 }
-                return Ok((entry & !(CACHE_BITS | pat_bit))
+                return Ok((entry
+                    & !(CACHE_BITS | pat_bit | if table_source { WRITE } else { 0 }))
                     | (u64::from(index & 3) << 3)
                     | if index & 4 != 0 { pat_bit } else { 0 });
             }

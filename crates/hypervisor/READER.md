@@ -1,9 +1,9 @@
 # Supplied-image memory reader
 
-The resident now also uses the bounded [local VMMCALL batch interface](../../LOCAL-READ.md)
-for same-PC process reads. The image-reader APIs below remain useful for offline
-captures and initial client-side discovery; repeated live samples execute in the
-resident batch engine.
+The unauthenticated local VMMCALL interface has been retired. The image-reader
+APIs and bounded batch engine remain available for offline captures and tests;
+the supported resident has no live reader service. Restoring protected same-PC
+reading depends on the [private-interface plan](PRIVATE-INTERFACE-PLAN.md).
 
 This `no_std` library translates addresses, reads bytes, and discovers processes in
 caller-supplied memory images. The [hypervisor](README.md)
@@ -36,6 +36,13 @@ no reads and leave the entire output untouched.
 
 ## Finding a process in an image
 
+The process APIs accept `read::VirtualRead`. A physical callback implements it
+automatically; annotate closure output arguments as `&mut [u8]` when needed for
+type inference. `read::VirtualReader` adapts a virtual callback, allowing live
+discovery to perform page walks inside the resident without duplicating the
+process-list validation. Either provider must preserve completed prefixes and
+translate freshly on every read.
+
 `process::ProcessProfile::new` validates caller-supplied `ProcessLayoutEvidence`: the
 EPROCESS size, field alignment, complete field spans, nonoverlap, and the explicitly
 permitted low directory-table-base bits. Structural validation does not establish
@@ -51,6 +58,13 @@ backlinks and sentinel closure, rejects duplicate matching PIDs, and limits trav
 to at most 4,096 process nodes. Missing image pages, invalid pointers, malformed links,
 and exhausted bounds return explicit errors; a provisional match is never returned
 from an incomplete list. Work is bounded in callback count, not callback execution time.
+
+Nearby PID and list links share one read of at most 64 bytes. `process::visit_fields`
+also accepts caller-owned scratch covering additional EPROCESS fields, so listing
+metadata needs no second object pass. If a later page is unavailable after the PID
+and links were copied, the visitor receives that node without metadata. Required-field
+failures still stop traversal. Visitors run before the final sentinel check, so callers
+discard accumulated results on error. Every touched page is translated afresh.
 
 `ProcessObservation` contains the observed PID, EPROCESS address, optional creation
 time, and normalized process kernel PML4 address. The creation time remains absent

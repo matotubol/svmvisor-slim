@@ -113,6 +113,13 @@ impl Vmcb {
         self.write_u64::<GUEST_RIP>(next.address());
     }
 
+    /// Apply an admitted emulated destination in the VMCB-owned stack register.
+    /// Operand, effect and continuation checks must precede this infallible step.
+    /// RSP contains guest data; a MOV to it need not produce a canonical pointer.
+    pub(crate) fn commit_emulated_stack_pointer(&mut self, rsp: u64) {
+        self.write_u64::<GUEST_RSP>(rsp);
+    }
+
     /// EFER policy has checked the logical value and its architectural faults.
     /// Preserve mandatory hardware SVME and invalidate translations after a
     /// paging-permission change (APM2 15.16, Appendix B TLB_CONTROL=1).

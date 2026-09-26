@@ -37,6 +37,8 @@ pub enum Outcome {
     PageFaultReflected,
     /// Physical interrupt remains pending for canonical native delivery.
     InterruptPending,
+    /// Canonical controls restored; ordinary #GP dispatch must process this exit.
+    GeneralProtectionIntercepted,
 }
 
 /// Caller-owned stable NPT walk, never inferred from the exit's U/S bit.
@@ -78,7 +80,7 @@ impl<'a> Trial<'a> {
             || vmcb.guest_cpl() != 3
             || !vmcb.guest_in_64_bit_code()
             || vmcb.read_u64::<NESTED_CONTROL>() != 1
-            || vmcb.read_u32::<EXCEPTIONS>() != 0
+            || vmcb.read_u32::<EXCEPTIONS>() & !super::NATIVE_EXCEPTION_INTERCEPTS != 0
             || vmcb.read_u32::<GUEST_ASID>() == 0
             || vmcb.virtual_interrupt_control() != 0
         {
@@ -95,7 +97,7 @@ impl<'a> Trial<'a> {
             *value = u32::from_le_bytes(bytes.try_into().unwrap());
         }
         vmcb.write_u64::<NESTED_CONTROL>(1 | GMET);
-        vmcb.write_u32::<EXCEPTIONS>(PF);
+        vmcb.write_u32::<EXCEPTIONS>(intercepts[2] | PF);
         vmcb.request_full_tlb_flush();
         vmcb.invalidate_all();
         Ok(Self {
@@ -166,6 +168,13 @@ impl<'a> Trial<'a> {
         self.restore();
         controls?;
         let exit = self.vmcb.exit_snapshot();
+        if exit.code == crate::svm::exit::EXIT_GP
+            && self.intercepts[2] == super::NATIVE_EXCEPTION_INTERCEPTS
+            && self.vmcb.event_injection() & VALID == 0
+            && self.vmcb.virtual_interrupt_control() == 0
+        {
+            return Ok(Outcome::GeneralProtectionIntercepted);
+        }
         if pending_event(self.vmcb) || self.vmcb.virtual_interrupt_control() != 0 {
             return Err(Error::PendingEvent);
         }

@@ -1,4 +1,4 @@
-//! Connection settings. The defaults suit an interactive program on a confirmed runtime boot.
+//! Retained reader settings. No setting enables the retired live interface.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -6,8 +6,8 @@ use svmvisor_hypervisor::reader::process::MAX_PROCESS_NODES;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub(crate) kernel: PathBuf,
-    pub(crate) pdb: PathBuf,
+    _kernel: PathBuf,
+    _pdb: PathBuf,
     pub(crate) cpu: u16,
     pub(crate) max_nodes: usize,
     pub(crate) max_calls: Option<u64>,
@@ -29,11 +29,12 @@ pub(crate) struct ManualContext {
 }
 
 impl Config {
-    /// `kernel` and `pdb` must be the running Windows kernel's `ntoskrnl.exe` and its PDB.
+    /// Retains the kernel and PDB paths for source compatibility.
+    /// [`crate::Svm::connect`] returns [`crate::ErrorKind::ReaderDisabled`] without opening them.
     pub fn new(kernel: impl Into<PathBuf>, pdb: impl Into<PathBuf>) -> Self {
         Self {
-            kernel: kernel.into(),
-            pdb: pdb.into(),
+            _kernel: kernel.into(),
+            _pdb: pdb.into(),
             cpu: 0,
             max_nodes: MAX_PROCESS_NODES,
             max_calls: None,
@@ -45,7 +46,7 @@ impl Config {
         }
     }
 
-    /// Processor (group 0, 0..=31) the connecting thread is pinned to while connected.
+    /// Retained CPU preference (group 0, 0..=31); live connections do not pin a thread.
     pub fn cpu(mut self, cpu: u16) -> Self {
         self.cpu = cpu;
         self

@@ -51,6 +51,7 @@ pub(super) fn address_error_code(error: svmvisor_hypervisor::memory::address::Ad
 pub(super) fn identity_npt_error_code(
     error: svmvisor_hypervisor::memory::npt::IdentityNptError,
 ) -> u64 {
+    use svmvisor_hypervisor::memory::npt::ControlPageDenialError as D;
     use svmvisor_hypervisor::memory::npt::IdentityNptError::*;
     match error {
         RequiredModeNotEstablished => 1,
@@ -60,6 +61,14 @@ pub(super) fn identity_npt_error_code(
         TableArenaOutsideExclusion => 5,
         GuestAddressOutsideWidth => 6,
         StorageBounds => 7,
+        // Preserve the existing diagnostic categories: denial plans are
+        // exclusions, and nested address failures retain their precise code.
+        ControlDenial(error) => match error {
+            D::Address(error) => 16 + address_error_code(error),
+            D::Capacity => 7,
+            D::OutsideIdentityDomain => 6,
+            D::PartialPage | D::UnsortedOrOverlapping => 4,
+        },
         Address(error) => 16 + address_error_code(error),
     }
 }

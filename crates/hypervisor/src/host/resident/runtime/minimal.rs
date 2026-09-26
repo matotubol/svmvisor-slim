@@ -15,6 +15,7 @@ use crate::{
 /// Refuse profile drift before another entry, without changing guest state.
 pub(super) fn valid(vmcb: &Vmcb) -> bool {
     !vmcb.instruction_intercept(InstructionIntercept::Cpuid)
+        && vmcb.native_exception_intercepts_valid()
         && !vmcb.cr3_intercepted()
         && [
             InstructionIntercept::Vmrun,
@@ -98,6 +99,25 @@ mod tests {
         assert!(valid(&vmcb));
         vmcb.set_instruction_intercept(InstructionIntercept::Cpuid, true);
         assert!(!valid(&vmcb));
+    }
+
+    #[test]
+    fn exception_profile_drift_refuses_without_repair() {
+        for mask in [0u32, 1 << 6, (1 << 13) | (1 << 14), u32::MAX] {
+            let mut vmcb = Vmcb::new();
+            vmcb.configure_native_boot_intercepts().unwrap();
+            // SAFETY: exclusive inert VMCB and its in-bounds exception bitmap.
+            unsafe {
+                ptr::from_mut(&mut vmcb)
+                    .cast::<u8>()
+                    .add(0x008)
+                    .cast::<u32>()
+                    .write_unaligned(mask);
+            }
+            let before = *vmcb.bytes();
+            assert!(!valid(&vmcb));
+            assert_eq!(*vmcb.bytes(), before);
+        }
     }
 
     #[test]

@@ -313,7 +313,7 @@ fn endpoint_tables_preserve_every_neighbor_page_and_stay_within_capacity() {
 fn oversized_out_of_profile_and_unowned_pool_tables_refuse_without_writes() {
     let p = policy(48);
     for (base, len, table_base, expected) in [
-        (0x200000, (32 << 20) + 4096, 0x200000, IdentityNptError::InvalidExclusion),
+        (0x200000, (32 << 20) + 0x3263000, 0x200000, IdentityNptError::InvalidExclusion),
         (0x3ff00000, 0x200000, 0x3ff00000, IdentityNptError::InvalidExclusion),
         (0x40000000, 0x200000, 0x40000000, IdentityNptError::InvalidExclusion),
         (0x201000, 0x400001, 0x201000, IdentityNptError::InvalidExclusion),

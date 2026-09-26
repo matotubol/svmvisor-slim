@@ -51,9 +51,10 @@ step() {
 
 step "fmt workspace"            cargo fmt --all -- --check
 step "test workspace"           cargo test --workspace
-# The resident-runtime features only link with --lib: the integration tests
+# The resident-runtime feature only links with --lib: the integration tests
 # cannot resolve the runtime's assembly symbols.
 step "test hypervisor resident-runtime (lib)"      cargo test -p svmvisor-hypervisor --lib --features resident-runtime
+step "test hypervisor offline trial primitives (lib)" cargo test -p svmvisor-hypervisor --lib --features svm-entry-trial
 for feature in card-resident-dev-loader card-resident-loader; do
     step "test card-loader $feature" cargo test -p svmvisor-card-loader --features "$feature"
 done

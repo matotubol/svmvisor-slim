@@ -1,6 +1,6 @@
 //! Serialized BSP installation: payload delivery, per-slot preparation, admission and
 //! publication of the resident pool before READY.
-use core::{ptr, sync::atomic::Ordering};
+use core::{arch::x86_64::__cpuid_count, ptr, sync::atomic::Ordering};
 
 use svmvisor_card_abi::package::Package;
 
@@ -13,12 +13,15 @@ use svmvisor_hypervisor::firmware::native::{
 };
 use svmvisor_hypervisor::{
     arch::x86_64::capabilities::EvidenceFlag,
-    memory::npt::{NptEvidence, TableStorage},
+    memory::npt::{CacheTableStorage, NptEvidence},
 };
 use svmvisor_hypervisor::{
-    arch::x86_64::msr::PAT,
+    arch::x86_64::msr::{MMIO_CFG_BASE_ADDR, PAT, TARGET_PHYSICAL_BITS, TARGET_SIGNATURE},
     boot::memory::ValidatedMemoryMap,
-    host::resident::{self as abi, ResidentDirectory},
+    host::resident::{
+        self as abi, ResidentDirectory,
+        configuration::{ROUTE_EXPECTATION_OFFSET, RouteExpectation},
+    },
     memory::address::AddressPolicy,
 };
 use uefi_raw::{
@@ -81,7 +84,7 @@ pub(crate) unsafe fn install(image: Handle, table: *mut SystemTable) -> Status {
             return status;
         }
     };
-    let result = unsafe { install_inner(image, &*boot_services) };
+    let result = unsafe { install_inner(image, &*boot_services, table) };
 
     if result.is_ok() && READY.load(Ordering::Acquire) {
         unsafe { handoff.commit(boot_services) };
@@ -100,7 +103,11 @@ pub(crate) unsafe fn install(image: Handle, table: *mut SystemTable) -> Status {
     }
 }
 
-unsafe fn install_inner(image: Handle, boot_services: &BootServices) -> Result<(), Status> {
+unsafe fn install_inner(
+    image: Handle,
+    boot_services: &BootServices,
+    table: *const SystemTable,
+) -> Result<(), Status> {
     preparation_step(2, 0);
     let processor = unsafe { cpu() }.map_err(unsupported)?;
 
@@ -108,6 +115,21 @@ unsafe fn install_inner(image: Handle, boot_services: &BootServices) -> Result<(
     let inventory =
         unsafe { resident::processors::inspect(boot_services) }.map_err(|_| Status::UNSUPPORTED)?;
     let count = inventory.processors().len();
+
+    // Capture one common route before any CPU can enter the guest. Every arm
+    // revalidates its own live register against this retained expectation.
+    // PPR57896 p210 applies only to this exact target; gate RDMSR first.
+    let signature = __cpuid_count(1, 0).eax;
+    if signature != TARGET_SIGNATURE || processor.physical_bits != TARGET_PHYSICAL_BITS {
+        return Err(Status::UNSUPPORTED);
+    }
+    let expected_route = RouteExpectation::new(
+        signature,
+        processor.physical_bits,
+        unsafe { rdmsr(MMIO_CFG_BASE_ADDR) },
+        count,
+    )
+    .ok_or(Status::UNSUPPORTED)?;
 
     let bsp = inventory.bsp_number();
     let common = inventory.processors()[bsp].identity;
@@ -196,6 +218,39 @@ unsafe fn install_inner(image: Handle, boot_services: &BootServices) -> Result<(
             preparation_step(12, arena.slot_base(slot).unwrap_or(0));
             unsafe { arena.initialize_slot(&package, slot) }.map_err(|_| Status::LOAD_ERROR)?;
         }
+        let retained = abi::retained_iommu_base(arena.base(), arena.bytes() as u64)
+            .ok_or(Status::LOAD_ERROR)?;
+        unsafe { super::iommu::mapped_backing(map.descriptors(), cfg, &mt, pat, retained, true) }
+            .map_err(unsupported)?;
+        // Capture directly into admitted lifetime backing after image copies.
+        // Partial/failed discovery is retained as information, never authority.
+        // No accessor survives failure: the arena still owns rollback here.
+        unsafe {
+            super::iommu::capture(
+                table,
+                map.descriptors(),
+                cfg,
+                &mt,
+                pat,
+                policy,
+                expected_route,
+                count,
+                retained,
+            )
+        }?;
+        unsafe { super::iommu::prepare_resources(arena.base(), arena.bytes() as u64, policy) }?;
+        unsafe {
+            super::iommu::prepare_presentation(
+                arena.base(),
+                arena.bytes() as u64,
+                policy,
+                expected_route,
+                count,
+            )
+        }?;
+        unsafe {
+            super::control_policy::publish(retained, arena.base(), policy, expected_route, count)
+        }?;
         map.release()?;
     }
     let mut directories = [ResidentDirectory::default(); abi::MAX_RESIDENT_CPUS];
@@ -258,6 +313,14 @@ unsafe fn install_inner(image: Handle, boot_services: &BootServices) -> Result<(
     }
 
     {
+        // The same page is aliased by every private host root and excluded by
+        // every guest NPT. No firmware pointer or mutable guest copy is kept.
+        let destination = (arena.base() + abi::STARTUP_PAGE_OFFSET + ROUTE_EXPECTATION_OFFSET)
+            as *mut RouteExpectation;
+        unsafe { destination.write(expected_route) };
+    }
+
+    {
         use svmvisor_hypervisor::svm::startup::NativeStartupMailbox;
         const _: () = assert!(
             core::mem::size_of::<NativeStartupMailbox>() * abi::MAX_RESIDENT_CPUS
@@ -309,8 +372,11 @@ unsafe fn install_inner(image: Handle, boot_services: &BootServices) -> Result<(
             physical_boot::admission_clear();
             preparation_step(17, d.arena_base);
             physical_boot::admission_begin(10, slot as u32, d.apic_id as u32);
-            let mut _npt = resident::memory::prepare_identity_npt(
-                unsafe { &mut *(d.npt as *mut TableStorage) },
+            let denied =
+                unsafe { super::control_policy::read(d.pool_base, d.pool_bytes, policy, count) }
+                    .map_err(unsupported)?;
+            let mut _npt = resident::memory::prepare_identity_npt_with_denials(
+                unsafe { &mut (*(d.npt as *mut CacheTableStorage)).0 },
                 d.npt,
                 policy,
                 pool,
@@ -322,6 +388,7 @@ unsafe fn install_inner(image: Handle, boot_services: &BootServices) -> Result<(
                 },
                 EvidenceFlag::Set,
                 pat,
+                &denied,
             )
             .map_err(|error| {
                 let code = resident_memory_error_code(error);
@@ -337,7 +404,15 @@ unsafe fn install_inner(image: Handle, boot_services: &BootServices) -> Result<(
                 }
             })?;
 
-            card_boot::protect_config(&mut _npt).map_err(|error| {
+            unsafe {
+                super::configuration::protect(
+                    &mut _npt,
+                    expected_route,
+                    processor.physical_bits,
+                    count,
+                )
+            }
+            .map_err(|error| {
                 let code = identity_npt_error_code(error);
                 admission_hint(637, d.npt, d.pool_base, code);
                 unsafe {

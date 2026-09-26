@@ -5,7 +5,7 @@ use crate::{
     arch::x86_64::{apic, registers::GuestRegisters},
     host::resident::{
         runtime::{
-            MSRPM, State, diagnostics, image_base, local,
+            MSRPM, State, image_base,
             msr::{read_msr, write_msr},
             stop::{stop, terminal_requested},
             svmvisor_resident_init_acks, svmvisor_resident_nmi_pending,
@@ -104,8 +104,6 @@ pub(super) unsafe fn service_startup(
         }
         if effect == NativeStartupEffect::Init {
             state.efer = efer;
-            // SAFETY: INIT committed on this stopped CPU, which owns its local channel.
-            unsafe { local::reset() };
             unsafe { svmvisor_resident_reset_guest_debug() };
         }
         if effect == NativeStartupEffect::Started {
@@ -125,7 +123,7 @@ pub(super) unsafe fn service_startup(
 
 /// Once the guest has started every application processor, this CPU no longer
 /// routes INIT/SIPI: its own ICR goes straight to the physical LAPIC, so IPIs
-/// stop exiting, and routine progress records stop. A later guest INIT to a
+/// stop exiting. A later guest INIT to a
 /// running CPU is then taken as a private wake and dropped; the guest does not
 /// re-INIT started CPUs without a platform reset. Each runtime owns its MSRPM,
 /// which the next VMRUN on this CPU reads.
@@ -145,7 +143,6 @@ pub(super) unsafe fn finish_guest_startup(state: &mut State, vmcb: &mut Vmcb) {
     }
     // Hardware may retain permission-map state even though the base is unchanged.
     vmcb.permission_maps_changed();
-    diagnostics::quiet_progress();
     state.guest_started = true;
 }
 

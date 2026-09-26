@@ -11,7 +11,7 @@ use crate::{
     boot::memory::{MemoryDescriptor, MemoryError, ValidatedMemoryMap},
     memory::{
         address::{AddressPolicy, PhysicalRange},
-        npt::{IdentityNpt, IdentityNptError, NptEvidence, TableStorage},
+        npt::{ControlPageDenials, IdentityNpt, IdentityNptError, NptEvidence, TableStorage},
     },
 };
 
@@ -42,10 +42,45 @@ pub fn prepare_identity_npt<'a>(
     one_gib_pages: EvidenceFlag,
     source_pat: u64,
 ) -> Result<IdentityNpt<'a>, ResidentMemoryError> {
+    prepare_identity_npt_with_denials(
+        &mut storage.0,
+        table_base,
+        policy,
+        monitor,
+        descriptors,
+        evidence,
+        one_gib_pages,
+        source_pat,
+        &ControlPageDenials::EMPTY,
+    )
+}
+
+/// The native installer and every callback rebuild use the retained control
+/// policy. The whole monitor remains excluded independently of these holes.
+pub fn prepare_identity_npt_with_denials<'a>(
+    storage: &'a mut [[u8; 4096]],
+    table_base: u64,
+    policy: AddressPolicy,
+    monitor: PhysicalRange,
+    descriptors: &[MemoryDescriptor],
+    evidence: NptEvidence,
+    one_gib_pages: EvidenceFlag,
+    source_pat: u64,
+    denied: &ControlPageDenials,
+) -> Result<IdentityNpt<'a>, ResidentMemoryError> {
     use ResidentMemoryError as E;
     validate_runtime_coverage(monitor, descriptors, policy.physical_bits())?;
-    IdentityNpt::new(storage, table_base, policy, monitor, evidence, one_gib_pages, source_pat)
-        .map_err(E::Npt)
+    IdentityNpt::new_with_denied_ranges(
+        storage,
+        table_base,
+        policy,
+        monitor,
+        evidence,
+        one_gib_pages,
+        source_pat,
+        denied,
+    )
+    .map_err(E::Npt)
 }
 
 /// Check actual supplied map records for continuous retained WB-capable runtime

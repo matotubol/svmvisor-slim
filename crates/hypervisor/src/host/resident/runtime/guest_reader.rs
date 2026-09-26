@@ -639,6 +639,68 @@ mod tests {
     }
 
     #[test]
+    fn generated_control_denials_block_software_aliases_across_cache_rebuilds() {
+        extern crate std;
+
+        use crate::{
+            arch::x86_64::capabilities::EvidenceFlag,
+            memory::npt::{
+                CACHE_TABLE_COUNT, CacheMapping, ControlPageDenials, IdentityNpt, NptEvidence,
+                retype_identity_policy,
+            },
+        };
+
+        let policy =
+            AddressPolicy::new(48, EncryptionState::Unencrypted { encryption_bit: None }).unwrap();
+        let table_base = 0x200_000;
+        let monitor = policy.validate(table_base, 0x100_000, 4096).unwrap();
+        let denied_address = 0xfed8_1000;
+        let denied = ControlPageDenials::new(
+            policy,
+            &[policy.validate(denied_address, 0x4000, 4096).unwrap()],
+        )
+        .unwrap();
+        let config = PagingConfig {
+            cr3: table_base,
+            physical_bits: 48,
+            la57: false,
+            nxe: true,
+            pcid: false,
+            page1gb: true,
+        };
+        let mut source = std::vec![[0; PAGE_BYTES]; CACHE_TABLE_COUNT];
+        let mut destination = std::vec![[0; PAGE_BYTES]; CACHE_TABLE_COUNT];
+        IdentityNpt::new_with_denied_ranges(
+            &mut source,
+            table_base,
+            policy,
+            monitor,
+            NptEvidence {
+                nx_supported: EvidenceFlag::Set,
+                host_nxe: EvidenceFlag::Set,
+                host_four_level: EvidenceFlag::Set,
+            },
+            EvidenceFlag::Set,
+            6,
+            &denied,
+        )
+        .unwrap();
+        for mapping in [CacheMapping::Quarantine, CacheMapping::Pat(0), CacheMapping::Pat(0)] {
+            for page in (denied_address..denied_address + 0x4000).step_by(PAGE_BYTES) {
+                for writable in [false, true] {
+                    assert!(!nested_fragment(config, &source, page, PAGE_BYTES, writable));
+                }
+            }
+            retype_identity_policy(&source, &mut destination, table_base, |_, _| Ok(Some(mapping)))
+                .unwrap();
+            core::mem::swap(&mut source, &mut destination);
+        }
+        assert!(nested_fragment(config, &source, denied_address - 4096, PAGE_BYTES, true));
+        assert!(nested_fragment(config, &source, denied_address + 0x4000, PAGE_BYTES, true));
+        assert!(!nested_fragment(config, &source, table_base, PAGE_BYTES, false));
+    }
+
+    #[test]
     fn denied_startup_fetch_refuses_before_low_memory_control_sampling() {
         static LOW_RAM: [MemoryDescriptor; 1] = [MemoryDescriptor {
             memory_type: 7,

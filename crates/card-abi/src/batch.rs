@@ -1,7 +1,7 @@
 //! Transport-independent batch wire contract. CRC protects framing, not authentication.
 
 pub const MAGIC: u32 = 0x3242_5453;
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const REQUEST_BYTES: usize = 256;
 pub const HEADER_BYTES: usize = 64;
 pub const MAX_RANGES: usize = 8;
@@ -15,6 +15,10 @@ pub struct BatchRequest {
     pub boot: u64,
     pub sequence: u64,
     pub token: u64,
+    /// Explicit aligned PML4 for `Virtual`; zero for every other operation.
+    pub root_pa: u64,
+    /// Virtual paging mode: physical width in bits 7:0, NXE in bit 8, 1 GiB pages in bit 9.
+    pub paging: u32,
     pub count: usize,
     pub ranges: [BatchRange; MAX_RANGES],
     pub binding: BindingEvidence,
@@ -33,6 +37,7 @@ impl BatchRequest {
             1 => Operation::Physical,
             2 => Operation::Bind,
             3 => Operation::Sample,
+            4 => Operation::Virtual,
             _ => return Err(FrameError::Operation),
         };
         let mut request = Self {
@@ -41,6 +46,8 @@ impl BatchRequest {
             boot: wide(bytes, 16),
             sequence: wide(bytes, 24),
             token: wide(bytes, 32),
+            root_pa: 0,
+            paging: 0,
             count: word(bytes, 40) as usize,
             ranges: [BatchRange::EMPTY; MAX_RANGES],
             binding: BindingEvidence::EMPTY,
@@ -55,10 +62,10 @@ impl BatchRequest {
                 }
                 48
             }
-            Operation::Physical | Operation::Sample => {
+            Operation::Physical | Operation::Sample | Operation::Virtual => {
                 if request.count == 0
                     || request.count > MAX_RANGES
-                    || (operation == Operation::Physical && request.token != 0)
+                    || (operation != Operation::Sample && request.token != 0)
                     || (operation == Operation::Sample && request.token == 0)
                 {
                     return Err(FrameError::Shape);
@@ -82,7 +89,22 @@ impl BatchRequest {
                 if total > MAX_DATA_BYTES {
                     return Err(FrameError::Shape);
                 }
-                48 + request.count * 16
+                let end = 48 + request.count * 16;
+                if operation == Operation::Virtual {
+                    // Eight range slots end at 176. The root follows them, even for fewer ranges.
+                    request.root_pa = wide(bytes, 176);
+                    request.paging = word(bytes, 184);
+                    if request.root_pa & 4095 != 0
+                        || !(32..=52).contains(&(request.paging & 0xff))
+                        || request.paging & !0x3ff != 0
+                        || bytes[end..176].iter().any(|byte| *byte != 0)
+                    {
+                        return Err(FrameError::Shape);
+                    }
+                    188
+                } else {
+                    end
+                }
             }
             Operation::Bind => {
                 if request.count != 0 || request.token != 0 || word(bytes, 108) > 0x0fff {
@@ -152,6 +174,10 @@ impl BatchRequest {
                 put_word(&mut bytes, 56 + index * 16, range.length);
             }
         }
+        if self.operation == Operation::Virtual {
+            put_wide(&mut bytes, 176, self.root_pa);
+            put_word(&mut bytes, 184, self.paging);
+        }
         let crc = crc32(&bytes[..252]);
         put_word(&mut bytes, 252, crc);
         bytes
@@ -206,6 +232,8 @@ pub enum Operation {
     Physical = 1,
     Bind = 2,
     Sample = 3,
+    /// Read virtual ranges using `root_pa`, without changing the process binding.
+    Virtual = 4,
 }
 
 #[repr(u32)]
@@ -217,6 +245,8 @@ pub enum Status {
     Binding = 3,
     Read = 4,
     Shape = 5,
+    /// Virtual translation failed; the session and binding remain usable.
+    Translation = 6,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,6 +326,8 @@ mod tests {
             boot: 8,
             sequence: 7,
             token: 0,
+            root_pa: 0,
+            paging: 0,
             count: 1,
             ranges,
             binding: BindingEvidence::EMPTY,
@@ -324,10 +356,35 @@ mod tests {
         let crc = crc32(&bytes[..252]);
         put_word(&mut bytes, 252, crc);
         assert_eq!(BatchRequest::decode(&bytes), Err(FrameError::Shape));
-        put_word(&mut bytes, 4, u32::from(VERSION) | (4 << 16));
+        put_word(&mut bytes, 4, u32::from(VERSION) | (5 << 16));
         let crc = crc32(&bytes[..252]);
         put_word(&mut bytes, 252, crc);
         assert_eq!(BatchRequest::decode(&bytes), Err(FrameError::Operation));
+    }
+
+    #[test]
+    fn virtual_requests_validate_mode_root_slots_and_protocol_version() {
+        let mut request = physical();
+        request.operation = Operation::Virtual;
+        request.root_pa = 0x1234_5000;
+        request.paging = 48 | (1 << 8) | (1 << 9);
+        assert_eq!(BatchRequest::decode(&request.encode()), Ok(request));
+        for (root_pa, paging) in [(1, 48), (0, 31), (0, 53), (0, 48 | (1 << 10))] {
+            let invalid = BatchRequest { root_pa, paging, ..request };
+            assert_eq!(BatchRequest::decode(&invalid.encode()), Err(FrameError::Shape));
+        }
+        for offset in [64, 175, 188, 251] {
+            let mut bytes = request.encode();
+            bytes[offset] = 1;
+            let crc = crc32(&bytes[..252]);
+            put_word(&mut bytes, 252, crc);
+            assert_eq!(BatchRequest::decode(&bytes), Err(FrameError::Shape));
+        }
+        let mut bytes = request.encode();
+        put_word(&mut bytes, 4, 2 | (4 << 16));
+        let crc = crc32(&bytes[..252]);
+        put_word(&mut bytes, 252, crc);
+        assert_eq!(BatchRequest::decode(&bytes), Err(FrameError::Header));
     }
 
     #[test]

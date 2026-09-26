@@ -6,13 +6,18 @@
 //! This provides register semantics, not nested VMRUN. The target-specific address checks
 //! follow PPR 57896 physical pages 213-216 and APM volume 2 physical page 647. SVM key
 //! reads return zero (PPR physical page 216; APM physical pages 648-649).
+//! Documented invalid accesses to SMM_CTL, AVIC_DOORBELL and VIRTUAL_TOM prepare
+//! #GP through the existing MSR intercept, without intercepting exceptions.
 
 use x86_64::registers::rflags::RFlags;
 
 use crate::{
     arch::x86_64::{
         capabilities::ValidatedCapabilities,
-        msr::{TARGET_PHYSICAL_BITS, TARGET_SIGNATURE, TSC_RATIO, TSC_RATIO_DEFINED, VM_CR_LOCK},
+        msr::{
+            AVIC_DOORBELL, SMM_CTL, TARGET_PHYSICAL_BITS, TARGET_SIGNATURE, TSC_RATIO,
+            TSC_RATIO_DEFINED, VIRTUAL_TOM, VM_CR_LOCK,
+        },
         registers::GuestRegisters,
     },
     svm::{
@@ -32,7 +37,7 @@ pub const SMM_ADDR: u32 = 0xc001_0112;
 pub const SMM_MASK: u32 = 0xc001_0113;
 
 pub const fn owned_msr(index: u32) -> bool {
-    matches!(index, VM_HSAVE_PA | SVM_LOCK_KEY | TSC_RATIO)
+    matches!(index, VM_HSAVE_PA | SVM_LOCK_KEY | TSC_RATIO | SMM_CTL | AVIC_DOORBELL | VIRTUAL_TOM)
 }
 
 const HSAVE_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
@@ -232,12 +237,23 @@ fn complete_control_msr(
         return Err(E::BackingMismatch);
     }
     let input = (u64::from(frame.rdx as u32) << 32) | u64::from(vmcb.guest_rax() as u32);
+    // The owner's address policy admits only the CPU with NoSmmCtlMSR fixed at
+    // one (PPR physical page 117). The boundary above rejects SEV/ES/SNP, so
+    // VIRTUAL_TOM cannot be accessed (PPR physical page 216). AVIC doorbell
+    // reads always fault (APM2 physical page 641). These faults leave RIP and
+    // instruction/debug state intact; no access reaches a physical MSR.
     if vmcb.guest_cpl() != 0
+        || matches!(index, SMM_CTL | VIRTUAL_TOM)
+        || (!write && index == AVIC_DOORBELL)
         || (write && index == VM_HSAVE_PA && !owner.address_policy.permits(input))
         || (write && index == TSC_RATIO && input & !TSC_RATIO_DEFINED != 0)
     {
         vmcb.queue_validated_msr_general_protection(instruction).map_err(E::Fault)?;
         return Ok(NativeMsrOutcome::GeneralProtectionPrepared);
+    }
+    // Doorbell writes need an AVIC owner; do not treat them as key writes.
+    if index == AVIC_DOORBELL {
+        return Err(E::UnsupportedMsr { index, write });
     }
     if (!startup_owned && !vmcb.guest_in_64_bit_code())
         || (startup_owned && !native_startup_instruction_mode(vmcb, instruction.length()))

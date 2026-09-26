@@ -48,7 +48,7 @@ pub fn parse_adapter_khz(text: &str) -> Result<u32, String> {
 }
 
 /// Build, package and check one development payload; flash only on request.
-pub fn dev(flash: bool, adapter_khz: u32, entry_trial: bool) -> Result<(), String> {
+pub fn dev(flash: bool, adapter_khz: u32) -> Result<(), String> {
     let root = resident::root();
     let base = root.join("target").join("card-dev");
     let out = base.join(fresh_name());
@@ -57,11 +57,7 @@ pub fn dev(flash: bool, adapter_khz: u32, entry_trial: bool) -> Result<(), Strin
     println!("card-dev: {}", out.display());
 
     println!("[1/4] cargo xtask resident -> resident/");
-    if entry_trial {
-        resident::build_entry_trial(&resident_dir)?;
-    } else {
-        resident::build(&resident_dir)?;
-    }
+    resident::build(&resident_dir)?;
 
     println!("[2/4] package-payload.py --resident -> payload/");
     let card = root.join("firmware/card");
@@ -122,7 +118,12 @@ pub fn dev(flash: bool, adapter_khz: u32, entry_trial: bool) -> Result<(), Strin
     let record = Value::Map(vec![
         ("schema_version".into(), Value::Int(1)),
         ("loader_mode".into(), Value::str("dev")),
-        ("entry_trial".into(), Value::Bool(entry_trial)),
+        ("entry_trial".into(), Value::Bool(false)),
+        ("reader_enabled".into(), Value::Bool(false)),
+        ("authenticated_reader".into(), Value::Bool(false)),
+        ("native_iommu_bootstrap".into(), Value::str("enabled-translated-no-ats-v1")),
+        ("guest_release_enabled".into(), Value::Bool(false)),
+        ("windows_boot_candidate".into(), Value::Bool(false)),
         ("low_runtime".into(), Value::Bool(true)),
         ("child_bytes".into(), Value::Int(header.payload_bytes as i64)),
         ("child_sha256".into(), Value::str(&child_sha)),
@@ -338,9 +339,12 @@ fn run_logged(
 ) -> Result<(), String> {
     let executable = resident::which(program).ok_or(format!("missing tool {program}"))?;
     let sink = io(fs::File::create(log), "create", log)?;
+    let temporary = resident::process_temp(root, program)?;
     let status = Command::new(&executable)
         .args(args)
         .current_dir(root)
+        .env("TEMP", &temporary)
+        .env("TMP", &temporary)
         .stdin(Stdio::null())
         .stdout(io(sink.try_clone(), "create", log)?)
         .stderr(sink)
@@ -372,9 +376,12 @@ fn flash_card(root: &Path, arguments: &[&OsStr], what: &str) -> Result<(), Strin
 fn run(root: &Path, program: &OsStr, args: &[&OsStr], what: &str) -> Result<(), String> {
     let name = program.to_string_lossy();
     let executable = resident::which(&name).ok_or(format!("missing tool {name}"))?;
+    let temporary = resident::process_temp(root, &name)?;
     let status = Command::new(&executable)
         .args(args)
         .current_dir(root)
+        .env("TEMP", &temporary)
+        .env("TMP", &temporary)
         .stdin(Stdio::null())
         .status()
         .map_err(|error| format!("{what}: cannot run {}: {error}", executable.display()))?;

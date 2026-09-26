@@ -1,41 +1,20 @@
-//! Read another Windows process's memory through the resident svmvisor runtime, with calls
-//! shaped like `OpenProcess` and `ReadProcessMemory`. No driver and no process handle with
-//! read rights is involved; each read is one VMMCALL session served by the hypervisor.
+//! Retained reader API and offline batch-engine validation.
 //!
-//! ```no_run
-//! use svmvisor_live_reader::{Config, Svm};
+//! Live access is disabled while the authenticated interface is being designed.
+//! The legacy guest transport has been removed. [`Svm::connect`] is safe and always returns
+//! [`ErrorKind::ReaderDisabled`] before checking profiles or making any native call.
 //!
-//! # fn main() -> Result<(), svmvisor_live_reader::Error> {
-//! let config = Config::new("target/kernel-analysis/ntoskrnl.exe", "target/kernel-analysis/ntkrnlmp.pdb");
-//! // SAFETY: this boot runs the redesigned svmvisor runtime.
-//! let mut svm = unsafe { Svm::connect(config)? };
-//! let entry = svm
-//!     .list_processes()?
-//!     .into_iter()
-//!     .find(|process| process.name.eq_ignore_ascii_case("malware.exe"))
-//!     .expect("malware.exe is running");
-//! let malware = svm.attach(&entry)?;
-//!
-//! let client = svm.module(malware, "client.dll")?.expect("client.dll is loaded");
-//! let something: u32 = svm.read_module_value(malware, &client, 0x2040)?;
-//! let exe = svm.main_module(malware)?.expect("the loader lists the executable");
-//! let something2: [f32; 3] = svm.read(malware, exe.base + 0x2100)?;
-//!
-//! let mut name = [0u8; 32];
-//! let mut flags = [0u8; 4];
-//! svm.read_batch(malware, &mut [(client.base + 0x3000, &mut name), (client.base + 0x3100, &mut flags)])?;
-//! # Ok(())
-//! # }
+//! ```
+//! use svmvisor_live_reader::{Config, ErrorKind, Svm};
+//! let config = Config::new("ntoskrnl.exe", "ntkrnlmp.pdb");
+//! let error = Svm::connect(config).err().expect("live reading is disabled");
+//! assert_eq!(error.kind(), ErrorKind::ReaderDisabled);
 //! ```
 //!
-//! A connection belongs to the thread that made it: that thread is pinned to one CPU while the
-//! connection lives, and `Svm` is neither `Send` nor `Sync`. Errors say what is still usable;
-//! see [`ErrorKind`].
-//!
-//! Windows is never asked for anything: the process list is the kernel's own, walked through
-//! the runtime, and no process is opened through Windows. The PEB address and bitness come
-//! from the process's kernel object, and every byte of target memory, including the loader's
-//! module list, comes from the runtime.
+//! Existing read types and methods remain for source compatibility and in-memory regression
+//! tests. They do not provide an alternate connection or an authentication mechanism.
+
+#![forbid(unsafe_code)]
 
 mod binding;
 mod bridge;

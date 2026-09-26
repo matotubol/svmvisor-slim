@@ -6,7 +6,7 @@ use crate::{
         paging::PagingConfig,
         resident::{
             BridgeContext, DIRECTORY_VERSION, IMAGE_LIMIT_OFFSET, MAX_RESIDENT_CPUS,
-            ResidentDirectory,
+            ResidentDirectory, pool_bytes_for_processors,
         },
     },
 };
@@ -46,7 +46,7 @@ pub fn pool_valid(directories: &[ResidentDirectory]) -> bool {
     if directories.len() > MAX_RESIDENT_CPUS {
         return false;
     }
-    let pool_bytes = directories.len() as u64 * ARENA_BYTES as u64;
+    let Some(pool_bytes) = pool_bytes_for_processors(directories.len()) else { return false };
     directories.iter().enumerate().all(|(slot, d)| {
         first.pool_base.checked_add(slot as u64 * ARENA_BYTES as u64).is_some_and(|base| {
             directory_valid(d, base)
@@ -89,7 +89,7 @@ pub fn directory_valid(d: &ResidentDirectory, base: u64) -> bool {
         (d.vmcb, 4096, 4096),
         (d.auxiliary, 4096, 4096),
         (d.registers, core::mem::size_of::<GuestRegisters>() as u64, 8),
-        (d.npt, core::mem::size_of::<crate::memory::npt::TableStorage>() as u64, 4096),
+        (d.npt, core::mem::size_of::<crate::memory::npt::CacheTableStorage>() as u64, 4096),
     ];
     for (i, &(address, bytes, alignment)) in objects.iter().enumerate() {
         if address < d.data_start

@@ -384,7 +384,8 @@ fn native_intercepts_keep_svm_stopped_and_pass_real_boot_instructions() {
     ] {
         assert!(!vmcb.instruction_intercept(instruction));
     }
-    assert_eq!(&vmcb.bytes()[..12], &[0; 12]);
+    assert_eq!(&vmcb.bytes()[..8], &[0; 8]); // CR and DR accesses stay native.
+    assert_eq!(&vmcb.bytes()[8..12], &(1u32 << 13).to_le_bytes()); // Only #GP.
     put(&mut vmcb, 0x60, 1 << 24);
     let original = *vmcb.bytes();
     assert!(vmcb.configure_native_boot_intercepts().is_err());

@@ -25,6 +25,10 @@ use crate::{
         descriptors::HostDescriptorRequest,
         resident::{
             CACHE_SHARED_BYTES, CACHE_SHARED_OFFSET, DIRECTORY_VERSION, ResidentDirectory,
+            configuration::{ROUTE_EXPECTATION_OFFSET, RouteExpectation},
+            control::{CONTROL_MANIFEST_OFFSET, ControlManifest},
+            inventory::map_retained_backing,
+            pool_processor_count,
             runtime::{
                 ASSIGNED_APIC_ID, AUX, CONTEXT, FAULT_STACK, FRAME, GDT_TSS, GDTR, HOST_EXTRA,
                 HSAVE, IDT, IDTR, IOPM, MSRPM, NMI_STACK, NPT, PHYSICAL_BITS, POOL, RAM, RAM_COUNT,
@@ -40,7 +44,7 @@ use crate::{
         control_msrs::{HsaveAddressPolicy, SMM_ADDR, SMM_MASK, VM_HSAVE_PA, VisibleSvmControls},
         dispatch::NativeEfer,
         instructions::NativeSvmInstructions,
-        permission_maps::{MsrAccess, Msrpm, Permission},
+        permission_maps::Msrpm,
         startup::{NativeDestinationMode, NativeIcr, NativeStartupMailbox, try_lock_routes},
     },
 };
@@ -160,6 +164,9 @@ pub unsafe extern "win64" fn prepare(
         tables[3][((alias >> 12) & 511) as usize] =
             (pool_base + CACHE_SHARED_OFFSET + offset) | 3 | (1 << 63);
     }
+    if !map_retained_backing(tables, root, base, pool_base, pool_bytes) {
+        return 5;
+    }
     let vmcb = unsafe { &mut *ptr::addr_of_mut!(VMCB) };
     if vmcb.configure_native_boot_intercepts().is_err() {
         return 4;
@@ -223,7 +230,8 @@ pub unsafe extern "win64" fn prepare(
 /// identity, 2 CPU capabilities, 3 EFER, 4 bootstrap ACK sites, 5 VMCB
 /// controls, 6 memory map, 7 CPU inventory, 8 native x2APIC admission,
 /// 9 startup ownership and its commit, 10 terminal endpoint, 13 VM_CR outside
-/// the visible profile, 14 cache capture, 15 guest SVM control admission
+/// the visible profile, 14 cache capture, 15 guest SVM control admission,
+/// 16 permanent configuration-route admission/interception
 /// (11 and 12 keep their historical meanings).
 /// Refusals occur before physical VM_CR INIT redirection is committed.
 unsafe extern "win64" fn arm(
@@ -278,7 +286,7 @@ unsafe extern "win64" fn arm(
         || !(ids as usize).is_multiple_of(core::mem::align_of::<u32>())
         || id_count == 0
         || id_count > 32
-        || id_count as u64 != unsafe { POOL.1 } / 0x100000
+        || Some(id_count) != pool_processor_count(unsafe { POOL.1 })
     {
         return 7;
     }
@@ -287,6 +295,51 @@ unsafe extern "win64" fn arm(
     let Ok(icr_owner) = NativeIcr::admit(assigned_id, ids) else {
         return 7;
     };
+    // All CPUs bind the common BSP observation retained in the excluded pool.
+    // This is independent of optional terminal admission, and never confers
+    // DMA ownership. Per-CPU route drift or unsupported apertures refuse arm.
+    let expectation = unsafe {
+        ((POOL.0 + super::STARTUP_PAGE_OFFSET + ROUTE_EXPECTATION_OFFSET)
+            as *const RouteExpectation)
+            .read()
+    };
+    let Some(configuration) = expectation.admit(
+        TARGET_SIGNATURE,
+        caps.address_policy().physical_bits(),
+        unsafe { read_msr(MMIO_CFG_BASE_ADDR) },
+        id_count,
+    ) else {
+        return 16;
+    };
+    let (configuration_base, configuration_bytes) = configuration.aperture();
+    let (pool_base, pool_bytes) = unsafe { POOL };
+    if configuration_base < pool_base + pool_bytes
+        && pool_base < configuration_base + configuration_bytes
+    {
+        return 16;
+    }
+    let policy = caps.address_policy();
+    let Ok(pool) = policy.validate(pool_base, pool_bytes, 4096) else { return 16 };
+    let manifest = unsafe {
+        ((pool_base + super::STARTUP_PAGE_OFFSET + CONTROL_MANIFEST_OFFSET)
+            as *const ControlManifest)
+            .read()
+    };
+    let Ok(control_denials) =
+        manifest.denials(policy, TARGET_SIGNATURE, configuration.raw(), id_count, pool)
+    else {
+        return 16;
+    };
+    let platform_io = unsafe {
+        ((pool_base
+            + super::STARTUP_PAGE_OFFSET
+            + crate::host::resident::platform::PLATFORM_IO_OFFSET)
+            as *const crate::host::resident::platform::PlatformIo)
+            .read()
+    };
+    if !platform_io.validate(configuration, id_count) {
+        return 16;
+    }
     // SAFETY: arm owns the same native CPU/LAPIC with IF=0 and validated inventory;
     // initial_icr is the admitted immutable caller input; the retained pool owns both pages.
     let interrupts =
@@ -301,16 +354,25 @@ unsafe extern "win64" fn arm(
         if !unsafe { diagnostics::prepare(endpoint, slot, id_count) } {
             return 10;
         }
-        let io = unsafe { &mut *ptr::addr_of_mut!(IOPM) };
-        if io.set_range(0, 65536, Permission::Allow).is_err()
-            || io.set_range(0xcf8, 8, Permission::Intercept).is_err()
-            || unsafe { &mut *ptr::addr_of_mut!(MSRPM) }
-                .set(MMIO_CFG_BASE_ADDR, MsrAccess::Write, Permission::Intercept)
-                .is_err()
-        {
-            return 10;
-        }
-        vmcb.set_instruction_intercept(crate::svm::vmcb::InstructionIntercept::Ioio, true);
+    }
+    if configuration
+        .install_native_intercepts(
+            unsafe { &mut *ptr::addr_of_mut!(IOPM) },
+            unsafe { &mut *ptr::addr_of_mut!(MSRPM) },
+            vmcb,
+        )
+        .is_err()
+        || !platform_io.install(unsafe { &mut *ptr::addr_of_mut!(IOPM) })
+        || crate::memory::npt::set_identity_write_range(
+            unsafe { &mut (*ptr::addr_of_mut!(NPT)).0 },
+            ptr::addr_of!(NPT) as u64,
+            configuration_base,
+            configuration_bytes,
+            false,
+        )
+        .is_err()
+    {
+        return 16;
     }
     // Capture only enumerated same-CPU features, before the first guest entry.
     // Guest FXSR and INVLPG execute directly; VMRUN/VMEXIT owns EFER switching.
@@ -412,9 +474,10 @@ unsafe extern "win64" fn arm(
     // Software startup commands retain the existing target-owned mailbox.
     // Ordinary fixed IPIs retain their physical destination and LAPIC state.
     let slot = ids.iter().position(|&id| id == assigned_id).unwrap();
-    if !unsafe { super::cache::capture(POOL.0, slot, ids) } {
+    if !unsafe { super::cache::capture(POOL.0, slot, ids, policy, &control_denials) } {
         return 14;
     }
+    state.control_denials = control_denials;
     let Ok(routes) = try_lock_routes(shared) else {
         return 9;
     };
@@ -447,8 +510,10 @@ unsafe extern "win64" fn arm(
     state.slot = ids.iter().position(|&id| id == assigned_id).unwrap();
     state.count = id_count;
     state.terminal_endpoint = endpoint;
+    state.configuration = Some(configuration);
+    state.platform_io = Some(platform_io);
     // Retain the maintenance opportunity through startup. Steady-state entry
-    // disables it unless a deferred NMI or configuration window still needs it.
+    // disables it unless a deferred NMI still needs it.
     state.pause_filter_supported =
         vmcb.configure_native_pause_filter(__cpuid_count(0x8000_000a, 0).edx);
     vmcb.set_event_intercept(crate::svm::vmcb::EventIntercept::Init, true);

@@ -93,7 +93,7 @@ fn field_mutation_can_return_a_process_tuple_that_never_existed_together() {
     let mut changed = false;
     let observed = find(42, &mut |pa, bytes| {
         image.read(pa, bytes)?;
-        if pa == PID && !changed {
+        if pa <= PID && pa + bytes.len() as u64 >= PID + 8 && !changed {
             // Once PID 42 has been sampled, retire it before publishing the new root/time.
             image.word(PID, 84);
             image.word(ROOT, 0xc000);
@@ -103,7 +103,7 @@ fn field_mutation_can_return_a_process_tuple_that_never_existed_together() {
         Ok(())
     });
     assert!(changed);
-    assert_eq!(image.calls, 15);
+    assert_eq!(image.calls, 12);
     assert_eq!(
         observed,
         ProcessObservation {
@@ -123,7 +123,7 @@ fn field_mutation_can_return_a_process_tuple_that_never_existed_together() {
     );
     assert_eq!(report, ReadReport { bytes_read: 8, error: None });
     assert_eq!(&output, b"new data");
-    assert_eq!(image.calls, 20);
+    assert_eq!(image.calls, 17);
     let current = find(84, &mut |pa, bytes| image.read(pa, bytes));
     assert_eq!(current, ProcessObservation { pid: 84, ..observed });
 }
@@ -149,7 +149,7 @@ fn reusing_pid_object_and_root_does_not_make_an_old_observation_a_handle() {
     );
     assert_eq!(report, ReadReport { bytes_read: 8, error: None });
     assert_eq!(&output, b"new data");
-    assert_eq!(image.calls, 35);
+    assert_eq!(image.calls, 29);
 }
 
 #[test]
@@ -179,5 +179,5 @@ fn successful_cross_page_read_can_combine_bytes_from_different_generations() {
     assert_eq!(report, ReadReport { bytes_read: 8, error: None });
     assert_eq!(&output, b"OLD!NEW!");
     assert_eq!(&image.bytes[0xaffc..0xb004], b"NEW!NEW!");
-    assert_eq!(image.calls, 25);
+    assert_eq!(image.calls, 22);
 }

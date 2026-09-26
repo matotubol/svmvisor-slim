@@ -40,10 +40,17 @@ impl NativeSvmInstructions {
             skinit: extended_cpuid_ecx & (1 << 12) != 0,
         })
     }
+
+    /// STGI and SKINIT have independent enable gates (APM3 physical pages 507 and 514).
+    /// Every other owned instruction requires logical EFER.SVME.
+    pub(crate) const fn requires_svme(&self, instruction: NativeSvmInstruction) -> bool {
+        !(matches!(instruction, NativeSvmInstruction::Stgi | NativeSvmInstruction::Skinit)
+            && (self.svm_lock || self.skinit))
+    }
 }
 
 /// Hardware-decoded instruction identities (APM volume 2 physical page 819).
-/// VMMCALL belongs to the separately installed local ABI and is excluded.
+/// VMMCALL is handled separately by the one-shot bootstrap and unclaimed-call dispatcher.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeSvmInstruction {
     Invlpga,
@@ -129,14 +136,11 @@ pub fn handle_native_svm_instruction(
     let logical_efer = efer
         .observe_backing(vmcb.guest_cr0(), vmcb.guest_efer())
         .map_err(NativeSvmInstructionError::Efer)?;
-    let independent_enable =
-        matches!(instruction, NativeSvmInstruction::Stgi | NativeSvmInstruction::Skinit)
-            && (owner.svm_lock || owner.skinit);
     // Mode and enable faults precede privilege faults. VM86 is not an admitted
     // protected execution mode for these instructions (APM3 exception tables).
     let fault = if vmcb.guest_cr0() & 1 == 0
         || vmcb.guest_rflags() & (1 << 17) != 0
-        || (logical_efer & EFER_SVME == 0 && !independent_enable)
+        || (logical_efer & EFER_SVME == 0 && owner.requires_svme(instruction))
     {
         NativeSvmInstructionOutcome::InvalidOpcodePrepared
     } else if vmcb.guest_cpl() != 0 {

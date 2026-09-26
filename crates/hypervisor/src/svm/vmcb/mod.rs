@@ -33,6 +33,8 @@ pub const VMCB_BYTES: usize = 4096;
 pub const VMCB_CONTROL_BYTES: usize = 0x400;
 
 const INTERCEPT_MISC1: usize = 0x00c;
+/// #GP is mediated to reconcile logical SVM state; all other exceptions are native.
+pub(crate) const NATIVE_EXCEPTION_INTERCEPTS: u32 = 1 << 13;
 const INTERCEPT_MISC2: usize = 0x010;
 const PAUSE_FILTER_THRESHOLD: usize = 0x03c;
 const PAUSE_FILTER_COUNT: usize = 0x03e;
@@ -61,7 +63,7 @@ const GUEST_RSP: usize = 0x5d8;
 const GUEST_S_CET: usize = 0x5e0;
 const GUEST_ISST_ADDR: usize = 0x5f0;
 const GUEST_RAX: usize = 0x5f8;
-#[cfg(any(feature = "resident-runtime", test))]
+#[cfg(test)]
 const GUEST_LSTAR: usize = 0x608;
 
 /// CPU layout alignment only: the object's address is not a physical address.
@@ -117,13 +119,13 @@ impl Vmcb {
         self.read_u64::<GUEST_CR3>()
     }
 
-    #[cfg(any(feature = "resident-runtime", test))]
+    #[cfg(test)]
     pub(crate) fn guest_cr4(&self) -> u64 {
         self.read_u64::<GUEST_CR4>()
     }
 
     /// Fresh only after the guest VMSAVE that precedes the resident dispatcher.
-    #[cfg(any(feature = "resident-runtime", test))]
+    #[cfg(test)]
     pub(crate) fn guest_lstar(&self) -> u64 {
         self.read_u64::<GUEST_LSTAR>()
     }

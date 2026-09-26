@@ -31,9 +31,9 @@ linked. The output directory must not exist; it keeps every artifact and one
    the `SVMRELO1` container that `crates/card-abi/src/package.rs` loads
    and `crates/hypervisor/build.rs` embeds through `SVMVISOR_RESIDENT_PAYLOAD`.
 6. Audit the linked payload (`src/audit.rs`): no undefined symbols
-   (`llvm-nm`); the continuing producer's entry and read-service
-   symbols are present and the one-shot experiment's entry symbols are
-   absent; over the `llvm-objdump` disassembly, no FP/SIMD/xstate
+   (`llvm-nm`); the required resident entry and world-switch symbols are present,
+   and retired local-reader/entry-trial exports are absent;
+   over the `llvm-objdump` disassembly, no FP/SIMD/xstate
    instruction, debug registers touched only by the exact DR0-3 reset helper,
    all 256 host fault frames, the capture sequence, SYS_CFG selection before
    physical CPUID/MSR sampling, the returning NMI gate and
@@ -48,22 +48,20 @@ linked. The output directory must not exist; it keeps every artifact and one
 
 `firmware/card/verify-resident-build.py` consumes the output directory.
 
-The GMET/#PF entry experiment is part of this workspace and is selected explicitly:
+The single supported payload disables live reading and the guest experiment:
 
 ```powershell
-cargo xtask resident --output target/native-resident/<fresh-name> --entry-trial
-cargo xtask card-dev --entry-trial
+cargo xtask resident --output target/native-resident/<fresh-name>
+cargo xtask card-dev
 ```
 
-The second command builds and packages the experimental card payload and runs offline
-flash checks. It does not flash without `--flash`. Both commands select
-`native-entry-trial`; the experiment remains dormant until its explicit VMMCALL ARM.
-Both build stages disable default features, so only the explicitly selected payload
-profile supplies optional interfaces. The linked-symbol audit requires the experiment's
-request/final/complete handlers in this profile and rejects every
-`svmvisor_entry_trial_` export in a standard build. `summary.json` records `entry_trial`
-and `payload_features`; `card-dev.json` also records `entry_trial`. A later standard
-build does not contain the experiment, even when built from this merged workspace.
+The second command packages the card payload and runs offline flash checks. It flashes
+only with `--flash`. Both commands select `resident-runtime` and disable default
+features. The retired `--entry-trial` flag is rejected before building or flashing.
+`summary.json` records `payload_features: "resident-runtime"`, `entry_trial: false`,
+`reader_enabled: false` and `authenticated_reader: false`; `card-dev.json` records
+the same disabled service status. The verifier rejects a mismatched profile or
+retired service export. These checks do not establish authenticated reading.
 
 `cargo xtask sources` prints the current source manifest, the same JSON a
 build records as `source-manifest.json`.
@@ -73,27 +71,21 @@ boot Windows, flash the card, or establish hardware compatibility.
 
 ## `cargo xtask live-read`
 
-`live-read` is a command-line wrapper around
-[`svmvisor-live-reader`](../live-reader/README.md), which programs should link
-directly. `cargo xtask live-read --help` describes local VMMCALL process batches. It requires
-`--live --local-runtime-v2`, matching kernel/PDB files, and finite node/call/time
-limits. Select `--auto-context` for bounded current-boot discovery, or supply all
-five explicit root/list/paging context flags. Automatic discovery requires the
-optional Context command and readable kernel mappings through the caller's root;
-it stops on inconsistent observations without retrying. The runtime flag
-acknowledges that the redesigned runtime is booted: probing the legacy runtime can
-stop the target. It is not safe runtime absence detection.
+`live-read --help` explains that the direct reader is disabled. Every execution
+request, including old acknowledgements and stdio flags, returns an explicit error
+before opening caller files or issuing a native call. `entry-trial` is also retired.
 
-`--stdio` keeps one pinned native session. Discovery and binding happen once;
-steady-state samples move translation and identity checks into the resident.
-Inputs accept a single `address,length` pair or up to eight `ranges`, totaling at
-most 4096 bytes. Any failure ends the session and discards the whole sample.
-`--cpu` selects a processor in group zero (default zero, maximum 31).
+The [reader library](../live-reader/README.md) and added
+[client library](../../client/README.md) report the same unavailable state. The
+client's existing picker can display that error. The same-PC protected replacement
+is specified in the [private-interface plan](../hypervisor/PRIVATE-INTERFACE-PLAN.md);
+no authenticated runtime service is implemented yet.
 
-The [Rust desktop client](../../client/README.md) invokes this mode directly.
-JTAG/FT601 scripts remain separate diagnostic tools. The local reader does not
-launch them or require a Windows driver. Offline builds and tests execute no live
-VMMCALL and do not establish runtime deployment or measured hardware performance.
+Card snapshots remain separate boot/card diagnostics. The resident publishes no
+live registers or progress. After the collective stop barrier it may publish a
+closed coarse reason category (phase 15h, detail 8); private fault details stay
+private. Offline builds and tests execute no live VMMCALL and do not establish
+deployment or hardware privacy.
 
 ## `cargo xtask rompack`
 

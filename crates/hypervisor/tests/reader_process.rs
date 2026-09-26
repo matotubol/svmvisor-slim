@@ -80,13 +80,15 @@ impl Image {
         let config = PagingConfig::new(48, true, true).unwrap();
         let profile = ProcessProfile::new(layout)?;
         let request = ProcessRequest { kernel_root_pa: 0x1000, list_head_va: HEAD, pid, max_nodes };
-        process::find(config, profile, request, &mut |pa, bytes| self.read(pa, bytes))
+        process::find(config, profile, request, &mut |pa, bytes: &mut [u8]| self.read(pa, bytes))
     }
 
     fn list(&mut self, nodes: &mut [ProcessNode]) -> Result<usize, ProcessError> {
         let config = PagingConfig::new(48, true, true).unwrap();
         let profile = ProcessProfile::new(layout())?;
-        process::list(config, profile, 0x1000, HEAD, nodes, &mut |pa, bytes| self.read(pa, bytes))
+        process::list(config, profile, 0x1000, HEAD, nodes, &mut |pa, bytes: &mut [u8]| {
+            self.read(pa, bytes)
+        })
     }
 
     fn read(&mut self, pa: u64, bytes: &mut [u8]) -> Result<(), PagingError> {
@@ -255,4 +257,122 @@ fn list_copies_every_node_in_order_within_the_slice_limit() {
     assert_eq!(image.list(&mut []), Err(ProcessError::InvalidNodeLimit));
     image.links(SECOND + 0x020, HEAD, HEAD);
     assert_eq!(image.list(&mut nodes), Err(ProcessError::CorruptLinks));
+}
+
+#[test]
+fn traversal_coalesces_pid_and_links_without_reading_creation_time_or_root() {
+    let mut image = Image::new();
+    // Head: five callbacks. FIRST's PID/link range crosses two noncontiguous pages:
+    // ten callbacks. SECOND fits one page: five callbacks. Previously this took thirty.
+    assert_eq!(image.find(99, 2), Ok(None));
+    assert_eq!(image.calls, 20);
+    image.calls = 0;
+    let mut nodes = [ProcessNode::default(); 2];
+    assert_eq!(image.list(&mut nodes), Ok(2));
+    assert_eq!(image.calls, 20);
+
+    // A distant PID remains a separate read rather than expanding a bounded field read.
+    image.virtual_word(FIRST + 0x0c0, 42);
+    image.virtual_word(SECOND + 0x0c0, 84);
+    image.calls = 0;
+    let evidence = ProcessLayoutEvidence { pid_offset: 0x0c0, ..layout() };
+    assert_eq!(image.with_layout(evidence, 99, 2), Ok(None));
+    assert_eq!(image.calls, 30);
+}
+
+#[test]
+fn combined_traversal_preserves_cross_page_fields_and_validates_the_tail() {
+    let config = PagingConfig::new(48, true, true).unwrap();
+    let profile = ProcessProfile::new(layout()).unwrap();
+    let request =
+        process::ProcessListRequest { kernel_root_pa: 0x1000, list_head_va: HEAD, max_nodes: 2 };
+    for corrupt in [false, true] {
+        let mut image = Image::new();
+        if corrupt {
+            image.links(HEAD, FIRST + 0x020, FIRST + 0x020);
+        }
+        let mut bytes = [0; 0x048];
+        let mut observed = Vec::new();
+        let result = process::visit_fields(
+            config,
+            profile,
+            request,
+            &mut process::ProcessFields { offset: 0x020, bytes: &mut bytes },
+            &mut |pa, bytes: &mut [u8]| image.read(pa, bytes),
+            &mut |node, bytes| {
+                let bytes = bytes.unwrap();
+                let time = u64::from_le_bytes(bytes[0x040..0x048].try_into().unwrap());
+                observed.push((node.pid, time));
+                Ok(())
+            },
+        );
+        assert_eq!(observed, [(42, 100), (84, 200)]);
+        assert_eq!(image.calls, 20);
+        assert_eq!(result, if corrupt { Err(ProcessError::CorruptLinks) } else { Ok(()) });
+    }
+}
+
+#[test]
+fn combined_traversal_skips_missing_metadata_but_requires_complete_pid_and_links() {
+    let mut image = Image::new();
+    // Place all required fields before a boundary; only optional metadata crosses it.
+    let first = 0x8f80;
+    image.links(HEAD, first + 0x020, SECOND + 0x020);
+    image.links(first + 0x020, SECOND + 0x020, HEAD);
+    image.virtual_word(first + 0x040, 42);
+    image.links(SECOND + 0x020, HEAD, first + 0x020);
+    image.word(0x4048, 0);
+    let request =
+        process::ProcessListRequest { kernel_root_pa: 0x1000, list_head_va: HEAD, max_nodes: 2 };
+    let config = PagingConfig::new(48, true, true).unwrap();
+    let profile = ProcessProfile::new(layout()).unwrap();
+    let mut bytes = [0; 0x0e0];
+    let mut observed = Vec::new();
+    process::visit_fields(
+        config,
+        profile,
+        request,
+        &mut process::ProcessFields { offset: 0x020, bytes: &mut bytes },
+        &mut |pa, bytes: &mut [u8]| image.read(pa, bytes),
+        &mut |node, bytes| {
+            observed.push((node.pid, bytes.is_some()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(observed, [(42, false), (84, true)]);
+
+    image.word(0x4040, 0);
+    let result = process::visit_fields(
+        config,
+        profile,
+        request,
+        &mut process::ProcessFields { offset: 0x020, bytes: &mut bytes },
+        &mut |pa, bytes: &mut [u8]| image.read(pa, bytes),
+        &mut |_, _| panic!("unreadable node must not reach the visitor"),
+    );
+    assert!(matches!(result, Err(ProcessError::Read(_))));
+}
+
+#[test]
+fn invalid_combined_field_ranges_fail_before_reading_memory() {
+    let config = PagingConfig::new(48, true, true).unwrap();
+    let profile = ProcessProfile::new(layout()).unwrap();
+    let request =
+        process::ProcessListRequest { kernel_root_pa: 0x1000, list_head_va: HEAD, max_nodes: 2 };
+    for (offset, length) in [(0, 0), (0x028, 0x040), (0x020, 0x020), (0x020, 0x100), (u32::MAX, 8)]
+    {
+        let mut bytes = vec![0; length];
+        assert_eq!(
+            process::visit_fields(
+                config,
+                profile,
+                request,
+                &mut process::ProcessFields { offset, bytes: &mut bytes },
+                &mut |_: u64, _: &mut [u8]| panic!("invalid range must not read memory"),
+                &mut |_, _| panic!("invalid range must not visit nodes"),
+            ),
+            Err(ProcessError::InvalidProfile),
+        );
+    }
 }

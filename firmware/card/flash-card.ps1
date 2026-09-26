@@ -53,7 +53,7 @@ $isRestore=($Action -eq 'Restore' -or [bool]$RestoreSession)
 $candidateInputs=@($candidatePin.Inputs | ForEach-Object { @{Name=$_.Name;Path=$_.Path;Bytes=[long]$_.Bytes;Hash=$_.Hash;Group='Candidate'} })
 # Fixed repository tool and hardware pins (recomputed from final file bytes).
 $fixedInputs=@(
-    @{Name='resident-verify.py';Path='firmware/card/verify-resident-build.py';Bytes=4816;Hash='06f9969f93163053bd2a135d9e52d0467cda2cd445f5a7488181a440a3769f15';Group='Candidate'},
+    @{Name='resident-verify.py';Path='firmware/card/verify-resident-build.py';Bytes=5303;Hash='513f4195e8dd872ce3d942c70a1b0454f277b3c8eb41a631b3fd58da2ffc7518';Group='Candidate'},
     @{Name='openocd.exe';Path='target/firmware/tools/openocd/bin/openocd.exe';Bytes=13664247;Hash='9732b05af7e0f6a05a0051371e49af42515662ad309ddcc87f86f9b434ce96d8';Group='Hardware'},
     @{Name='proxy.bit';Path='target/firmware/tools/lambda-squirrel/flash_screamer/bscan_spi_xc7a35t.bit';Bytes=261513;Hash='ef8af1e277a7fe556e1ed7ace4680d4993cfc4174616485e1c354793d784b7f6';Group='Hardware'},
     @{Name='transport.cfg';Path='firmware/card/openocd/card-transport.cfg';Bytes=-1;Hash='3a31fe2838566fc9653bd0306c7378da93c86beb2bde611f3038272b1c75e642';Group='Hardware'},

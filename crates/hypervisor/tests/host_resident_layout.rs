@@ -7,7 +7,7 @@ use svmvisor_hypervisor::host::resident::{
 
 #[test]
 fn resident_image_stops_below_shared_cache_diagnostic_and_startup_pages() {
-    assert_eq!(DIRECTORY_VERSION, 12);
+    assert_eq!(DIRECTORY_VERSION, 17);
     assert_eq!(IMAGE_LIMIT_OFFSET, 0xf0000);
     assert_eq!(IMAGE_LIMIT_OFFSET, CACHE_SHARED_OFFSET);
     assert_eq!(CACHE_SHARED_BYTES, 0x8000);
@@ -24,7 +24,7 @@ fn resident_image_stops_below_shared_cache_diagnostic_and_startup_pages() {
 #[test]
 fn host_apic_ids_fit_the_bootstrap_inventory() {
     let pool = 0x200000;
-    let bytes = 24 * 0x100000;
+    let bytes = 24 * 0x100000 + 0x3262000;
     // This machine's 24 IDs, one per dense slot.
     for (slot, id) in (0..=11).chain(16..=27).enumerate() {
         let slot = slot as u64;

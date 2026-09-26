@@ -1,0 +1,28 @@
+{
+  "observed_utc": "2026-09-26T12:16:32.2640515Z",
+  "method": "Windows EnumSystemFirmwareTables/GetSystemFirmwareTable ACPI provider; read-only",
+  "trust": "untrusted guest-reported inventory; not proof of firmware authenticity or hardware ownership",
+  "api_limit": "GetSystemFirmwareTable returns first table when signature repeats",
+  "tables": [
+    {
+      "signature": "IVRS",
+      "status": "captured_first_instance",
+      "instances": 1,
+      "bytes": 484,
+      "revision": 2,
+      "checksum_mod_256": 0,
+      "sha256": "103bb8e3c4699698f6bdb1f3e0091f01838c3db316ef99bde8dbac0001afcf79",
+      "path": "C:\\Users\\mato\\Documents\\svmvisor\\target\\fresh-private-interface-review\\IVRS.bin"
+    },
+    {
+      "signature": "MCFG",
+      "status": "captured_first_instance",
+      "instances": 1,
+      "bytes": 60,
+      "revision": 1,
+      "checksum_mod_256": 0,
+      "sha256": "8b78e1f2270e77c06f5421167e736c2f7fa1955a6e22c13c80ac1fe07ff817cb",
+      "path": "C:\\Users\\mato\\Documents\\svmvisor\\target\\fresh-private-interface-review\\MCFG.bin"
+    }
+  ]
+}

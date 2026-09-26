@@ -24,7 +24,7 @@ use svmvisor_hypervisor::{
     host::{descriptors::HostTablePointer, resident as abi},
     memory::{
         address::AddressPolicy,
-        npt::{NptEvidence, TableStorage},
+        npt::{CacheTableStorage, NptEvidence},
     },
     svm::vmcb::Vmcb,
 };
@@ -111,6 +111,28 @@ unsafe fn callback(b: &NativeBoundary, slot: usize) -> Result<(), u64> {
         AddressPolicy::new(processor.physical_bits, processor.encryption).map_err(|_| 13u64)?;
     unsafe { mapped(map, cfg, &mt, pat, d.arena_base, d.arena_bytes, true, true) }?;
     unsafe { host_closure(directories(), slot, map, processor, &mt, pat) }?;
+    // Arm reads common startup state under this native root before switching
+    // to its private shared alias. Validate the actual BSP backing here too.
+    let shared_startup = d.pool_base + abi::STARTUP_PAGE_OFFSET;
+    unsafe { mapped(map, cfg, &mt, pat, shared_startup, 4096, true, false) }?;
+    let route_expectation = unsafe {
+        ((shared_startup + abi::configuration::ROUTE_EXPECTATION_OFFSET)
+            as *const abi::configuration::RouteExpectation)
+            .read()
+    };
+    let control_denials =
+        unsafe { super::control_policy::read(d.pool_base, d.pool_bytes, policy, CPU_COUNT) }?;
+    let retained = abi::retained_iommu_base(d.pool_base, d.pool_bytes).ok_or(24u64)?;
+    unsafe {
+        super::iommu::mapped_backing(map, cfg, &mt, pat, retained, false)?;
+        super::iommu::validate_retained_header(
+            retained,
+            route_expectation,
+            processor.physical_bits,
+            CPU_COUNT,
+        )?;
+        super::iommu::validate_resource_header(d.pool_base, d.pool_bytes, policy)?;
+    }
     let current_rsp: u64;
     unsafe {
         asm!("mov {}, rsp", out(reg) current_rsp, options(nomem, nostack, preserves_flags));
@@ -271,9 +293,9 @@ unsafe fn callback(b: &NativeBoundary, slot: usize) -> Result<(), u64> {
             let isst_addr = unsafe { rdmsr(0x6a8) };
             vmcb.initialize_native_cet_msrs(s_cet, isst_addr).map_err(|_| 17u64)?;
         }
-        let storage = unsafe { &mut *(d.npt as *mut TableStorage) };
+        let storage = unsafe { &mut (*(d.npt as *mut CacheTableStorage)).0 };
         let monitor = policy.validate(d.pool_base, d.pool_bytes, 4096).map_err(|_| 18u64)?;
-        let mut _npt = resident::memory::prepare_identity_npt(
+        let mut _npt = resident::memory::prepare_identity_npt_with_denials(
             storage,
             d.npt,
             policy,
@@ -286,10 +308,19 @@ unsafe fn callback(b: &NativeBoundary, slot: usize) -> Result<(), u64> {
             },
             EvidenceFlag::Set,
             pat,
+            &control_denials,
         )
         .map_err(|_| 19u64)?;
 
-        card_boot::protect_config(&mut _npt).map_err(|_| 19u64)?;
+        unsafe {
+            super::configuration::protect(
+                &mut _npt,
+                route_expectation,
+                processor.physical_bits,
+                CPU_COUNT,
+            )
+        }
+        .map_err(|_| 19u64)?;
     }
 
     physical_boot::validate_x2apic()?;

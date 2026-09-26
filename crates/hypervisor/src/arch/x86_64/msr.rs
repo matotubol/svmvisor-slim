@@ -28,6 +28,8 @@ pub const MTRR_DEF_TYPE: u32 = 0x2ff;
 pub const EFER: u32 = 0xc000_0080;
 /// Secure Virtual Machine Enable (SVME, bit 12).
 pub const EFER_SVME: u64 = 1 << 12;
+/// Upper Address Ignore Enable, when enumerated by CPUID.
+pub const EFER_UAIE: u64 = 1 << 20;
 
 pub const TSC_AUX: u32 = 0xc000_0103;
 pub const TSC_RATIO: u32 = 0xc000_0104;
@@ -39,6 +41,10 @@ pub const TSC_RATIO_DEFINED: u64 = (1 << 40) - 1;
 pub const SYS_CFG: u32 = 0xc001_0010;
 pub const HWCR: u32 = 0xc001_0015;
 pub const TOM2: u32 = 0xc001_001d;
+/// PPR57896 physical p208: per-thread SMI I/O trap master control.
+pub const SMI_ON_IO_TRAP_CTL_STS: u32 = 0xc001_0054;
+/// IoTrapEn enables the SMI I/O/configuration trap mechanism (bit 15).
+pub const SMI_ON_IO_TRAP_ENABLE: u64 = 1 << 15;
 pub const MMIO_CFG_BASE_ADDR: u32 = 0xc001_0058;
 
 /// SYS_CFG bits 26:18; bits 63:27 and 17:0 are reserved.
@@ -71,4 +77,10 @@ pub const VM_CR_SVMDIS: u64 = 1 << 4;
 /// Architectural reserved high bits (APM volume 2, physical page 645).
 pub const VM_CR_MBZ: u64 = !0x1f;
 
+/// Absent on the admitted CPU: NoSmmCtlMSR is fixed at one (PPR physical page 117).
+pub const SMM_CTL: u32 = 0xc001_0116;
+/// Write-only AVIC doorbell; reads raise #GP (APM2 physical page 641).
+pub const AVIC_DOORBELL: u32 = 0xc001_011b;
 pub const SEV_STATUS: u32 = 0xc001_0131;
+/// Accessible only with VirtualTom and SNPActive (PPR physical page 216).
+pub const VIRTUAL_TOM: u32 = 0xc001_0135;

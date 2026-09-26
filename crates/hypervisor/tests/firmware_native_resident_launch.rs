@@ -20,9 +20,9 @@ fn directory(base: u64) -> ResidentDirectory {
         enter: base + 32,
         text_end: base + 0x8000,
         data_start: base + 0x10000,
-        memory_end: base + 0x30000,
+        memory_end: base + 0x60000,
         pool_base: base,
-        pool_bytes: 0x100000,
+        pool_bytes: 0x3362000,
         cpu_slot: 0,
         apic_id: 0,
 
@@ -36,7 +36,7 @@ fn pool(count: u64) -> Vec<ResidentDirectory> {
         .map(|slot| {
             let mut d = directory(0x200000 + slot * 0x100000);
             d.pool_base = 0x200000;
-            d.pool_bytes = count * 0x100000;
+            d.pool_bytes = count * 0x100000 + 0x3262000;
             d.cpu_slot = slot;
             d.apic_id = if slot < 12 { slot } else { slot + 4 };
             d
@@ -121,7 +121,7 @@ fn current_controls_still_refuse_unowned_protection_and_paging_modes() {
 
 #[test]
 fn relocated_directory_binds_disjoint_writable_objects_and_code_functions() {
-    for base in [0x100000, 0x280000, 0x3ff00000] {
+    for base in [0x200000, 0x400000, 0x3cc00000] {
         let d = directory(base);
         assert!(directory_valid(&d, base));
         assert!(!directory_valid(&d, base + 4096));
@@ -129,8 +129,23 @@ fn relocated_directory_binds_disjoint_writable_objects_and_code_functions() {
 }
 
 #[test]
+fn directory_admits_all_sixty_four_npt_pages_before_entry() {
+    let base = 0x200000;
+    let mut d = directory(base);
+    // Eight legacy pages fit, but the actual resident object does not.
+    d.memory_end = d.npt + 8 * 4096;
+    assert!(!directory_valid(&d, base));
+    d.memory_end = d.npt + 64 * 4096 - 1;
+    assert!(!directory_valid(&d, base));
+    d.memory_end += 1;
+    assert!(directory_valid(&d, base));
+    d.vmcb = d.npt + 63 * 4096;
+    assert!(!directory_valid(&d, base));
+}
+
+#[test]
 fn image_may_end_at_but_not_cross_the_diagnostic_alias_range() {
-    for base in [0x200000, 0x3ff00000] {
+    for base in [0x200000, 0x3cc00000] {
         let mut d = directory(base);
         d.memory_end = base + IMAGE_LIMIT_OFFSET;
         assert!(directory_valid(&d, base));
@@ -157,7 +172,7 @@ fn host_apic_ids_fit_the_physical_bootstrap_inventory() {
 
 #[test]
 fn only_complete_dense_pools_are_published() {
-    for count in [1, 2, 24, 32] {
+    for count in [1, 2, 3, 24, 32] {
         assert!(pool_valid(&pool(count)));
     }
     assert!(!pool_valid(&[]));
@@ -184,7 +199,7 @@ fn directory_binds_each_cpu_copy_to_the_complete_retained_pool() {
             let base = 0x200000 + slot * 0x100000;
             let mut d = directory(base);
             d.pool_base = 0x200000;
-            d.pool_bytes = count * 0x100000;
+            d.pool_bytes = count * 0x100000 + 0x3262000;
             d.cpu_slot = slot;
             d.apic_id = slot;
             assert!(directory_valid(&d, base));

@@ -22,8 +22,6 @@ uefi-raw = "0.15.1"
 [features]
 # Resident runtime selected only for the freestanding build stage.
 resident-runtime = []
-# One-shot stopped-VMCB experiment primitives.
+# Offline stopped-VMCB experiment primitives; no callable runtime interface.
 svm-entry-trial = []
-# Explicit native activation protocol, physical timer admission and exit adapter.
-native-entry-trial = ["resident-runtime", "svm-entry-trial"]
 

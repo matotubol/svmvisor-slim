@@ -18,9 +18,11 @@ class ResidentEvidenceTests(unittest.TestCase):
                  "source-manifest.json": json.dumps(source).encode(), "disassembly.log": b"audited",
                  "undefined.log": b"", "boot-audit-disassembly.log": b"boot",
                  "physical-audit-relocations.log": b"AP",
-                 "symbols.log": b"1000 T entry_uefi\n1020 T svmvisor_minimal_prepare\n1040 T svmvisor_resident_enter\n1060 T svmvisor_local_read_service\n"}
+                 "symbols.log": b"1000 T entry_uefi\n1020 T svmvisor_minimal_prepare\n1040 T svmvisor_resident_enter\n"}
         for name, data in files.items(): (root / name).write_bytes(data)
         summary = dict(boot=True, test_output=False, payload_only=False,
+                       entry_trial=False, reader_enabled=False, authenticated_reader=False,
+                       payload_features="resident-runtime",
                        no_fp_simd_xstate_instructions=True, undefined_symbols=0,
                        linked_instruction_count=10,
                        bootstrap_audit=dict(copied_section_relocations=0, copied_wait_bytes=95),
@@ -34,11 +36,18 @@ class ResidentEvidenceTests(unittest.TestCase):
                 root = Path(tmp); self.fixture(root)
                 result = verify.verify(root, root / "driver.efi", current=False)
                 self.assertFalse(result["physical_execution_proven"])
+                self.assertFalse(result["entry_trial"])
+                self.assertFalse(result["reader_enabled"])
+                self.assertFalse(result["authenticated_reader"])
                 (root / member).write_bytes(b"changed")
                 with self.assertRaises(ValueError): verify.verify(root, root / "driver.efi", current=False)
 
     def test_diagnostic_and_incomplete_audits_are_refused(self):
-        for field, value in (("boot", False), ("test_output", True), ("undefined_symbols", 1)):
+        for field, value in (("boot", False), ("test_output", True), ("undefined_symbols", 1),
+                             ("entry_trial", True), ("entry_trial", None),
+                             ("reader_enabled", True), ("reader_enabled", None), ("reader_enabled", 0),
+                             ("authenticated_reader", True), ("authenticated_reader", None),
+                             ("payload_features", "native-entry-trial"), ("payload_features", None)):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp); summary = self.fixture(root)
                 summary[field] = value
@@ -69,9 +78,11 @@ class ResidentEvidenceTests(unittest.TestCase):
                 verify.current_sources = original
 
     def test_minimal_rejects_missing_or_forbidden_linked_symbols(self):
-        required = ("entry_uefi", "svmvisor_minimal_prepare", "svmvisor_resident_enter",
-                    "svmvisor_local_read_service")
-        forbidden = ("svmvisor_minimal_enter", "svmvisor_minimal_stop", "svmvisor_minimal_halt")
+        required = ("entry_uefi", "svmvisor_minimal_prepare", "svmvisor_resident_enter")
+        forbidden = ("svmvisor_minimal_enter", "svmvisor_minimal_stop", "svmvisor_minimal_halt",
+                     "svmvisor_entry_trial_request", "svmvisor_entry_trial_final",
+                     "svmvisor_entry_trial_complete", "svmvisor_entry_trial_future_adapter",
+                     "svmvisor_local_read_service", "svmvisor_local_read_future_adapter")
         for name in required + forbidden:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp); summary = self.fixture(root)

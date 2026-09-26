@@ -130,9 +130,3 @@ pub enum CapabilityError {
     Address(AddressError),
     InvalidAsid,
 }
-
-/// Same-CPU architectural 1-GiB page support; this does not install any intercept.
-#[cfg(feature = "resident-runtime")]
-pub(crate) fn page1gb_supported() -> bool {
-    core::arch::x86_64::__cpuid_count(0x8000_0001, 0).edx & (1 << 26) != 0
-}

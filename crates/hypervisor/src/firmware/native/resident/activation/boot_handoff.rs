@@ -8,6 +8,10 @@ use super::*;
 static mut svmvisor_original_exit_boot_services: usize = 0;
 #[unsafe(no_mangle)]
 static svmvisor_boot_completed: AtomicU32 = AtomicU32::new(0);
+// 1 = physical IOMMU publication completed, guest contract incomplete. This
+// distinct hold is neither an activation failure nor permission for EBS return.
+#[unsafe(no_mangle)]
+static svmvisor_boot_hold_reason: AtomicU32 = AtomicU32::new(0);
 // MAX means the native boundary did not reach Rust; otherwise start's exact
 // bounded failure code remains available in retained DXE data.
 #[unsafe(no_mangle)]
@@ -95,6 +99,16 @@ unsafe extern "efiapi" fn svmvisor_boot_inner(
     let result = unsafe { physical_boot::start() };
     unsafe {
         svmvisor_boot_failure = result;
+    }
+    if result == super::iommu_takeover::PROTECTED_GUEST_CONTRACT_PENDING {
+        unsafe {
+            svmvisor_boot_failure = 0;
+        }
+        svmvisor_boot_hold_reason.store(1, Ordering::Release);
+        // Separate successful-protection/held-guest journal stage. No private
+        // addresses or per-requester facts are published here.
+        unsafe { card_boot::stage(6, 0, 1) };
+        return;
     }
     if result == 0 {
         unsafe { card_boot::stage(5, 0, 0) };

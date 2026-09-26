@@ -16,7 +16,7 @@ use crate::{
 pub const SLICE_BYTES: usize = 256;
 /// Six metadata ranges, at most two pages and five physical callbacks per page.
 pub const MAX_SLICE_CALLS: usize = 60;
-/// A local call may group four data fragments, but never mix them with metadata validation.
+/// A local call may group at most four data fragments, including a complete small sample.
 /// Four four-level translations plus their data reads need at most twenty callbacks.
 pub const MAX_DATA_SLICES_PER_CALL: usize = 4;
 /// Eight ranges add at most sixteen alignment fragments to sixteen full data slices.
@@ -122,6 +122,26 @@ impl BatchEngine {
         self.phase = match request.operation {
             Operation::Hello => BatchPhase::Idle,
             Operation::Physical => BatchPhase::Data,
+            Operation::Virtual => {
+                let width = (request.paging & 0xff) as u8;
+                let nxe = request.paging & (1 << 8) != 0;
+                let page_1g = request.paging & (1 << 9) != 0;
+                if width > config.physical_bits()
+                    || (nxe && !config.nxe())
+                    || (page_1g && !config.page_1g())
+                    || request.root_pa >> width != 0
+                    || request.ranges[..request.count].iter().any(|range| {
+                        !is_canonical_48(range.address)
+                            || !is_canonical_48(range.address + u64::from(range.length) - 1)
+                    })
+                {
+                    self.finish(Status::Shape);
+                    return Ok(());
+                }
+                // The wire codec checked width and reserved paging bits before admission.
+                self.config = Some(PagingConfig::new(width, nxe, page_1g).unwrap());
+                BatchPhase::Data
+            }
             Operation::Bind => {
                 self.binding = None;
                 let evidence = request.binding;
@@ -238,23 +258,31 @@ impl BatchEngine {
                 let count = SLICE_BYTES
                     .min(range.length as usize - self.offset)
                     .min(4096 - (address as usize & 4095));
-                let physical = if request.operation == Operation::Sample {
-                    let binding = self.binding.unwrap();
-                    match paging::translate(
-                        config,
-                        binding.observation.kernel_root_pa,
-                        address,
-                        &mut bounded,
-                    ) {
-                        Ok(translation) => translation.pa(),
-                        Err(_) => {
-                            self.finish(Status::Read);
-                            return true;
+                let physical =
+                    if matches!(request.operation, Operation::Sample | Operation::Virtual) {
+                        let root = if request.operation == Operation::Virtual {
+                            request.root_pa
+                        } else {
+                            // Sample admission checked the binding before entering the data phase.
+                            self.binding.unwrap().observation.kernel_root_pa
+                        };
+                        match paging::translate(config, root, address, &mut bounded) {
+                            Ok(translation) => translation.pa(),
+                            Err(error) => {
+                                let status = if request.operation == Operation::Virtual
+                                    && error != PagingError::PhysicalRead
+                                {
+                                    Status::Translation
+                                } else {
+                                    Status::Read
+                                };
+                                self.finish(status);
+                                return true;
+                            }
                         }
-                    }
-                } else {
-                    address
-                };
+                    } else {
+                        address
+                    };
                 if bounded(physical, &mut self.data[self.length..self.length + count]).is_err() {
                     self.finish(Status::Read);
                     return true;
@@ -278,16 +306,19 @@ impl BatchEngine {
         self.phase == BatchPhase::Complete
     }
 
-    /// Service one metadata phase or at most four data fragments (at most 1024 data bytes).
-    /// Metadata validation stays on each side of the data, in separate opportunities.
-    /// The whole call retains the single-phase callback ceiling; grouping never grants a
+    /// Complete a small sample when both validations and its data fit the callback ceiling.
+    /// Otherwise service one metadata phase or at most four data fragments (1024 data bytes).
+    /// The whole call retains the same callback ceiling; grouping never grants a
     /// fresh callback budget per fragment. This bounds work, not elapsed time: callers
     /// must separately validate their worst-case interrupt latency on the target machine.
     pub fn advance_bounded(
         &mut self,
         read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
     ) -> bool {
-        let limit = if self.phase == BatchPhase::Data { MAX_DATA_SLICES_PER_CALL } else { 1 };
+        let fast = self.fast_sample_steps();
+        let limit = fast.unwrap_or_else(|| {
+            if self.phase == BatchPhase::Data { MAX_DATA_SLICES_PER_CALL } else { 1 }
+        });
         let mut calls = 0;
         let mut bounded = |address, bytes: &mut [u8]| {
             if calls == MAX_SLICE_CALLS || bytes.len() > SLICE_BYTES {
@@ -300,11 +331,37 @@ impl BatchEngine {
             if self.advance(&mut bounded) {
                 return true;
             }
-            if self.phase != BatchPhase::Data {
+            if fast.is_none() && self.phase != BatchPhase::Data {
                 break;
             }
         }
         false
+    }
+
+    fn fast_sample_steps(&self) -> Option<usize> {
+        let request = self.request?;
+        let binding = self.binding?;
+        if request.operation != Operation::Sample || self.phase != BatchPhase::Before {
+            return None;
+        }
+        let metadata = binding.profile.revalidation_calls(binding.observation.eprocess_va)?;
+        let mut fragments = 0;
+        for range in &request.ranges[..request.count] {
+            let mut address = range.address;
+            let mut remaining = range.length as usize;
+            while remaining != 0 {
+                let count = remaining.min(SLICE_BYTES).min(4096 - (address as usize & 4095));
+                fragments += 1;
+                if fragments > MAX_DATA_SLICES_PER_CALL {
+                    return None;
+                }
+                remaining -= count;
+                if remaining != 0 {
+                    address += count as u64;
+                }
+            }
+        }
+        (metadata * 2 + fragments * 5 <= MAX_SLICE_CALLS).then_some(fragments + 2)
     }
 
     pub fn reset_response(&mut self) {
@@ -381,6 +438,8 @@ mod tests {
             boot: 7,
             sequence,
             token: 0,
+            root_pa: 0,
+            paging: 0,
             count: 0,
             ranges: [BatchRange::EMPTY; MAX_RANGES],
             binding: BindingEvidence::EMPTY,

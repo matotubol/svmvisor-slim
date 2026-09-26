@@ -9,22 +9,42 @@ interrupts, ordinary APIC operations, and cache MSRs remain hardware-owned.
 Software INIT/SIPI routing remains to start the guest CPUs without resetting the
 resident monitor. CPUID and CR3 execute natively; nested SVM is unsupported.
 
-Same-PC process reads use the [local VMMCALL batch interface](LOCAL-READ.md).
-The hypervisor performs process revalidation, virtual translation and memory reads;
-the client supplies discovery/profile evidence and caller-owned result buffers.
-USB and PCIe BAR transport are outside this local read path.
+The unauthenticated local reader and ARM/QUERY experiment have been retired.
+This interim build disables live reading. The rebuilt [client](client/README.md)
+returns an explicit error before any native call. Bounded translation, process
+validation and batch primitives remain available for offline tests.
 
-Process reads use monitor-side copies into validated client buffers. They do not
-install a client aperture, modify target mappings, or require the GMET entry trial.
-The separate entry-trial diagnostic remains available; experimental memory-window
-code has been retired. Reads are best-effort observations, not atomic snapshots.
+The [private-interface plan](crates/hypervisor/PRIVATE-INTERFACE-PLAN.md) targets
+an isolated analysis component on this PC. Authentication, trusted boot and DMA
+isolation are still required before reading can resume under the kernel threat
+model. Removing the old interfaces does not establish those protections or make
+the hypervisor undetectable.
 
-**Status:** this rewrite needs a fresh hardware boot test. Previous Windows boot
-results apply to the removed virtual interrupt/cache backend, not this revision.
+[IOMMU discovery](crates/hypervisor/IOMMU-DISCOVERY.md) adds bounded firmware
+inventory and read-only state observation. DMA ownership and a protected client
+remain subsequent work; discovery cannot enable the reader.
+The complete historical report now has retained backing inside the monitor pool,
+with guest CPU exclusion and read-only host mappings. This supplies lifetime,
+not protection from DMA or fresh takeover evidence.
+The [ownership preparation](crates/hypervisor/IOMMU-OWNERSHIP.md) adds offline
+entry/command codecs, bounded table-image construction and host-walk checks. It
+also adds permanent per-CPU configuration-route interception and bounded NPT
+control-page denial construction. Real IOMMU control-page denial remains inactive
+until hardware ownership and the Windows presentation are implemented.
+Complete restricted DTE and basic interrupt-entry codecs now require explicit
+interrupt behavior; they do not install a device policy.
+One complete deny-default device table and empty command/event/completion backing
+now reside in the retained pool, with CPU exclusion and read-only host mappings.
+They remain uninstalled; the bounded offline queue never submits commands.
+
+**Status:** the current control-preparation build deliberately stops on PCI data
+I/O, ECAM writes, CF9 reset and route changes without an admitted effects policy.
+It is an offline review artifact, not a compatible Windows deployment. Further
+software and platform evidence are required before a normal Windows boot test;
+previous boot results do not qualify this revision.
 
 ## Layout
 
-- `client`: [Iced desktop client](client/README.md), process picker and hex memory viewer.
 - `crates/hypervisor`: the single hypervisor crate. `firmware/` owns UEFI boot,
   `host/resident/` owns the runtime, and `reader/` owns bounded memory reads.
   Its UEFI binary embeds its audited resident image, linked with `payload.ld`.
@@ -37,13 +57,15 @@ results apply to the removed virtual interrupt/cache backend, not this revision.
 
 ```powershell
 cargo test --workspace
-cargo test -p svmvisor-hypervisor --features resident-runtime
+cargo test -p svmvisor-hypervisor --lib --no-default-features --features resident-runtime --locked
 cargo xtask resident --output target/native-resident/<fresh-name>
 cargo xtask card-dev
 ```
 
+`resident` and `card-dev` select `resident-runtime` with the reader and guest
+experiment disabled. The retired `--entry-trial` flag is rejected.
 Builds do not deploy automatically. `cargo xtask card-dev --flash` programs the
 payload slot; power-cycle the target to test it. `cargo xtask card-snapshot` reads
-its diagnostic records.
+card/boot records; this resident no longer exports live register or stop records.
 
 See [hypervisor](crates/hypervisor/README.md) and [build tools](crates/xtask/README.md).

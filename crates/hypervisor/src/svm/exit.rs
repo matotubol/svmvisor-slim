@@ -8,6 +8,7 @@
 
 use crate::arch::x86_64::capabilities::ValidatedCapabilities;
 
+pub const EXIT_GP: u64 = 0x4d;
 pub(crate) const EXIT_SHUTDOWN: u64 = 0x7f;
 
 /// Caller-supplied snapshot. Unused EXITINFO fields may be undefined and are
@@ -81,6 +82,32 @@ impl ExitSnapshot {
             .filter(|n| (1..=15).contains(n))
             .ok_or(ResumeError::InvalidInstructionLength)?;
         Ok(ResumeCandidate { address: self.info2, instruction_bytes: length as u8 })
+    }
+
+    /// Continuation for one exactly decoded MOV at a final-GPA data NPF.
+    /// The sealed evidence comes from the bounded MMIO preparation path using
+    /// hardware decode-assist bytes. nRIP is not defined for this exit and is
+    /// never consulted. This grants no device effect or permission to resume.
+    pub(crate) fn npf_mov_continuation(
+        self,
+        decoded: &crate::svm::mmio::DecodedMov,
+    ) -> Result<ResumeCandidate, ResumeError> {
+        if self.code != 0x400 || decoded.rip() != self.rip {
+            return Err(ResumeError::ExitDoesNotPermitCandidate);
+        }
+        if !crate::memory::address::is_canonical_48(self.rip) {
+            return Err(ResumeError::NonCanonicalRip);
+        }
+        let bytes = decoded.instruction_bytes();
+        if !(1..=15).contains(&bytes) {
+            return Err(ResumeError::InvalidInstructionLength);
+        }
+        let address =
+            self.rip.checked_add(u64::from(bytes)).ok_or(ResumeError::InvalidInstructionLength)?;
+        if !crate::memory::address::is_canonical_48(address) {
+            return Err(ResumeError::NonCanonicalNrip);
+        }
+        Ok(ResumeCandidate { address, instruction_bytes: bytes })
     }
 
     /// Derive continuation from exactly one unprefixed CPUID or VMMCALL.

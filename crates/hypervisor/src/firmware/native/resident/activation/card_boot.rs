@@ -173,20 +173,6 @@ impl JournalIo for Direct {
     }
 }
 
-/// Apply endpoint lifetime protection to each rebuilt private NPT. The
-/// descriptor is written during serialized preparation and immutable thereafter.
-pub(super) fn protect_config(
-    npt: &mut svmvisor_hypervisor::memory::npt::IdentityNpt<'_>,
-) -> Result<(), svmvisor_hypervisor::memory::npt::IdentityNptError> {
-    if let Some(endpoint) = unsafe { *ptr::addr_of!(TERMINAL) } {
-        let (base, bytes) = endpoint
-            .config_aperture()
-            .ok_or(svmvisor_hypervisor::memory::npt::IdentityNptError::InvalidExclusion)?;
-        npt.protect_write_range(base, bytes)?;
-    }
-    Ok(())
-}
-
 /// Serialized BSP only, after MP completion or post-EBS survey collection has
 /// been resolved. USER3 carries exact full operands; the preparation or
 /// activation result identifies which ownership boundary refused execution.
@@ -291,12 +277,16 @@ pub(super) fn preparation_failure(reason: u32, status: u64, address: u64) {
 /// bootstrap/wait code. No firmware call, allocation or shared transport lock.
 /// A failed access ends observation for this boot, never retried indefinitely.
 pub(super) unsafe fn stage(stage: u32, slot: u32, detail: u32) {
-    // Stage 5 follows every successful CPU activation: version 1 in bit 24,
-    // bit 0 reports the validated endpoint copied by those ArmRuntime calls.
-    // This is preparation evidence, not a promise of future PCI/BAR availability.
-    // Legacy stage-5 detail 0 means the endpoint state was not reported.
-    let detail =
-        if stage == 5 { 0x0100_0000 | u32::from(!terminal_endpoint().is_null()) } else { detail };
+    // Stage 5 follows every successful CPU activation. Version 2 adds the
+    // bounded firmware IOMMU observation: MMIO-count bits23:16, unit-count
+    // bits15:8, status bits7:4; bit0 remains the prepared endpoint observation.
+    // This is neither DMA ownership nor a promise of future device availability.
+    // Legacy versions 0/1 remain understood by the offline journal decoder.
+    let detail = if stage == 5 {
+        super::iommu::summary() | u32::from(!terminal_endpoint().is_null())
+    } else {
+        detail
+    };
     unsafe { commit_words([stage | (slot << 16), detail, CPU_COUNT as u32]) };
 }
 

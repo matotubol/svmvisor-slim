@@ -12,6 +12,12 @@ The card does three things:
 The flash image is 5 MiB: the FPGA configuration bitstream below `0x400000`
 (which contains the ROM/loader) and the 1 MiB payload slot at `0x400000`.
 
+The current resident control-preparation profile is for offline review. It stops
+on PCI data I/O, ECAM writes and unsupported reset/route effects. Normal Windows
+boot compatibility and DMA ownership are not established. The flashing workflow
+below does not make this intermediate payload ready for deployment; see the
+[current ownership boundary](../../crates/hypervisor/IOMMU-OWNERSHIP.md).
+
 ## Source boundary
 
 - `rtl/` – svmvisor-owned completion-only endpoint (read-only ROM leaf, payload
@@ -30,6 +36,45 @@ The flash image is 5 MiB: the FPGA configuration bitstream below `0x400000`
   `flash-card.ps1`; regenerate it with `new-candidate-pin.ps1` (see below).
 - `recovery-pin.psd1` – pins the recovery bitstream candidate.
 - Generated projects, downloaded tools and build output stay under `target/`.
+
+### Firmware IOMMU discovery observation
+
+The reader-disabled driver performs bounded read-only IOMMU discovery before
+`ExitBootServices`. Its final stage-5 boot record can include a compact inventory
+result so later boot stages do not overwrite that observation. The offline
+`read_snapshot.py` decoder accepts legacy records and the version-2 detail word:
+
+| Bits | Meaning |
+| --- | --- |
+| 31:24 | Format version 2 |
+| 23:16 | Units with a completed documented MMIO observation |
+| 15:8 | Normalized IVRS unit count, at most 16 |
+| 7:4 | 1 observed, 2 unavailable, 3 unsupported, 4 malformed, 5 ambiguous, 6 partial |
+| 3:1 | Reserved, zero |
+| 0 | Existing terminal endpoint prepared indicator |
+
+The decoder leaves unknown or inconsistent encodings raw. Its `iommu_discovery`
+object describes a preboot observation, not DMA ownership, protection, Windows
+compatibility or reader authorization. No physical addresses, queue contents or
+runtime analysis results are added to this record. Full discovery state now lives
+in a CPU-excluded retained-pool tail with read-only host mappings. It remains a
+historical firmware observation without DMA integrity or reader authority;
+callback header checks do not establish current hardware state. No new guest
+query is introduced.
+The same retained pool now also holds one uninstalled candidate device table,
+empty root and command/event/completion pages. The whole shared 0x220000-byte
+tail is CPU-excluded and privately mapped read-only/NX. Its header describes
+prepared memory only; no IOMMU pointer or enable bit is programmed.
+
+The resident's optional public stop record uses phase `0x15`, detail `8`, and
+version `1`. Journal word 4 contains version in bits 7:0 and one closed reason
+category in bits 15:8; words 2, 3, 5 and 6 are zero. No register, RIP, physical
+address, timestamp or reader data is exported. Publication requires every CPU's
+terminal acknowledgement, the sole winner, both route/endpoint locks, unchanged
+configuration and UC mappings, matching card/build identities and matching boot.
+A failure or missing endpoint leaves the detailed private record unexported.
+The report is a last diagnostic observation, not authenticated ownership or DMA
+drain evidence. Host-fault and barrier-timeout paths may produce no public report.
 
 ## The six jobs, in order
 

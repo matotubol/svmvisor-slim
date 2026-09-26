@@ -3,6 +3,10 @@
 //!
 //! AMD APM vol.2 rev.3.44 sections 15.7, 15.12, 15.20, 15.21 and Appendix B.
 
+/// Shared EVENTINJ/EXITINTINFO validity fields (APM2 physical pages 571/594).
+pub(crate) const EVENT_VALID: u64 = 1 << 31;
+pub(crate) const EVENT_ERROR_VALID: u64 = 1 << 11;
+
 /// An exception queued without advancing guest CS:RIP. #DF is an abort and its
 /// retained instruction pointer is undefined, not a restart address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

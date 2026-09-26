@@ -1,4 +1,4 @@
-//! Stops: the stop record, the terminal barrier and export, and the host fault entry.
+//! Private stop records, the terminal barrier, and the host fault entry.
 
 use core::{arch::asm, ptr};
 
@@ -9,9 +9,8 @@ use crate::{
     },
     host::resident::{
         runtime::{
-            ASSIGNED_APIC_ID, EXIT_HISTORY, EXIT_HISTORY_COUNT, EXIT_HISTORY_NEXT, FRAME,
-            RawVmexitCapture, State, VMCB,
-            diagnostics::{self, record as diagnostic_record},
+            ASSIGNED_APIC_ID, RawVmexitCapture, State, VMCB,
+            diagnostics::record as diagnostic_record,
             image_base,
             msr::read_msr,
             startup::{mailboxes, send_native_notification},
@@ -77,19 +76,12 @@ pub(super) unsafe fn terminal_requested(state: &State) -> bool {
 /// Terminal-only: no route guard is held, no resume follows. APM2 Table15-10
 /// holds external SMI/NMI/INIT while GIF=0. All CPUs acknowledge only in that
 /// state and never reopen GIF afterward, excluding their firmware/config writes.
-/// Reset/machine-check or a nonparticipating CPU can lose evidence; no write is
-/// permitted for the legacy aggregate without the complete ack mask. The live
-/// guarded per-CPU transport exports failure evidence independently of that mask.
+/// Reset/machine-check or a nonparticipating CPU can lose retained evidence.
+/// The barrier state and fault details stay in monitor-owned memory.
 /// Iteration caps are not time bounds.
 pub(super) unsafe fn terminal_finish(state: &mut State) {
-    if !state.armed
-        || !terminal_enabled(state)
-        || state.terminal_endpoint.is_some_and(|endpoint| !endpoint.valid())
-    {
+    if !state.armed || !terminal_enabled(state) {
         return;
-    }
-    unsafe {
-        diagnostics::flush_fault();
     }
     let shared = unsafe { terminal_control() };
     if !shared.ready(state.count) {
@@ -102,16 +94,8 @@ pub(super) unsafe fn terminal_finish(state: &mut State) {
     if !shared.acknowledge(state.slot, state.count) {
         return;
     }
-    unsafe {
-        record_barrier(shared);
-    }
     if !winner {
         return;
-    }
-    // The terminal request establishes sole spare-bank ownership; export before
-    // notification/preflight can fail and without waiting for another CPU.
-    unsafe {
-        export_stop_context(state);
     }
     // The published ready gate follows every target's armed/guest ACK. The
     // dedicated terminal request is authoritative; no guest INIT is enqueued.
@@ -123,9 +107,6 @@ pub(super) unsafe fn terminal_finish(state: &mut State) {
         || unsafe { mailboxes(state.count) }.iter().any(|m| !m.is_ready())
     {
         shared.finish(2);
-        unsafe {
-            record_barrier(shared);
-        }
         return;
     }
     // Same already admitted INIT-to-#SX wire operation as startup notification,
@@ -133,26 +114,15 @@ pub(super) unsafe fn terminal_finish(state: &mut State) {
     unsafe { send_native_notification() };
     for _ in 0..20_000_000 {
         if shared.all_acknowledged(state.count) {
-            let words = terminal::stop_words(
-                state.slot,
-                state.stopped,
-                state.stopped_rip,
-                state.stopped_info1,
-                state.stopped_info2,
-            );
-            let result = words.is_some_and(|words| unsafe { diagnostics::export_terminal(words) });
-            shared.finish(if result { 1 } else { 4 });
-            unsafe {
-                record_barrier(shared);
-            }
+            shared.finish(1);
+            // Only a closed reason category can reach the public journal.
+            // Detailed stop/fault evidence remains private even on failure.
+            let _ = unsafe { super::diagnostics::publish_stop(state) };
             return;
         }
         core::hint::spin_loop();
     }
     shared.finish(3);
-    unsafe {
-        record_barrier(shared);
-    }
 }
 
 /// All accesses use the existing pool-excluded shared alias, initialized before
@@ -165,12 +135,17 @@ pub(super) unsafe fn terminal_control() -> &'static TerminalControl {
 }
 
 pub(super) fn terminal_enabled(state: &State) -> bool {
-    state.startup_owned && state.count >= 2 && state.terminal_endpoint.is_some()
+    // Collective refusal is required even when no diagnostic endpoint exists.
+    // The shared ready gate still waits for every CPU's actual bootstrap ACK.
+    state.startup_owned
+        && (2..=super::super::MAX_RESIDENT_CPUS).contains(&state.count)
+        && state.slot < state.count
+        && state.configuration.is_some()
 }
 
 pub(super) fn stop(state: &mut State, code: u64, rip: u64, info1: u64, info2: u64) -> bool {
-    // Retain the exact terminal reason even in production, where the diagnostic
-    // port is absent. The dedicated stopped owner never resumes after this.
+    // Retain the exact terminal reason privately. The dedicated stopped owner
+    // never resumes after this.
     unsafe {
         ptr::write_volatile(&mut state.stopped_rip, rip);
         ptr::write_volatile(&mut state.stopped_info1, info1);
@@ -182,8 +157,8 @@ pub(super) fn stop(state: &mut State, code: u64, rip: u64, info1: u64, info2: u6
             if let Some((event, context)) =
                 raw.stop_record(ptr::addr_of!(VMCB) as u64, ASSIGNED_APIC_ID)
             {
-                // Win the sticky first-fault bank with the immutable boundary;
-                // keep event3 as the ordinary latest stopped-state record.
+                // Prefer the immutable boundary for the private first-fault
+                // payload; the State fields above retain the final stop reason.
                 diagnostic_record(event, true, context, info1 as u32);
             }
         }
@@ -195,7 +170,7 @@ pub(super) fn stop(state: &mut State, code: u64, rip: u64, info1: u64, info2: u6
 /// Terminal assembly has copied the normalized first host exception frame to
 /// private retained storage and blocked recursive callback entry. No STATE
 /// reference may be formed here: a host fault can interrupt a live mutable
-/// runtime borrow. Export is a bounded best effort, then this CPU stays stopped.
+/// runtime borrow. Capture is bounded, then this CPU stays stopped.
 #[unsafe(no_mangle)]
 unsafe extern "C" fn svmvisor_resident_host_fault(frame: *const u64, cr2: u64, cr3: u64) -> ! {
     let vector = unsafe { ptr::read(frame) } as u32;
@@ -205,56 +180,53 @@ unsafe extern "C" fn svmvisor_resident_host_fault(frame: *const u64, cr2: u64, c
     let rsp = unsafe { ptr::read(frame.add(5)) };
     unsafe {
         diagnostic_record(4, true, [rip, error, cr2, cr3, rsp, flags], vector);
-        diagnostics::flush_fault();
     }
     unsafe {
         asm!("cli", "2: hlt", "jmp 2b", options(noreturn, nostack));
     }
 }
 
-unsafe fn record_barrier(shared: &TerminalControl) {
-    let mut context = shared.diagnostic_snapshot();
-    context[5] = diagnostics::fault_status();
-    unsafe {
-        diagnostic_record(7, false, context, 0);
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        arch::x86_64::msr::{TARGET_PHYSICAL_BITS, TARGET_SIGNATURE},
+        host::resident::runtime::INITIAL_STATE,
+        svm::configuration::ConfigurationRoute,
+    };
 
-/// Stable raw stopped state; reading bytes does not change VMCB/GPRs. These are
-/// software observations, not a claim that invalid-entry save fields are valid.
-unsafe fn export_stop_context(state: &State) {
-    let aux = (state.slot as u32) << 8 | (state.count as u32) << 24;
-    unsafe {
-        diagnostics::export_context(
-            0,
-            [
-                state.stopped_rip,
-                state.stopped,
-                state.stopped_info1,
-                state.stopped_info2,
-                state.exits,
-                diagnostics::fault_status(),
-            ],
-            aux,
+    #[test]
+    fn collective_refusal_does_not_require_a_terminal_endpoint() {
+        let mut state = INITIAL_STATE;
+        state.startup_owned = true;
+        state.count = 24;
+        state.slot = 23;
+        assert!(state.terminal_endpoint.is_none());
+        assert!(!terminal_enabled(&state), "no admitted configuration owner");
+        state.configuration = Some(
+            ConfigurationRoute::admit_target(TARGET_SIGNATURE, TARGET_PHYSICAL_BITS, 0xe000_0021)
+                .unwrap(),
         );
-        let bytes = ptr::addr_of!(VMCB).cast::<u8>();
-        let read = |offset: usize| ptr::read_volatile(bytes.add(offset).cast::<u64>());
-        diagnostics::export_context(
-            1,
-            [read(0x78), read(0x80), read(0x88), read(0xa8), read(0xc8), read(0x550)],
-            aux | 1,
+        assert!(terminal_enabled(&state));
+        state.startup_owned = false;
+        assert!(!terminal_enabled(&state));
+    }
+
+    #[test]
+    fn collective_refusal_rejects_invalid_participation() {
+        let mut state = INITIAL_STATE;
+        state.startup_owned = true;
+        state.configuration = Some(
+            ConfigurationRoute::admit_target(TARGET_SIGNATURE, TARGET_PHYSICAL_BITS, 0xe000_0021)
+                .unwrap(),
         );
-        let frame = ptr::read_volatile(ptr::addr_of!(FRAME));
-        diagnostics::export_context(
-            2,
-            [read(0x5f8), frame.rcx, frame.rdx, read(0x558), read(0x4d0), read(0x410)],
-            aux | 2 | ((ptr::read_volatile(bytes.add(0x4cb)) as u32) << 13),
-        );
-        let count = EXIT_HISTORY_COUNT;
-        for n in 0..count {
-            let index = (EXIT_HISTORY_NEXT + 5 - count + n) % 5;
-            let context = ptr::addr_of!(EXIT_HISTORY).cast::<[u64; 6]>().add(index).read();
-            diagnostics::export_context(3 + n, context, aux | 3 | ((n as u32) << 16));
+        for (count, slot) in [(0, 0), (1, 0), (2, 2), (32, 32), (33, 0), (usize::MAX, 0)] {
+            state.count = count;
+            state.slot = slot;
+            assert!(!terminal_enabled(&state), "count {count}, slot {slot}");
         }
+        state.count = 32;
+        state.slot = 31;
+        assert!(terminal_enabled(&state));
     }
 }

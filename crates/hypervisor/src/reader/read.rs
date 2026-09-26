@@ -12,6 +12,46 @@ pub const MAX_READ_BYTES: usize = 16 * PAGE_BYTES;
 /// Maximum page walks, including an unaligned first page.
 pub const MAX_PAGE_WALKS: usize = MAX_READ_BYTES / PAGE_BYTES + 1;
 
+/// A bounded virtual reader. Implementations retain only a completed prefix on failure and
+/// translate each touched page afresh; successful reads do not imply coherent live contents.
+/// Physical callbacks implement this trait through the local page walker automatically.
+pub trait VirtualRead {
+    fn read_virtual(
+        &mut self,
+        config: PagingConfig,
+        root: u64,
+        va: u64,
+        output: &mut [u8],
+    ) -> ReadReport;
+}
+
+impl<F: FnMut(u64, &mut [u8]) -> Result<(), PagingError>> VirtualRead for F {
+    fn read_virtual(
+        &mut self,
+        config: PagingConfig,
+        root: u64,
+        va: u64,
+        output: &mut [u8],
+    ) -> ReadReport {
+        read_virtual(config, root, va, output, self)
+    }
+}
+
+/// Adapt a virtual-read callback, for example a bounded remote reader.
+pub struct VirtualReader<F>(pub F);
+
+impl<F: FnMut(PagingConfig, u64, u64, &mut [u8]) -> ReadReport> VirtualRead for VirtualReader<F> {
+    fn read_virtual(
+        &mut self,
+        config: PagingConfig,
+        root: u64,
+        va: u64,
+        output: &mut [u8],
+    ) -> ReadReport {
+        self.0(config, root, va, output)
+    }
+}
+
 /// Completed prefix and the reason reading stopped, if any.
 /// Completion means callbacks supplied those bytes, not that they share one image state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +66,8 @@ pub enum ReadError {
     AddressOverflow,
     NoncanonicalRange,
     WalkLimit,
+    /// A remote reader refused translation without returning a more specific paging error.
+    Translation,
     Paging(PagingError),
 }
 
@@ -90,7 +132,8 @@ pub fn read_virtual(
     ReadReport { bytes_read, error }
 }
 
-fn validate_range(va: u64, length: usize) -> Result<(), ReadError> {
+/// Check the shared length, overflow and canonical-address bounds before reading any bytes.
+pub fn validate_range(va: u64, length: usize) -> Result<(), ReadError> {
     if length > MAX_READ_BYTES {
         return Err(ReadError::LengthLimit);
     }

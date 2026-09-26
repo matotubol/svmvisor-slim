@@ -14,9 +14,9 @@ use crate::{
         runtime::{
             CONTEXT, EXIT_HISTORY, EXIT_HISTORY_COUNT, EXIT_HISTORY_NEXT, FRAME, NPT, STATE, State,
             VMCB, configuration,
-            diagnostics::{self, record as diagnostic_record},
+            diagnostics::record as diagnostic_record,
             guest_reader::fetch_instruction,
-            interrupt, local,
+            interrupt,
             msr::{handle_mcax_msr, handle_native_icr},
             startup::{
                 acknowledge_init, finish_guest_startup, mailboxes, route_physical_nmi_to_guest,
@@ -30,7 +30,7 @@ use crate::{
         control_msrs,
         dispatch::{self, NativeMsrOutcome},
         events::DeliveryError,
-        exit::ExitSnapshot,
+        exit::{EXIT_GP, ExitSnapshot},
         instructions::handle_native_svm_instruction,
         vmcb::Vmcb,
     },
@@ -56,31 +56,18 @@ pub(super) unsafe extern "win64" fn dispatch(context: *mut BridgeContext) -> boo
         return false;
     }
     // The nonmigrating assembly returned on this image's sole VMCB. Establish
-    // reusable cached groups and consume the old RAP request before trial
-    // restoration, event handling or any emulation can change guest state.
+    // reusable cached groups and consume the old RAP request before event
+    // handling or any emulation can change guest state.
     let vmcb = unsafe { &mut *ptr::addr_of_mut!(VMCB) };
     unsafe {
         state.vmcb_cache.after_exit(vmcb, super::ASSIGNED_APIC_ID, ptr::addr_of!(VMCB) as u64);
         vmcb.consume_rap_clear_after_exit();
     }
-    #[cfg(feature = "native-entry-trial")]
-    let trial_exit = match unsafe { super::entry::complete(state, &mut *ptr::addr_of_mut!(VMCB)) } {
-        Ok(handled) => handled,
-        Err(()) => {
-            unsafe { terminal_finish(state) };
-            return false;
-        }
-    };
-    #[cfg(not(feature = "native-entry-trial"))]
-    let trial_exit = false;
     if unsafe { terminal_requested(state) } {
         unsafe { terminal_finish(state) };
         return false;
     }
     let before = unsafe { &*ptr::addr_of!(VMCB) }.exit_snapshot();
-    // SAFETY: the stopped CPU owns this retained VMCB; no guest can change RAX here.
-    let local_call = before.code == 0x81
-        && unsafe { &*ptr::addr_of!(VMCB) }.guest_rax() == svmvisor_card_abi::local::MAGIC;
     unsafe {
         let frame = ptr::read_volatile(ptr::addr_of!(FRAME));
         let rax = (&*ptr::addr_of!(VMCB)).guest_rax();
@@ -98,10 +85,10 @@ pub(super) unsafe extern "win64" fn dispatch(context: *mut BridgeContext) -> boo
     }
 
     // The inner body's RAII route guards must be gone before terminal work.
-    let resume = unsafe { dispatch_body(context, trial_exit) };
+    let resume = unsafe { dispatch_body(context) };
     let state = unsafe { &mut *ptr::addr_of_mut!(STATE) };
     // Every terminal return needs evidence, including an unforeseen callee
-    // refusal. Route guards have unwound before publishing the stop/barrier.
+    // refusal. Route guards have unwound before private stop coordination.
     if !unsafe { terminal_requested(state) } {
         record_unexplained_stop(state, resume, before);
     }
@@ -109,11 +96,7 @@ pub(super) unsafe extern "win64" fn dispatch(context: *mut BridgeContext) -> boo
         unsafe { terminal_finish(state) };
         return false;
     }
-    if resume
-        && !local_call
-        && before.code != 0x77
-        && (before.code != 0x72 || state.exits & 0xff == 1)
-    {
+    if resume && before.code != 0x77 && (before.code != 0x72 || state.exits & 0xff == 1) {
         let vmcb = unsafe { &*ptr::addr_of!(VMCB) };
         unsafe {
             diagnostic_record(
@@ -147,14 +130,22 @@ pub(super) unsafe extern "win64" fn dispatch(context: *mut BridgeContext) -> boo
             state.pause_filter_supported,
             state.guest_started,
             super::svmvisor_resident_nmi_pending.load(core::sync::atomic::Ordering::Acquire) != 0,
-            unsafe { configuration::pending(state) },
         );
-        #[cfg(feature = "native-entry-trial")]
-        if !unsafe { super::entry::final_entry(state, vmcb) } {
+        if !unsafe { configuration::verify(state, vmcb) } {
+            unsafe { terminal_finish(state) };
             return false;
         }
-        // Last software boundary before assembly VMLOAD/VMRUN, including any
-        // one-shot trial edits. No VMCB reference survives the world switch.
+        let sources_valid = state.capabilities.as_ref().is_some_and(|caps| {
+            unsafe { super::viommu::verify_sources(vmcb, caps.address_policy()) }.is_ok()
+        });
+        if !sources_valid {
+            let exit = vmcb.exit_snapshot();
+            stop(state, exit.code, exit.rip, 0xf215, 0);
+            unsafe { terminal_finish(state) };
+            return false;
+        }
+        // Last software boundary before assembly VMLOAD/VMRUN.
+        // No VMCB reference survives the world switch.
         state.vmcb_cache.prepare_entry(
             vmcb,
             unsafe { super::ASSIGNED_APIC_ID },
@@ -177,6 +168,11 @@ pub(super) fn retry_routing(state: &mut State, vmcb: &Vmcb) -> bool {
 }
 
 pub(super) fn check_exit_event(state: &mut State, vmcb: &mut Vmcb) -> bool {
+    // #GP owns prior delivery and the new fault in one transaction. Reinjecting
+    // EXITINTINFO here would discard the secondary fault or loop indefinitely.
+    if vmcb.exit_snapshot().code == EXIT_GP {
+        return true;
+    }
     let error = match vmcb.complete_event_delivery(&mut state.pending_fault) {
         Ok(()) => return true,
         Err(error) => error,
@@ -207,7 +203,7 @@ pub(super) fn record_unexplained_stop(
     }
 }
 
-unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
+unsafe fn dispatch_body(context: *mut BridgeContext) -> bool {
     // The outer dispatcher validated context without dereferencing it.
     debug_assert!(context == ptr::addr_of_mut!(CONTEXT));
     let state = unsafe { &mut *ptr::addr_of_mut!(STATE) };
@@ -215,8 +211,7 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
     let frame = unsafe { &mut *ptr::addr_of_mut!(FRAME) };
     state.exits = state.exits.saturating_add(1);
     if !state.armed {
-        // F10Bh without detail: an exit before arm. With the startup-route
-        // record retired, `stop_words` exports it as an unhandled exit.
+        // F10Bh without detail: retain an exit-before-arm reason privately.
         let exit = vmcb.exit_snapshot();
         return stop(state, exit.code, exit.rip, 0xf10b, 0);
     }
@@ -229,10 +224,9 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
         return stop(state, exit.code, exit.rip, 0xf114, 0);
     }
     let observed = vmcb.exit_snapshot();
-    // Every unusual exit and MSR boundary; common CPUID/PAUSE samples are
-    // bounded to avoid making diagnostic PCI traffic dominate guest execution.
-    let local_call = observed.code == 0x81 && vmcb.guest_rax() == svmvisor_card_abi::local::MAGIC;
-    if !local_call && (!matches!(observed.code, 0x72 | 0x77) || state.exits & 0xff == 1) {
+    // Legacy progress observations remain bounded. The private record sink
+    // ignores nonfault events and performs no device publication.
+    if !matches!(observed.code, 0x72 | 0x77) || state.exits & 0xff == 1 {
         unsafe {
             diagnostic_record(
                 1,
@@ -254,15 +248,11 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
     // An invalid entry does not establish that the requested flush occurred.
     unsafe {
         super::cache::after_exit(vmcb);
-        // Trial completion already consumed this entry's flush and requested
-        // its canonical restoration flush. Keep that new request pending.
-        if !trial_exit {
-            vmcb.consume_tlb_flush_after_exit();
-        }
+        vmcb.consume_tlb_flush_after_exit();
     }
-    // SAFETY: old flush consumed, guest stopped; close before startup or root changes.
-    // Earlier diagnostics see the pending window and cannot touch the endpoint.
-    if !unsafe { configuration::close(state, vmcb) } {
+    // Permanent route state is verified before startup, cache service or guest
+    // instruction effects. No ECAM write window exists to close or reopen.
+    if !unsafe { configuration::verify(state, vmcb) } {
         return false;
     }
     if state.startup_owned {
@@ -273,7 +263,7 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
             return stop(state, 0x63, vmcb.guest_rip(), 0xf105, 0);
         }
     }
-    if !trial_exit && !check_exit_event(state, vmcb) {
+    if !check_exit_event(state, vmcb) {
         return false;
     }
     if !unsafe { super::cache::service(state, vmcb) } {
@@ -292,7 +282,7 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
                 (unsafe { mailboxes(state.count) })[state.slot].mark_running();
                 if terminal_enabled(state) {
                     // Separate monotonic initial-ACK mask, not mutable guest
-                    // startup readiness. Last initial guest ACK opens export.
+                    // startup readiness. The last initial ACK admits stop coordination.
                     let _ = unsafe { terminal_control() }.initial_ack(state.slot, state.count);
                     unsafe {
                         diagnostic_record(
@@ -320,7 +310,6 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
     // first; if it changes this CPU, never complete the superseded instruction.
     let resume = match unsafe { startup_service(&mut context) } {
         Some(resume) => resume,
-        None if trial_exit => true,
         None => unsafe { handle_exit(&mut context) },
     };
     // A still-intercepted ICR write in this exit has already been routed above.
@@ -368,24 +357,18 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
             Ok(false) => {}
         }
     }
-    #[cfg(feature = "native-entry-trial")]
-    if exit.code == 0x81
-        && let Some(resume) = unsafe { super::entry::request(state, vmcb, frame) }
-    {
-        return resume;
-    }
     match exit.code {
-        0x81 if vmcb.guest_rax() == svmvisor_card_abi::local::MAGIC => {
-            // SAFETY: startup ACK and event handling precede this acknowledged guest branch.
-            return unsafe { local::handle(state, vmcb, frame) };
-        }
+        EXIT_GP => return unsafe { super::protection::handle(state, vmcb) },
         0x81 => {
-            // Installed ABIs have already had first refusal. Preserve any event being
-            // re-injected before retrying this instruction; never replace its delivery.
+            // Bootstrap acknowledgement is the only VMMCALL consumed by this runtime,
+            // and its one-shot owner runs before this acknowledged-guest dispatcher.
+            // There is no guest service ABI. Preserve any event being re-injected
+            // before retrying this instruction; never replace its delivery.
             if vmcb.event_injection() & (1 << 31) != 0 {
                 return true;
             }
-            // Unclaimed VMMCALL follows the native #UD behavior (APM2 physical page 593).
+            // Every later VMMCALL follows native #UD behavior (APM2 physical page 593;
+            // APM3 physical page 536), independent of operands or guest privilege.
             // The hardware exit identifies the instruction, and a fault retains CS:RIP.
             if vmcb.queue_vmmcall_invalid_opcode().is_ok() {
                 state.pending_fault = true;
@@ -428,14 +411,10 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
             // p509), which it has re-injected, so EVENTINJ.V is not a refusal.
             return true;
         }
-        0x7b if diagnostics::available() => return unsafe { diagnostics::handle_io(state, vmcb) },
+        0x7b => return unsafe { configuration::handle_io(state, vmcb) },
         0x7c => {
-            if frame.rcx as u32 == MMIO_CFG_BASE_ADDR && diagnostics::available() {
-                // Dynamic ECAM relocation is not yet an owned instruction path.
-                // Keep the actual stopped operands before any native write.
-                let requested =
-                    (vmcb.guest_rax() as u32 as u64) | ((frame.rdx as u32 as u64) << 32);
-                return stop(state, exit.code, exit.rip, 0xf202, requested);
+            if frame.rcx as u32 == MMIO_CFG_BASE_ADDR {
+                return unsafe { configuration::handle_msr(state, vmcb, frame) };
             }
             if crate::svm::cache_policy::owned_msr(frame.rcx as u32) {
                 return unsafe { super::cache::handle(state, vmcb, frame) };
@@ -560,12 +539,18 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
             return stop(state, exit.code, exit.rip, 0xf104, frame.rcx);
         }
         0x400 if state.startup_owned => {
-            if let Some(endpoint) = unsafe { diagnostics::endpoint() }
-                && let Some((base, bytes)) = endpoint.config_aperture()
-                && let Ok((start, end)) = crate::memory::npt::identity_protection_range(base, bytes)
-                && (start..end).contains(&exit.info2)
-            {
-                return unsafe { handle_diagnostic_ecam(state, vmcb, base, bytes) };
+            let tracked = state
+                .capabilities
+                .as_ref()
+                .map(|caps| unsafe { super::viommu::tracked_write(vmcb, caps.address_policy()) });
+            if !matches!(tracked, Some(Ok(false))) {
+                // Arbitrary table mutation requires the complete all-CPU and
+                // DMA source barrier. Never reopen the page or commit a MOV
+                // approximation while that protocol is unavailable.
+                return stop(state, exit.code, exit.rip, 0xf215, 1);
+            }
+            if state.configuration.is_some_and(|route| route.contains(exit.info2)) {
+                return configuration::refuse_ecam(state, vmcb);
             }
             return stop(state, exit.code, exit.rip, exit.info1, exit.info2);
         }
@@ -600,56 +585,33 @@ fn complete_control_msr_exit(
     }
 }
 
-unsafe fn handle_diagnostic_ecam(
-    state: &mut State,
-    vmcb: &mut Vmcb,
-    base: u64,
-    bytes: u64,
-) -> bool {
-    let exit = vmcb.exit_snapshot();
-    if exit.info1 & 0x1f != 7 {
-        return stop(state, exit.code, exit.rip, exit.info1, exit.info2);
-    }
-    // SAFETY: validated write NPF in the admitted configuration aperture.
-    if let Some(resume) = unsafe { configuration::open(state, vmcb, base, bytes) } {
-        return resume;
-    }
-    let Some(guard) = (unsafe { terminal_control() }).diagnostic_lock() else {
-        return retry_routing(state, vmcb);
-    };
-    // Remove only our write restriction after noting the first such write.
-    // Hardware retries the original instruction; no GPR/RIP/event is emulated.
-    unsafe {
-        diagnostics::note_config_write(exit.info2, 0, 0, 1);
-    }
-    let result = crate::memory::npt::set_identity_write_range(
-        unsafe { &mut (*ptr::addr_of_mut!(NPT)).0 },
-        ptr::addr_of!(NPT) as u64,
-        base,
-        bytes,
-        true,
-    );
-    drop(guard);
-    if result.is_err() {
-        return stop(state, exit.code, exit.rip, 0xf203, exit.info2);
-    }
-    vmcb.request_full_tlb_flush();
-    state.routing_retries = 0;
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::{
-        arch::x86_64::msr::{TSC_RATIO, TSC_RATIO_DEFINED, TSC_RATIO_UNITY},
+        arch::x86_64::msr::{
+            AVIC_DOORBELL, SMM_CTL, TSC_RATIO, TSC_RATIO_DEFINED, TSC_RATIO_UNITY, VIRTUAL_TOM,
+        },
+        guest::continuation::{NATIVE_BOOTSTRAP_ACK, NativeBootstrapAck},
         host::resident::runtime::INITIAL_STATE,
         svm::{
             control_msrs::{SVM_LOCK_KEY, VM_HSAVE_PA},
             events::ExternalInterruptError,
         },
     };
+
+    // Historical wire values are test inputs only. No production feature may
+    // turn them back into a callable reader or experiment interface.
+    const RETIRED_CALLS: [(u64, u64); 7] = [
+        (0x5356_4d4c_4f43_414c, 0), // Reader PROBE.
+        (0x5356_4d4c_4f43_414c, 1), // Reader SUBMIT, including HELLO.
+        (0x5356_4d4c_4f43_414c, 2), // Reader STEP.
+        (0x5356_4d4c_4f43_414c, 3), // Reader ABORT.
+        (0x5356_4d4c_4f43_414c, 4), // Reader CONTEXT.
+        (0x3154_454d_4756_4d53, 1), // Experiment ARM.
+        (0x3154_454d_4756_4d53, 2), // Experiment QUERY.
+    ];
 
     fn put(vmcb: &mut Vmcb, offset: usize, value: u64) {
         // SAFETY: tests exclusively own these inert VMCB bytes and use in-bounds field offsets.
@@ -767,6 +729,171 @@ mod tests {
         put(&mut vmcb, 0x0c8, 0x3000);
         put(&mut vmcb, 0x570, 2);
         (state, vmcb, frame)
+    }
+
+    #[test]
+    fn gp_dispatch_repairs_disabled_svm_for_kernel_and_user_without_completing_it() {
+        for cpl in 0..=3 {
+            for (instruction, expected) in [
+                ([0x0f, 0x01, 0xda], 0x8000_0306u64), // VMLOAD -> #UD
+                ([0x0f, 0x01, 0xd8], 0x8000_0306),    // VMRUN operand #GP -> #UD
+                ([0x0f, 0x01, 0xdc], 0x8000_0b0d),    // STGI independently enabled
+                ([0x0f, 0x30, 0x90], 0x8000_0b0d),    // Ordinary WRMSR #GP
+            ] {
+                let (mut state, mut vmcb, frame) = stopped_svm();
+                put(&mut vmcb, 0x070, 0x4d);
+                put(&mut vmcb, 0x0c8, 0); // #GP has no continuation evidence.
+                put(&mut vmcb, 0x4c8, cpl << 24);
+                put(&mut vmcb, 0x570, 0x10102);
+                put(&mut vmcb, 0x5f8, u64::MAX); // Illegal physical operand at CPL0.
+                let before = (state.svm_controls, frame);
+                let mut expected_bytes = *vmcb.bytes();
+                expected_bytes[0x0a8..0x0b0].copy_from_slice(&expected.to_le_bytes());
+                assert!(check_exit_event(&mut state, &mut vmcb));
+                assert!(super::super::protection::handle_with_reader(
+                    &mut state,
+                    &mut vmcb,
+                    |_, index| Ok(instruction[index]),
+                ));
+                assert_eq!(*vmcb.bytes(), expected_bytes);
+                assert_eq!((state.svm_controls, frame), before);
+                assert!(state.pending_fault && !state.stopped_valid);
+            }
+        }
+    }
+
+    #[test]
+    fn gp_dispatch_combines_delivery_faults_without_reading_the_instruction() {
+        for (prior, expected) in [
+            (0x8000_0306u64, Some(0x0010_8000_0b0du64)), // #UD delivery -> #GP
+            (0x8000_0b0d, Some(0x8000_0b08)),            // #GP delivery -> #DF
+            (0x8000_0b08, None),                         // #DF delivery -> shutdown policy
+        ] {
+            let (mut state, mut vmcb, _) = stopped_svm();
+            state.pending_fault = true;
+            put(&mut vmcb, 0x070, 0x4d);
+            put(&mut vmcb, 0x078, 0x10);
+            put(&mut vmcb, 0x088, prior);
+            let mut expected_bytes = *vmcb.bytes();
+            assert!(check_exit_event(&mut state, &mut vmcb));
+            let resume =
+                super::super::protection::handle_with_reader(&mut state, &mut vmcb, |_, _| {
+                    panic!("delivery faults have no faulting SVM instruction")
+                });
+            if let Some(event) = expected {
+                expected_bytes[0x0a8..0x0b0].copy_from_slice(&event.to_le_bytes());
+            }
+            assert_eq!(resume, expected.is_some());
+            assert_eq!(*vmcb.bytes(), expected_bytes);
+            assert!(state.pending_fault);
+            assert_eq!(state.stopped_valid, expected.is_none());
+        }
+    }
+
+    #[test]
+    fn gp_dispatch_preserves_enabled_svm_and_refuses_a_queued_event_before_fetch() {
+        for queued in [false, true] {
+            let (mut state, mut vmcb, _) = stopped_svm();
+            put(&mut vmcb, 0x070, 0x4d);
+            state.efer = Some(
+                dispatch::NativeEfer::admit_native_visible_svm(
+                    0x1500,
+                    1 << 2,
+                    (1 << 11) | (1 << 20) | (1 << 29),
+                    0,
+                    None,
+                )
+                .unwrap(),
+            );
+            if queued {
+                put(&mut vmcb, 0x0a8, 0x8000_0306);
+            }
+            let mut expected = *vmcb.bytes();
+            assert_eq!(
+                super::super::protection::handle_with_reader(&mut state, &mut vmcb, |_, _| panic!(
+                    "enabled SVM or queued delivery requires no opcode fetch"
+                ),),
+                !queued
+            );
+            if !queued {
+                expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0b0du64.to_le_bytes());
+            }
+            assert_eq!(*vmcb.bytes(), expected);
+            assert_eq!(state.stopped_valid, queued);
+        }
+    }
+
+    #[test]
+    fn gp_dispatch_refuses_unreadable_evidence_and_retries_a_busy_reader_transactionally() {
+        for error in [3, 8, terminal::FetchReadFailure::MemoryControlBusy as u16] {
+            let (mut state, mut vmcb, _) = stopped_svm();
+            state.pending_fault = true;
+            put(&mut vmcb, 0x070, 0x4d);
+            let before = *vmcb.bytes();
+            let resume =
+                super::super::protection::handle_with_reader(&mut state, &mut vmcb, |_, _| {
+                    Err(error)
+                });
+            let busy = error == terminal::FetchReadFailure::MemoryControlBusy as u16;
+            assert_eq!(resume, busy);
+            assert_eq!(*vmcb.bytes(), before);
+            assert!(state.pending_fault);
+            assert_eq!(state.stopped_valid, !busy);
+            if busy {
+                assert!(super::super::protection::handle_with_reader(
+                    &mut state,
+                    &mut vmcb,
+                    |_, index| Ok([0x0f, 0x01, 0xda][index]),
+                ));
+                assert_eq!(vmcb.event_injection(), 0x8000_0306);
+                assert_eq!(state.routing_retries, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_control_msrs_dispatch_faults_and_preserve_pending_delivery() {
+        for (index, write) in [
+            (AVIC_DOORBELL, false),
+            (SMM_CTL, false),
+            (SMM_CTL, true),
+            (VIRTUAL_TOM, false),
+            (VIRTUAL_TOM, true),
+        ] {
+            for pending in [false, true] {
+                let (mut state, mut vmcb, mut frame) = stopped_svm();
+                put(&mut vmcb, 0x070, 0x7c);
+                put(&mut vmcb, 0x078, u64::from(write));
+                put(&mut vmcb, 0x570, 0x10102);
+                if pending {
+                    put(&mut vmcb, 0x0a8, 0x8000_0306);
+                    put(&mut vmcb, 0x0c8, u64::MAX);
+                }
+                frame.rcx = u64::from(index);
+                let before = (state.svm_controls, frame);
+                let mut expected = *vmcb.bytes();
+                if !pending {
+                    expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0b0d_u64.to_le_bytes());
+                }
+                assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+                assert_eq!((state.svm_controls, frame), before);
+                assert_eq!(*vmcb.bytes(), expected);
+                assert_eq!(state.pending_fault, !pending);
+                assert!(!state.stopped_valid);
+            }
+        }
+    }
+
+    #[test]
+    fn doorbell_write_dispatch_remains_an_unsupported_stop() {
+        let (mut state, mut vmcb, mut frame) = stopped_svm();
+        put(&mut vmcb, 0x070, 0x7c);
+        put(&mut vmcb, 0x078, 1);
+        frame.rcx = u64::from(AVIC_DOORBELL);
+        let before = (state.svm_controls, *vmcb.bytes(), frame);
+        assert!(!dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!((state.svm_controls, *vmcb.bytes(), frame), before);
+        assert!(state.stopped_valid && !state.pending_fault);
     }
 
     #[test]
@@ -938,56 +1065,84 @@ mod tests {
 
     #[test]
     fn unclaimed_hypercall_preserves_pending_delivery_before_retry() {
-        for event in [0x8000_0051, 0x8000_0202, 0x0000_0030_8000_0b0d] {
-            let (mut state, mut vmcb, mut frame) = stopped(0, 3);
-            put(&mut vmcb, 0x088, event);
-            put(&mut vmcb, 0x0a8, event);
-            let before = *vmcb.bytes();
-            let registers = frame;
-            assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
-            assert_eq!(*vmcb.bytes(), before);
-            assert_eq!(frame, registers);
-            assert!(!state.pending_fault && !state.stopped_valid);
-        }
-    }
-
-    #[test]
-    fn local_hypercall_keeps_priority_over_unclaimed_fallback() {
-        let (mut state, mut vmcb, mut frame) = stopped(svmvisor_card_abi::local::MAGIC, 3);
-        // Local ABI's existing TF rejection queues #GP, distinguishing it from the #UD fallback.
-        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
-        assert_eq!(vmcb.event_injection(), 0x8000_0b0d);
-        assert_eq!(vmcb.guest_rip(), 0x2ffe);
-        assert!(state.pending_fault && !state.stopped_valid);
-    }
-
-    #[test]
-    fn privileged_local_hypercall_dispatch_faults_without_completing_the_abi() {
-        for cpl in 0..3 {
-            for flags in [2, 0x10102] {
-                let (mut state, mut vmcb, mut frame) =
-                    stopped(svmvisor_card_abi::local::MAGIC, cpl);
-                put(&mut vmcb, 0x570, flags);
-                // The fixture has no capabilities and poisoned NRIP. A hardware-decoded
-                // VMMCALL fault must not depend on a continuation or guest memory.
-                let mut expected = *vmcb.bytes();
-                expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0306u64.to_le_bytes());
-                // EVENTINJ is uncached; queuing #UD preserves cached state.
-                let registers = frame;
-                assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
-                assert_eq!(*vmcb.bytes(), expected);
-                assert_eq!(frame, registers);
-                assert!(state.pending_fault && !state.stopped_valid);
-
-                // Model successful fault delivery followed by another exit. The existing
-                // dispatcher lifecycle consumes the injection without completing VMMCALL.
-                put(&mut vmcb, 0x070, 0x77);
-                assert!(check_exit_event(&mut state, &mut vmcb));
-                assert!(!state.pending_fault && !state.stopped_valid);
-                assert_eq!(vmcb.event_injection(), 0);
-                assert_eq!(vmcb.guest_rip(), 0x2ffe);
+        for (rax, operation) in RETIRED_CALLS.into_iter().chain([(0, 0)]) {
+            for event in [0x8000_0051, 0x8000_0202, 0x0000_0030_8000_0b0d] {
+                for cpl in 0..=3 {
+                    let (mut state, mut vmcb, mut frame) = stopped(rax, cpl);
+                    frame.rcx = operation;
+                    put(&mut vmcb, 0x088, event);
+                    put(&mut vmcb, 0x0a8, event);
+                    let before = *vmcb.bytes();
+                    let registers = frame;
+                    assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+                    assert_eq!(*vmcb.bytes(), before);
+                    assert_eq!(frame, registers);
+                    assert!(!state.pending_fault && !state.stopped_valid);
+                }
             }
         }
+    }
+
+    #[test]
+    fn retired_interfaces_fault_at_every_privilege_without_reading_operands_or_completing() {
+        for (rax, operation) in RETIRED_CALLS {
+            for cpl in 0..=3 {
+                for flags in [2, 0x102, 0x10002, 0x10102] {
+                    for nrip in [0, u64::MAX, 0x3001] {
+                        let (mut state, mut vmcb, mut frame) = stopped(rax, cpl);
+                        frame.rcx = operation;
+                        // Poison former request/result pointers. Even a valid former operation
+                        // cannot read guest memory, inspect a session, or return protocol data.
+                        frame.rdx = u64::MAX;
+                        frame.r8 = u64::MAX;
+                        frame.r9 = u64::MAX;
+                        frame.r10 = 9;
+                        state.exits = 41;
+                        state.routing_retries = 7;
+                        put(&mut vmcb, 0x570, flags);
+                        put(&mut vmcb, 0x0c8, nrip);
+                        let mut expected = *vmcb.bytes();
+                        expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0306u64.to_le_bytes());
+                        let registers = frame;
+                        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+                        assert_eq!(*vmcb.bytes(), expected);
+                        assert_eq!(frame, registers);
+                        assert!(state.pending_fault && !state.stopped_valid);
+                        assert_eq!((state.exits, state.routing_retries), (41, 7));
+
+                        // Successful fault delivery does not complete the rejected instruction.
+                        put(&mut vmcb, 0x070, 0x77);
+                        assert!(check_exit_event(&mut state, &mut vmcb));
+                        assert!(!state.pending_fault && !state.stopped_valid);
+                        assert_eq!(vmcb.event_injection(), 0);
+                        assert_eq!(vmcb.guest_rip(), 0x2ffe);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn post_ack_dispatcher_rejects_bootstrap_operands() {
+        let (mut state, mut vmcb, mut frame) = stopped(NATIVE_BOOTSTRAP_ACK, 0);
+        put(&mut vmcb, 0x570, 2);
+        put(&mut vmcb, 0x578, 0x1000);
+        let mut ack = NativeBootstrapAck::new(&vmcb, &frame, 0x1000, 0x1005, 0x1008).unwrap();
+        put(&mut vmcb, 0x578, 0x1005);
+        ack.acknowledge(&mut vmcb, &frame).unwrap();
+        assert_eq!(vmcb.guest_rip(), 0x1008);
+        state.ack = Some(ack);
+
+        // Even replay at the exact linked ACK site reaches the closed post-ACK dispatcher.
+        put(&mut vmcb, 0x578, 0x1005);
+        let mut expected = *vmcb.bytes();
+        expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0306u64.to_le_bytes());
+        let registers = frame;
+        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!(*vmcb.bytes(), expected);
+        assert_eq!(frame, registers);
+        assert!(state.ack.as_ref().unwrap().acknowledged());
+        assert!(state.pending_fault && !state.stopped_valid);
     }
 
     #[test]

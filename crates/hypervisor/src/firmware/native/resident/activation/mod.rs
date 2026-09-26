@@ -65,7 +65,11 @@ mod capture;
 
 mod card_boot;
 mod closure;
+mod configuration;
+mod control_policy;
 mod install;
+mod iommu;
+mod iommu_takeover;
 mod mapping;
 
 mod physical_boot;

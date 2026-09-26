@@ -122,11 +122,17 @@ impl Vmcb {
         }
         self.write_u32::<0x000>(0); // CR reads/writes execute natively.
         self.write_u32::<0x004>(0); // DR6/DR7 are switched by VMRUN/VMEXIT.
-        self.write_u32::<0x008>(0); // Guest exceptions use its native IDT.
+        self.write_u32::<0x008>(super::NATIVE_EXCEPTION_INTERCEPTS);
         self.write_u32::<INTERCEPT_MISC1>((1 << 26) | (1 << 28) | (1 << 31));
         self.write_u32::<INTERCEPT_MISC2>(0x7f);
         self.write_u32::<0x014>(0);
         Ok(())
+    }
+
+    /// The ordinary profile intercepts only #GP. The entry trial adds #PF temporarily.
+    #[cfg(feature = "resident-runtime")]
+    pub(crate) fn native_exception_intercepts_valid(&self) -> bool {
+        self.read_u32::<0x008>() == super::NATIVE_EXCEPTION_INTERCEPTS
     }
 
     /// Enable the already-built native NPT only before first entry. Caller

@@ -1,4 +1,5 @@
-//! The first-fault latch: one diagnostic payload captured per runtime and held until published.
+//! The first-fault latch: one immutable diagnostic payload per runtime.
+//! The current resident retains it privately; explicit publication is an offline codec operation.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 

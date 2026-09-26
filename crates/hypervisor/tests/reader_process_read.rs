@@ -60,9 +60,10 @@ fn assert_process_read(layout: ProcessLayoutEvidence) {
     let profile = ProcessProfile::new(layout).unwrap();
     let request =
         ProcessRequest { kernel_root_pa: 0x10000, list_head_va: 0x1000, pid: 4242, max_nodes: 2 };
-    let process = process::find(config, profile, request, &mut |pa, bytes| image.read(pa, bytes))
-        .unwrap()
-        .unwrap();
+    let process =
+        process::find(config, profile, request, &mut |pa, bytes: &mut [u8]| image.read(pa, bytes))
+            .unwrap()
+            .unwrap();
     assert_eq!(process.pid, 4242);
     assert_eq!(process.eprocess_va, 0x3000);
     assert_eq!(process.create_time, Some(0x1234_5678_90ab_cdef));
@@ -73,7 +74,7 @@ fn assert_process_read(layout: ProcessLayoutEvidence) {
         process.kernel_root_pa,
         0x4000,
         &mut output,
-        &mut |pa, bytes| image.read(pa, bytes),
+        &mut |pa, bytes: &mut [u8]| image.read(pa, bytes),
     );
     assert_eq!(report.bytes_read, 12);
     assert_eq!(report.error, None);

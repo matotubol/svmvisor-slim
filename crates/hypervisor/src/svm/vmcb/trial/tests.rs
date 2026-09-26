@@ -88,6 +88,23 @@ fn entry_trial_begin_refusal_is_byte_exact() {
 }
 
 #[test]
+fn entry_trial_preserves_gp_interception_and_returns_delivery_fault_to_dispatch() {
+    let mut v = canonical();
+    put(&mut v, 0x008, 0x2000, 4);
+    let t = issued(&mut v);
+    assert_eq!(t.vmcb.read_u32::<EXCEPTIONS>(), 0x6000);
+    exit(t.vmcb, 0x4d, 0x10, u64::MAX, 3);
+    put(t.vmcb, 0x088, 0x8000_0306, 8);
+    let saved = t.vmcb.bytes[0x400..].to_vec();
+    assert_eq!(unsafe { t.finish(None) }, Ok(Outcome::GeneralProtectionIntercepted));
+    assert_eq!(v.read_u32::<EXCEPTIONS>(), 0x2000);
+    assert_eq!(get(&v, 0x090), 1);
+    assert_eq!(get(&v, 0x0a8), 0);
+    assert_eq!(get(&v, 0x088), 0x8000_0306);
+    assert_eq!(&v.bytes[0x400..], saved);
+}
+
+#[test]
 fn entry_trial_arming_changes_only_owned_controls_and_flush_metadata() {
     let mut v = canonical();
     let before = v.bytes;

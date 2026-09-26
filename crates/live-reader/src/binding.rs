@@ -8,14 +8,14 @@ use svmvisor_hypervisor::reader::{
 
 use crate::{
     bridge::ReadBridge,
-    process::{Details, physical},
+    process::{Details, memory},
     profile::KernelProfile,
 };
 
 /// A process bound resident-side, with the EPROCESS fields read while finding it.
 pub(crate) struct Bound {
     pub token: u64,
-    /// The creation time the token pins.
+    /// The creation time the resident compares on each sample.
     pub created: u64,
     pub details: Details,
 }
@@ -29,12 +29,8 @@ pub(crate) fn discover(
     bridge: &mut ReadBridge,
 ) -> Result<Option<Bound>, String> {
     let mut backend_error = None;
-    let found = process::find(
-        config,
-        profile.process(),
-        request,
-        &mut physical(bridge, &mut backend_error),
-    );
+    let found =
+        process::find(config, profile.process(), request, &mut memory(bridge, &mut backend_error));
     let identity = found.map_err(|error| {
         format!("process discovery failed: {error:?}; backend={backend_error:?}")
     })?;
@@ -46,7 +42,7 @@ pub(crate) fn discover(
         profile,
         request.kernel_root_pa,
         identity.eprocess_va,
-        &mut physical(bridge, &mut backend_error),
+        &mut memory(bridge, &mut backend_error),
     );
     let details = details.map_err(|error| format!("{error}; backend={backend_error:?}"))?;
 

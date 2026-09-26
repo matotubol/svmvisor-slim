@@ -6,8 +6,8 @@
 
 use svmvisor_card_abi::endpoint::TerminalEndpoint;
 
-/// Shared cache-policy profile; incompatible with previous resident layouts.
-pub const DIRECTORY_VERSION: u64 = 12;
+/// Shared retained-resource profile; incompatible with previous pool layouts.
+pub const DIRECTORY_VERSION: u64 = 17;
 /// Image bound below the shared cache-policy aliases.
 pub const IMAGE_LIMIT_OFFSET: u64 = 0xf0000;
 /// One shared cache-policy backing in slot zero, aliased into every host root.
@@ -16,6 +16,27 @@ pub const CACHE_SHARED_BYTES: u64 = 0x8000;
 /// Shared startup mailboxes and terminal control, excluded from guest memory.
 pub const STARTUP_PAGE_OFFSET: u64 = 0xfe000;
 pub const MAX_RESIDENT_CPUS: usize = 32;
+/// One immutable firmware observation after the private image slots. The whole
+/// assigned extent is retained and CPU-excluded, including unused capacity.
+pub const IOMMU_RETAINED_BYTES: u64 = 0x10000;
+/// Uninstalled candidate device table, root, command/event/completion backing.
+pub const IOMMU_RESOURCE_BYTES: u64 = 0x210000;
+/// Native capacity, checked against the complete fresh inventory before ownership.
+pub const MAX_NATIVE_IOMMU_UNITS: usize = 4;
+/// Each generation holds a full device table plus 256 translation/interrupt pages.
+/// Arbitrary guest compositions must pass a separate capacity check; this is not
+/// a promise that every possible Windows mapping fits.
+pub const IOMMU_COMPOSITION_BYTES: u64 = 0x300000;
+pub const IOMMU_UNIT_STRIDE: u64 = IOMMU_RESOURCE_BYTES + 2 * IOMMU_COMPOSITION_BYTES;
+/// Common scalar guest PCI/IVRS presentation; shared by every processor.
+pub const IOMMU_PRESENTATION_BYTES: u64 = 0x12000;
+/// One serialized source capture and mapping workspace, not one copy per CPU.
+/// Its source-page protection and physical publication are separate obligations.
+pub const IOMMU_WORKSPACE_BYTES: u64 = 0x1200000;
+pub const SHARED_RETAINED_BYTES: u64 = IOMMU_RETAINED_BYTES
+    + MAX_NATIVE_IOMMU_UNITS as u64 * IOMMU_UNIT_STRIDE
+    + IOMMU_PRESENTATION_BYTES
+    + IOMMU_WORKSPACE_BYTES;
 
 const _: () = {
     assert!(IMAGE_LIMIT_OFFSET <= CACHE_SHARED_OFFSET);
@@ -23,6 +44,10 @@ const _: () = {
     assert!(CACHE_SHARED_BYTES & 4095 == 0);
     assert!(CACHE_SHARED_OFFSET + CACHE_SHARED_BYTES <= 0xfb000);
     assert!(CACHE_SHARED_OFFSET + CACHE_SHARED_BYTES <= STARTUP_PAGE_OFFSET);
+    assert!(
+        MAX_RESIDENT_CPUS as u64 * 0x100000 + SHARED_RETAINED_BYTES
+            <= crate::memory::npt::MAX_IDENTITY_EXCLUSION_BYTES
+    );
 };
 
 /// Typed takeover evidence: tag A1h in bits 63:56, bit 55 set when the
@@ -190,7 +215,81 @@ pub type ArmRuntime = unsafe extern "win64" fn(
     *const TerminalEndpoint,
 ) -> u64;
 
-/// One 1MiB image per dense slot; larger pools are 2MiB aligned below1GiB.
+/// Numeric extent for dense 1MiB images plus shared observation and resources.
+pub const fn pool_bytes_for_processors(count: usize) -> Option<u64> {
+    if count == 0 || count > MAX_RESIDENT_CPUS {
+        return None;
+    }
+    Some(count as u64 * 0x100000 + SHARED_RETAINED_BYTES)
+}
+
+/// Decode only the current exact pool shape; the tail is never a CPU slot.
+pub const fn pool_processor_count(bytes: u64) -> Option<usize> {
+    if bytes < 0x100000 + SHARED_RETAINED_BYTES {
+        return None;
+    }
+    let images = bytes - SHARED_RETAINED_BYTES;
+    if images & 0xfffff != 0 || images / 0x100000 > MAX_RESIDENT_CPUS as u64 {
+        return None;
+    }
+    Some((images / 0x100000) as usize)
+}
+
+/// Address of the common observation within a numerically valid pool.
+pub fn retained_iommu_base(pool_base: u64, pool_bytes: u64) -> Option<u64> {
+    let count = pool_processor_count(pool_bytes)?;
+    if pool_base < 0x200000
+        || pool_base & 0x1fffff != 0
+        || pool_base.checked_add(pool_bytes)? > 0x40000000
+    {
+        return None;
+    }
+    Some(pool_base + count as u64 * 0x100000)
+}
+
+/// Fixed native backing addresses. These numeric assignments do not grant a
+/// storage borrow, admission, DMA integrity or permission to publish hardware.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeIommuResources {
+    pub bank: u64,
+    pub generations: [u64; 2],
+}
+
+/// Common retained state. Both extents are disjoint from hardware-consumed
+/// unit banks and belong to the complete pool covered by the exclusion policy.
+/// Numeric layout does not establish that the physical policy is installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeIommuShared {
+    pub presentation: u64,
+    pub workspace: u64,
+}
+
+pub fn native_iommu_shared(pool_base: u64, pool_bytes: u64) -> Option<NativeIommuShared> {
+    let retained = retained_iommu_base(pool_base, pool_bytes)?;
+    let presentation =
+        retained + IOMMU_RETAINED_BYTES + MAX_NATIVE_IOMMU_UNITS as u64 * IOMMU_UNIT_STRIDE;
+    Some(NativeIommuShared { presentation, workspace: presentation + IOMMU_PRESENTATION_BYTES })
+}
+
+/// Each physical unit needs its own slot; callers must reject a larger fresh
+/// inventory, never truncate it. All slots, including unused ones, are retained
+/// and CPU-excluded as part of the complete pool.
+pub fn native_iommu_resources(
+    pool_base: u64,
+    pool_bytes: u64,
+    unit: usize,
+) -> Option<NativeIommuResources> {
+    if unit >= MAX_NATIVE_IOMMU_UNITS {
+        return None;
+    }
+    let retained = retained_iommu_base(pool_base, pool_bytes)?;
+    let bank = retained + IOMMU_RETAINED_BYTES + unit as u64 * IOMMU_UNIT_STRIDE;
+    let first = bank + IOMMU_RESOURCE_BYTES;
+    Some(NativeIommuResources { bank, generations: [first, first + IOMMU_COMPOSITION_BYTES] })
+}
+
+/// One 1MiB image per dense slot followed by the retained shared tail.
+/// Every pool is 2MiB aligned below1GiB, including the one-CPU test profile.
 /// APIC IDs remain limited to the physical bootstrap inventory (0..=254).
 /// Numeric layout checks are not allocation, caching or CPU ownership proof.
 pub fn is_valid_pool_slot(
@@ -200,18 +299,12 @@ pub fn is_valid_pool_slot(
     slot: u64,
     apic_id: u64,
 ) -> bool {
-    let Some(end) = pool_base.checked_add(pool_bytes) else {
+    let Some(count) = pool_processor_count(pool_bytes) else {
         return false;
     };
-    pool_base >= 0x100000
-        && pool_base & 4095 == 0
-        && end <= 0x40000000
-        && pool_bytes >= 0x100000
-        && pool_bytes <= MAX_RESIDENT_CPUS as u64 * 0x100000
-        && pool_bytes & 0xfffff == 0
-        && slot < pool_bytes / 0x100000
+    retained_iommu_base(pool_base, pool_bytes).is_some()
+        && slot < count as u64
         && apic_id <= 254
-        && (pool_bytes == 0x100000 || pool_base & 0x1fffff == 0)
         && base == pool_base + slot * 0x100000
         && base >> 21 == (base + 0xfffff) >> 21
 }

@@ -89,7 +89,7 @@ impl Image {
             config(),
             ProcessProfile::new(layout).unwrap(),
             ProcessRequest { kernel_root_pa: ROOT, list_head_va: HEAD, pid: 42, max_nodes: 5 },
-            &mut |pa, output| self.read(pa, output),
+            &mut |pa, output: &mut [u8]| self.read(pa, output),
         )
         .unwrap()
         .unwrap()
@@ -105,7 +105,7 @@ impl Image {
             ProcessProfile::new(layout).unwrap(),
             ROOT,
             expected,
-            &mut |pa, output| self.read(pa, output),
+            &mut |pa, output: &mut [u8]| self.read(pa, output),
         )
     }
 }

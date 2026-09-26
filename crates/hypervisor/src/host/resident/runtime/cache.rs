@@ -18,7 +18,14 @@ use crate::{
             stop::{stop, terminal_requested},
         },
     },
-    memory::npt::{CacheMapping, CacheNptError, CacheTableStorage, retype_identity_policy},
+    memory::{
+        address::AddressPolicy,
+        npt::{
+            CacheMapping, CacheNptError, CacheTableStorage, ControlPageDenials,
+            retype_identity_policy_with_guards,
+            table_guard::{TableWriteDenials, protect_identity_tables, verify_identity_tables},
+        },
+    },
     svm::{
         cache_policy::{CacheBank, CacheEffect, CacheError, SharedCache},
         dispatch,
@@ -52,7 +59,13 @@ fn mask(count: usize) -> u32 {
 
 /// Before the first guest entry, under the identity-mapped firmware root.
 /// Shared backing has been initialized and every MSRPM already owns cache MSRs.
-pub(super) unsafe fn capture(pool: u64, slot: usize, ids: &[u32]) -> bool {
+pub(super) unsafe fn capture(
+    pool: u64,
+    slot: usize,
+    ids: &[u32],
+    policy: AddressPolicy,
+    denied: &ControlPageDenials,
+) -> bool {
     if ids.is_empty() || ids.len() > 32 || slot >= ids.len() {
         return false;
     }
@@ -91,11 +104,19 @@ pub(super) unsafe fn capture(pool: u64, slot: usize, ids: &[u32]) -> bool {
     }
     // No guest has run on this CPU. Establish the correctly composed initial
     // types as well: nested PAT0=WB alone is not transparent for physical WC.
+    // Retype the installed tree, preserving every permanent zero hole. This
+    // path must never recreate identity mappings from the domain width alone.
     if unsafe {
-        retype_identity_policy(
+        retype_identity_policy_with_guards(
             &(*ptr::addr_of!(NPT)).0,
             &mut (*ptr::addr_of_mut!(STAGING)).0,
             ptr::addr_of!(NPT) as u64,
+            policy,
+            denied,
+            match super::viommu::local_guards(policy) {
+                Ok(guards) => guards,
+                Err(_) => return false,
+            },
             |start, end| select_type(&bank, &bank, host_pat, start, end),
         )
     }
@@ -245,10 +266,22 @@ pub(super) unsafe fn service(state: &mut State, vmcb: &mut Vmcb) -> bool {
                 return refuse(state, vmcb, 3);
             }
             let result = unsafe {
-                retype_identity_policy(
+                // Zero control/monitor holes are permanent; only the cache
+                // builder's own quarantine marker is eligible for restoration.
+                let Some(caps) = state.capabilities.as_ref() else {
+                    return refuse(state, vmcb, 4);
+                };
+                let guards = match super::viommu::local_guards(caps.address_policy()) {
+                    Ok(guards) => guards,
+                    Err(_) => return refuse(state, vmcb, 4),
+                };
+                retype_identity_policy_with_guards(
                     &(*ptr::addr_of!(NPT)).0,
                     &mut (*ptr::addr_of_mut!(STAGING)).0,
                     ptr::addr_of!(NPT) as u64,
+                    caps.address_policy(),
+                    &state.control_denials,
+                    guards,
                     |start, end| select_type(&logical, &physical, host_pat, start, end),
                 )
             };
@@ -322,6 +355,37 @@ pub(super) unsafe fn service(state: &mut State, vmcb: &mut Vmcb) -> bool {
         core::hint::spin_loop();
     }
     refuse(state, vmcb, 6)
+}
+
+/// Stage and install actual page-level NPT source guards using the cache
+/// owner's existing per-CPU scratch tables. No second large static allocation.
+///
+/// # Safety
+/// Same stopped CPU, no active cache transaction using STAGING, and a global
+/// table-source barrier retaining every peer. No peer may resume until its own
+/// corresponding installation and flush request has completed.
+pub(super) unsafe fn install_source_guards(
+    vmcb: &mut Vmcb,
+    policy: AddressPolicy,
+    guards: TableWriteDenials<'_>,
+) -> Result<(), CacheNptError> {
+    let root = ptr::addr_of!(NPT) as u64;
+    if vmcb.nested_root() != root {
+        return Err(CacheNptError::Storage);
+    }
+    unsafe {
+        protect_identity_tables(
+            &(*ptr::addr_of!(NPT)).0,
+            &mut (*ptr::addr_of_mut!(STAGING)).0,
+            root,
+            policy,
+            guards,
+        )?;
+        verify_identity_tables(&(*ptr::addr_of!(STAGING)).0, root, guards)?;
+        ptr::copy_nonoverlapping(ptr::addr_of!(STAGING), ptr::addr_of_mut!(NPT), 1);
+    }
+    vmcb.request_full_tlb_flush();
+    Ok(())
 }
 
 fn select_type(

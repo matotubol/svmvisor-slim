@@ -1,16 +1,17 @@
-//! One bounded local batch session; no physical transactions occur in steady-state sampling.
+//! Retained batch client logic, exercised through in-memory transports in tests.
 
 use std::{
     fmt,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use svmvisor_card_abi::batch::{
     self, BatchRange, BatchRequest, BindingEvidence, HEADER_BYTES, MAGIC, MAX_DATA_BYTES,
     MAX_RANGES, MAX_RESPONSE_BYTES, Operation, Status, VERSION,
 };
+use svmvisor_hypervisor::reader::paging::PagingConfig;
 
-use crate::transport::{Exchange, NativeTransport};
+use crate::transport::Exchange;
 
 /// Why an exchange failed. Only a resident refusal of a well-formed request keeps the session.
 #[derive(Debug, PartialEq, Eq)]
@@ -62,36 +63,7 @@ pub(crate) struct ReadBridge {
 }
 
 impl ReadBridge {
-    /// `deadline` bounds the whole session; `None` leaves only per-phase and response limits.
-    pub(crate) fn start(
-        cpu: u16,
-        max_calls: u64,
-        deadline: Option<Duration>,
-        response_timeout: Duration,
-    ) -> Result<Self, String> {
-        let started = Instant::now();
-        let transport = NativeTransport::new(cpu)?;
-        let session = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_nanos() as u64
-            ^ u64::from(std::process::id()).rotate_left(32);
-        let bridge = Self::with_transport(
-            Box::new(transport),
-            session.max(1),
-            max_calls,
-            deadline
-                .map(|deadline| {
-                    deadline
-                        .checked_sub(started.elapsed())
-                        .ok_or("session deadline reached during initialization")
-                })
-                .transpose()?,
-            response_timeout,
-        )?;
-        Ok(bridge)
-    }
-
+    #[cfg(test)]
     pub(crate) fn with_transport(
         transport: Box<dyn Exchange>,
         session: u64,
@@ -118,7 +90,7 @@ impl ReadBridge {
             failed: false,
         };
         bridge
-            .exchange(Operation::Hello, 0, &[], BindingEvidence::EMPTY)
+            .exchange(Operation::Hello, 0, &[], BindingEvidence::EMPTY, None)
             .map_err(|failure| failure.to_string())?;
         Ok(bridge)
     }
@@ -200,26 +172,49 @@ impl ReadBridge {
         Ok(self.phase_deadline.map_or(end, |deadline| end.min(deadline)))
     }
 
+    #[cfg(test)]
     pub(crate) fn read(&mut self, gpa: u64, output: &mut [u8]) -> Result<(), String> {
         let range = BatchRange {
             address: gpa,
             length: u32::try_from(output.len()).map_err(|_| "physical range too large")?,
         };
         let (_, bytes) = self
-            .exchange(Operation::Physical, 0, &[range], BindingEvidence::EMPTY)
+            .exchange(Operation::Physical, 0, &[range], BindingEvidence::EMPTY, None)
             .map_err(|failure| failure.to_string())?;
         output.copy_from_slice(&bytes);
         Ok(())
     }
 
+    pub(crate) fn read_virtual(
+        &mut self,
+        config: PagingConfig,
+        root: u64,
+        va: u64,
+        output: &mut [u8],
+    ) -> Result<(), Failure> {
+        let range = BatchRange {
+            address: va,
+            length: u32::try_from(output.len()).map_err(|_| "virtual range too large")?,
+        };
+        let (_, bytes) = self.exchange(
+            Operation::Virtual,
+            0,
+            &[range],
+            BindingEvidence::EMPTY,
+            Some((config, root)),
+        )?;
+        output.copy_from_slice(&bytes);
+        Ok(())
+    }
+
     pub(crate) fn bind(&mut self, evidence: BindingEvidence) -> Result<u64, String> {
-        self.exchange(Operation::Bind, 0, &[], evidence)
+        self.exchange(Operation::Bind, 0, &[], evidence, None)
             .map(|(token, _)| token)
             .map_err(|failure| failure.to_string())
     }
 
     pub(crate) fn sample(&mut self, token: u64, ranges: &[BatchRange]) -> Result<Vec<u8>, Failure> {
-        self.exchange(Operation::Sample, token, ranges, BindingEvidence::EMPTY)
+        self.exchange(Operation::Sample, token, ranges, BindingEvidence::EMPTY, None)
             .map(|(_, bytes)| bytes)
     }
 
@@ -229,11 +224,12 @@ impl ReadBridge {
         token: u64,
         ranges: &[BatchRange],
         binding: BindingEvidence,
+        address_space: Option<(PagingConfig, u64)>,
     ) -> Result<(u64, Vec<u8>), Failure> {
         if self.failed {
             return Err("local session already failed; no retry".into());
         }
-        let result = self.exchange_inner(operation, token, ranges, binding);
+        let result = self.exchange_inner(operation, token, ranges, binding, address_space);
         if matches!(result, Err(Failure::Fatal(_))) {
             self.failed = true;
         }
@@ -246,6 +242,7 @@ impl ReadBridge {
         token: u64,
         ranges: &[BatchRange],
         binding: BindingEvidence,
+        address_space: Option<(PagingConfig, u64)>,
     ) -> Result<(u64, Vec<u8>), Failure> {
         self.finish_phase()?;
         if self.calls >= self.max_calls {
@@ -260,6 +257,12 @@ impl ReadBridge {
             boot: self.boot,
             sequence: self.sequence.checked_add(1).ok_or("sequence exhausted")?,
             token,
+            root_pa: address_space.map_or(0, |(_, root)| root),
+            paging: address_space.map_or(0, |(config, _)| {
+                u32::from(config.physical_bits())
+                    | (u32::from(config.nxe()) << 8)
+                    | (u32::from(config.page_1g()) << 9)
+            }),
             count: ranges.len(),
             ranges: [BatchRange::EMPTY; MAX_RANGES],
             binding,
@@ -309,15 +312,21 @@ fn decode_response(bytes: &[u8], request: BatchRequest) -> Result<(u64, u64, Vec
     }
     let length = word(44) as usize;
     if length > MAX_DATA_BYTES
+        || (word(40) != Status::Success as u32 && length != 0)
         || bytes.len() != HEADER_BYTES + ((length + 3) & !3) + 4
         || bytes[HEADER_BYTES + length..bytes.len() - 4].iter().any(|byte| *byte != 0)
     {
         return Err("invalid response data length/padding".into());
     }
-    // Only Sample refusals are recoverable: the resident keeps the session after a failed range,
-    // and clears just the binding after an identity change.
+    // Failed virtual translations are recoverable; physical backend failures remain fatal.
+    // Samples keep the session after an unreadable range or invalidate just the process binding.
     match word(40) {
         0 => {}
+        status
+            if status == Status::Translation as u32 && request.operation == Operation::Virtual =>
+        {
+            return Err(Failure::Unreadable);
+        }
         status if status == Status::Read as u32 && request.operation == Operation::Sample => {
             return Err(Failure::Unreadable);
         }
@@ -550,6 +559,8 @@ mod tests {
             boot: 0,
             sequence: 1,
             token: 0,
+            root_pa: 0,
+            paging: 0,
             count: 0,
             ranges: [BatchRange::EMPTY; MAX_RANGES],
             binding: BindingEvidence::EMPTY,
@@ -558,6 +569,11 @@ mod tests {
         let length =
             batch::encode_response(request, 7, 0, Status::Success, &[], &mut output).unwrap();
         assert_eq!(decode_response(&output[..length], request).unwrap(), (7, 0, Vec::new()));
+        let mut legacy = output;
+        legacy[4..6].copy_from_slice(&2u16.to_le_bytes());
+        let crc = batch::crc32(&legacy[..length - 4]);
+        legacy[length - 4..length].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(decode_response(&legacy[..length], request), Err(Failure::Fatal(_))));
         for token in [1u64, 9, u64::MAX] {
             output[32..40].copy_from_slice(&token.to_le_bytes());
             let crc = batch::crc32(&output[..length - 4]);
@@ -592,7 +608,7 @@ mod tests {
             failed: false,
         };
         assert_eq!(
-            bridge.exchange(Operation::Hello, 0, &[], BindingEvidence::EMPTY).unwrap_err(),
+            bridge.exchange(Operation::Hello, 0, &[], BindingEvidence::EMPTY, None).unwrap_err(),
             Failure::Fatal("response token or data length mismatch".into())
         );
         assert!(bridge.failed);
@@ -602,7 +618,7 @@ mod tests {
         assert_eq!(bytes, [0x55; 32]);
         assert!(
             bridge
-                .exchange(Operation::Hello, 0, &[], BindingEvidence::EMPTY)
+                .exchange(Operation::Hello, 0, &[], BindingEvidence::EMPTY, None)
                 .unwrap_err()
                 .to_string()
                 .contains("no retry")
@@ -611,13 +627,15 @@ mod tests {
     }
 
     #[test]
-    fn only_sample_read_and_binding_refusals_keep_the_session() {
+    fn only_sample_refusals_and_virtual_translation_refusals_keep_the_session() {
         let mut request = BatchRequest {
             operation: Operation::Sample,
             session: 11,
             boot: 7,
             sequence: 3,
             token: 9,
+            root_pa: 0,
+            paging: 0,
             count: 1,
             ranges: [BatchRange::EMPTY; MAX_RANGES],
             binding: BindingEvidence::EMPTY,
@@ -635,6 +653,18 @@ mod tests {
         }
         request.operation = Operation::Physical;
         assert!(matches!(refusal(request, Status::Read), Failure::Fatal(_)));
+        assert!(matches!(refusal(request, Status::Translation), Failure::Fatal(_)));
+        request.operation = Operation::Virtual;
+        assert_eq!(refusal(request, Status::Translation), Failure::Unreadable);
+        assert!(matches!(refusal(request, Status::Read), Failure::Fatal(_)));
+        let mut output = [0; MAX_RESPONSE_BYTES];
+        let length =
+            batch::encode_response(request, 7, 9, Status::Success, &[1, 2, 3], &mut output)
+                .unwrap();
+        output[40..44].copy_from_slice(&(Status::Translation as u32).to_le_bytes());
+        let crc = batch::crc32(&output[..length - 4]);
+        output[length - 4..length].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(decode_response(&output[..length], request), Err(Failure::Fatal(_))));
     }
 
     #[test]
@@ -645,6 +675,8 @@ mod tests {
             boot: 7,
             sequence: 3,
             token: 9,
+            root_pa: 0,
+            paging: 0,
             count: 1,
             ranges: [BatchRange::EMPTY; MAX_RANGES],
             binding: BindingEvidence::EMPTY,

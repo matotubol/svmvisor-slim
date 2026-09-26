@@ -105,7 +105,7 @@ impl ContextFixture {
         let profile = &self.profile;
         let bytes = &self.bytes;
         let reads = &mut self.reads;
-        discover(profile, candidates, 4, &mut |address, output| {
+        discover(profile, candidates, 4, &mut |address, output: &mut [u8]| {
             *reads += 1;
             for (index, byte) in output.iter_mut().enumerate() {
                 *byte = bytes.get(&(address + index as u64)).copied().unwrap_or(0);
@@ -192,11 +192,12 @@ fn backend_failure_stops_before_trying_another_candidate() {
     let fixture = ContextFixture::new();
     let candidate = fixture.candidate();
     let mut calls = 0;
-    let error = discover(&fixture.profile, &[candidate, candidate], 4, &mut |_, _| {
-        calls += 1;
-        Err(PagingError::PhysicalRead)
-    })
-    .unwrap_err();
+    let error =
+        discover(&fixture.profile, &[candidate, candidate], 4, &mut |_: u64, _: &mut [u8]| {
+            calls += 1;
+            Err(PagingError::PhysicalRead)
+        })
+        .unwrap_err();
     assert!(error.contains("stopped"));
     assert_eq!(calls, 1);
 }
@@ -229,7 +230,7 @@ fn kernel_identity_mutation_between_root_checks_never_publishes_context() {
     let candidate = fixture.candidate();
     let codeview = 0x4000_0000 + ((KERNEL_BASE + u64::from(CODEVIEW_RVA)) & 0x3fff_ffff);
     let mut observations = 0;
-    let result = discover(&fixture.profile, &[candidate], 4, &mut |address, output| {
+    let result = discover(&fixture.profile, &[candidate], 4, &mut |address, output: &mut [u8]| {
         for (index, byte) in output.iter_mut().enumerate() {
             *byte = fixture.bytes.get(&(address + index as u64)).copied().unwrap_or(0);
         }

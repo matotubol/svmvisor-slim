@@ -8,7 +8,7 @@ use svmvisor_hypervisor::{
         paging::{self, PagingConfig},
         resident::{self as abi, ResidentDirectory},
     },
-    memory::npt::TableStorage,
+    memory::npt::CacheTableStorage,
 };
 
 use super::{
@@ -59,7 +59,14 @@ pub(super) unsafe fn host_closure(
     reject!(c.host_code_selector != 8, 604, d.context, c.host_code_selector, 8, 24);
     reject!(c.host_data_selector != 16, 605, d.context, c.host_data_selector, 16, 24);
     reject!(c.host_tr_selector != 24, 606, d.context, c.host_tr_selector, 24, 24);
-    reject!(!inside(c.host_cr3, 16384, 4096), 607, d.context, c.host_cr3, d.memory_end, 24);
+    reject!(
+        !inside(c.host_cr3, abi::inventory::HOST_TABLE_BYTES, 4096),
+        607,
+        d.context,
+        c.host_cr3,
+        d.memory_end,
+        24
+    );
     reject!(!inside(c.hsave_pa, 4096, 4096), 608, d.context, c.hsave_pa, d.memory_end, 24);
     reject!(
         !inside(c.host_extra_pa, 4096, 4096),
@@ -114,7 +121,7 @@ pub(super) unsafe fn host_closure(
             (d.context, core::mem::size_of::<abi::BridgeContext>() as u64),
             (d.vmcb, 4096),
             (d.registers, 112),
-            (d.npt, core::mem::size_of::<TableStorage>() as u64),
+            (d.npt, core::mem::size_of::<CacheTableStorage>() as u64),
             (c.hsave_pa, 4096),
             (c.host_extra_pa, 4096),
             (c.host_stack_top - 65536, 65536),
@@ -197,6 +204,17 @@ pub(super) unsafe fn host_closure(
                 d.arena_base + abi::CACHE_SHARED_OFFSET + page + edge,
                 d.pool_base + abi::CACHE_SHARED_OFFSET + page + edge,
                 true,
+                true,
+            )?;
+        }
+    }
+    let retained = abi::retained_iommu_base(d.pool_base, d.pool_bytes).ok_or(24u64)?;
+    for page in (retained..retained + abi::SHARED_RETAINED_BYTES).step_by(4096) {
+        for edge in [0, 4095] {
+            check_alias(
+                page + edge,
+                page + edge,
+                page >= retained + abi::IOMMU_RETAINED_BYTES,
                 true,
             )?;
         }

@@ -1,65 +1,41 @@
-//! Bounded, best-effort progress for the admitted first-boot PCI endpoint.
-//! APM2 5.4/7.8.5/15.10 and PPR57896 2.1.6.1: dedicated host UC aliases;
-//! every participating guest CPU traps its first target configuration write.
-//! Decision (2026-09-18): that write no longer ends publication. Windows
-//! writes PCI configuration space early in every boot, and a transport that
-//! stops there hides every later stop. Each publication instead revalidates
-//! the endpoint under the shared lifetime guard (`checked_endpoint_locked`:
-//! ECAM base, vendor/device, class, Command.MEM, BAR0, then the BAR signature
-//! and both build IDs) and publishes nothing while any of them differs, as
-//! during BAR sizing. A forwarded port write runs under that guard. A guest
-//! ECAM write runs after its exit returns, so a write landing between one
-//! validation and the record words that follow it is not excluded: accepted
-//! for this development transport, whose words then go to an address the card
-//! decoded a moment earlier. Only a changed ECAM base still ends publication.
-//! Firmware/SMM, reset and machine checks are outside this first-boot transport
-//! guarantee. A missing record is never proof that the CPU reached no later code.
+//! Private first-fault retention and optional boot diagnostic aliases.
 //!
-//! Temporary configuration windows suppress all endpoint publication, and each CPU restores
-//! protection at its next exit. Local read calls do not use this diagnostic transport.
+//! Runtime fault details stay in the monitor's retained memory. The resident
+//! does not publish progress or register state. After the collective terminal
+//! barrier, its sole winner may publish a closed, coarse reason enum using the
+//! revalidated boot endpoint. This is best-effort output, never a guest service.
 
 use core::{
     arch::{asm, x86_64::__cpuid_count},
     ptr,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use svmvisor_card_abi::{
     endpoint::{self as card_endpoint, PCI_CLASS_REVISION, PCI_VENDOR_DEVICE, TerminalEndpoint},
     journal::{self, JournalIo},
+    stop_status::{self, StopReason},
 };
 
 use crate::{
-    arch::x86_64::msr::{HWCR, HWCR_IO_CFG_GP_FAULT, MMIO_CFG_BASE_ADDR, PAT, TARGET_SIGNATURE},
+    arch::x86_64::msr::{MMIO_CFG_BASE_ADDR, PAT, TARGET_SIGNATURE},
     host::resident::{
         runtime::{
-            ASSIGNED_APIC_ID, PHYSICAL_BITS, POOL, State, TABLES, configuration,
-            exit::retry_routing,
-            guest_reader::native_mtrrs,
-            image_base,
-            msr::read_msr,
-            stop::{stop, terminal_control},
+            ASSIGNED_APIC_ID, PHYSICAL_BITS, POOL, State, TABLES, guest_reader::native_mtrrs,
+            image_base, msr::read_msr, startup::mailboxes, stop::terminal_control,
         },
         terminal,
     },
-    svm::vmcb::Vmcb,
+    svm::startup::try_lock_routes,
 };
 
 const CONFIG_ALIAS: u64 = 0xfb000;
 const BAR_ALIAS: u64 = 0xfc000;
-/// Event 6 `aux` bit: publication continues after this configuration write.
-/// Images without it revoked the transport permanently at this record.
-const TRANSPORT_CONTINUES: u32 = 0x100;
 
 static READY: AtomicU32 = AtomicU32::new(0);
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+static PUBLIC_STOP_ATTEMPTED: AtomicU32 = AtomicU32::new(0);
 static FIRST_FAULT: terminal::DeferredFault = terminal::DeferredFault::new();
-static PAUSE_SAMPLE: AtomicU64 = AtomicU64::new(0);
-/// Set once the guest has started every CPU: routine progress records stop,
-/// fault records and the terminal barrier (event 7) still publish.
-static PROGRESS_QUIET: AtomicU32 = AtomicU32::new(0);
-/// This CPU has recorded its first native configuration write (event 6).
-static CONFIG_WRITE_NOTED: AtomicU32 = AtomicU32::new(0);
 static mut ENDPOINT: TerminalEndpoint = TerminalEndpoint {
     config_page: 0,
     bar0_host_page: 0,
@@ -73,31 +49,6 @@ static mut ENDPOINT: TerminalEndpoint = TerminalEndpoint {
     version: 0,
     reserved: 0,
 };
-static mut SLOT: usize = 0;
-static mut COUNT: usize = 0;
-
-struct TerminalJournal(u64);
-
-impl JournalIo for TerminalJournal {
-    type Error = ();
-    fn read(&mut self, offset: u64) -> Result<u32, ()> {
-        if offset > 0x9c || offset & 3 != 0 {
-            return Err(());
-        }
-        Ok(unsafe { ((self.0 + offset) as *const u32).read_volatile() })
-    }
-    fn write(&mut self, offset: u64, value: u32) -> Result<(), ()> {
-        if (!(0x40..=0x60).contains(&offset) && !(0x600..=0xffc).contains(&offset))
-            || offset & 3 != 0
-        {
-            return Err(());
-        }
-        unsafe {
-            ((self.0 + offset) as *mut u32).write_volatile(value);
-        }
-        Ok(())
-    }
-}
 
 /// Before guest entry, current firmware root and exclusively owned host tables.
 /// The caller has installed target config interception in every resident NPT.
@@ -133,286 +84,18 @@ pub(super) unsafe fn prepare(endpoint: TerminalEndpoint, slot: usize, count: usi
             entry.write(page | flags);
         }
         ENDPOINT = endpoint;
-        SLOT = slot;
-        COUNT = count;
     }
     READY.store(1, Ordering::Release);
     true
 }
 
-/// No STATE or guest-memory access: also callable from the private fault IST.
-/// Latch before trying transport. A contended/reentrant guard never loses the
-/// first fault and never spins waiting for a lock held by its interrupted CPU.
+/// No STATE, guest-memory or device access: also callable from the private fault
+/// IST. Capturing the first fault is bounded and does not wait on an interrupted
+/// writer. Ordinary progress events have no output or retained payload.
 pub(super) unsafe fn record(event: u8, fault: bool, context: [u64; 6], aux: u32) {
-    if !available() || (!fault && event != 7 && progress_quiet()) {
+    if !available() || !fault {
         return;
     }
-    let payload = unsafe { make_payload(event, fault, context, aux) };
-    if fault {
-        FIRST_FAULT.capture(payload);
-    }
-    if event == 5 {
-        let now = u64::from(payload[4]) | (u64::from(payload[5]) << 32);
-        let last = PAUSE_SAMPLE.load(Ordering::Relaxed);
-        if last != 0 && now.wrapping_sub(last) < 50_000_000 {
-            return;
-        }
-        PAUSE_SAMPLE.store(now, Ordering::Relaxed);
-    }
-    let control = unsafe { terminal_control() };
-    if !control.ready(unsafe { COUNT }) || control.diagnostic_revoked() {
-        return;
-    }
-    if let Some(_guard) = control.diagnostic_lock() {
-        let Some((_, bar)) = (unsafe { checked_endpoint_locked() }) else {
-            FIRST_FAULT.failed();
-            return;
-        };
-        if !unsafe { flush_locked(bar) } {
-            return;
-        }
-        let _ = journal::commit_diagnostic(&mut TerminalJournal(bar), unsafe { SLOT }, payload);
-    } else if fault {
-        FIRST_FAULT.failed();
-    }
-}
-
-/// Called after dispatcher guards have unwound, before any barrier wait. Each
-/// attempt is bounded; a missing peer is irrelevant to the lifetime guard.
-pub(super) unsafe fn flush_fault() {
-    let control = unsafe { terminal_control() };
-    for _ in 0..65_536 {
-        if FIRST_FAULT.pending().is_none() || control.diagnostic_revoked() {
-            return;
-        }
-        if let Some(_guard) = control.diagnostic_lock()
-            && let Some((_, bar)) = unsafe { checked_endpoint_locked() }
-            && unsafe { flush_locked(bar) }
-        {
-            return;
-        }
-        core::hint::spin_loop();
-    }
-    FIRST_FAULT.failed();
-}
-
-/// Terminal-owner-only extension in unused physical CPU banks. It never aliases
-/// an admitted processor; >=32-CPU configurations simply have no spare banks.
-/// Each record is sticky in its spare first-fault bank and last-progress bank.
-pub(super) unsafe fn export_context(index: usize, context: [u64; 6], aux: u32) {
-    if !available() {
-        return;
-    }
-    let slot = unsafe { COUNT } + index;
-    if slot >= 32 {
-        return;
-    }
-    let control = unsafe { terminal_control() };
-    if control.diagnostic_snapshot()[2] != unsafe { SLOT as u64 } + 1 {
-        return;
-    }
-    let payload = unsafe { make_payload(14, true, context, aux) };
-    for _ in 0..65_536 {
-        if control.diagnostic_revoked() {
-            return;
-        }
-        if let Some(_guard) = control.diagnostic_lock() {
-            let Some((_, bar)) = (unsafe { checked_endpoint_locked() }) else {
-                FIRST_FAULT.failed();
-                return;
-            };
-            if journal::commit_diagnostic(&mut TerminalJournal(bar), slot, payload).is_err() {
-                FIRST_FAULT.failed();
-            }
-            return;
-        }
-        core::hint::spin_loop();
-    }
-    FIRST_FAULT.failed();
-}
-
-/// This CPU stops publishing routine progress; permanent until reset.
-pub(super) fn quiet_progress() {
-    PROGRESS_QUIET.store(1, Ordering::Relaxed);
-}
-
-fn progress_quiet() -> bool {
-    PROGRESS_QUIET.load(Ordering::Relaxed) != 0
-}
-
-pub(super) fn fault_status() -> u64 {
-    FIRST_FAULT.status()
-}
-
-/// Terminal owner only, all guests permanently stopped with IF/GIF clear.
-/// Reuses the prepared UC mappings and the same lifetime owner as live records;
-/// never installs a scratch PTE or accesses a guest-memory alias.
-pub(super) unsafe fn export_terminal(words: [u32; 3]) -> bool {
-    if !available() || __cpuid_count(1, 0).eax != TARGET_SIGNATURE {
-        return false;
-    }
-    let control = unsafe { terminal_control() };
-    if !control.all_acknowledged(unsafe { COUNT })
-        || control.diagnostic_snapshot()[2] != unsafe { SLOT as u64 } + 1
-    {
-        return false;
-    }
-    // Another CPU can still be finishing its final acknowledgement record.
-    // Bound acquisition; failure retains the per-CPU first-fault records.
-    for _ in 0..256 {
-        if let Some(_guard) = control.diagnostic_lock() {
-            let Some((endpoint, bar)) = (unsafe { checked_endpoint_locked() }) else {
-                return false;
-            };
-            let mut io = TerminalJournal(bar);
-            if io.read(0x24) != Ok(0) || io.read(0x84) != Ok(endpoint.boot_id) {
-                return false;
-            }
-            let Ok(sequence) = io.read(0x2c) else {
-                return false;
-            };
-            let lo: u32;
-            let hi: u32;
-            unsafe {
-                asm!("rdtsc",out("eax")lo,out("edx")hi,options(nostack,preserves_flags));
-            }
-            return journal::commit_record(
-                &mut io,
-                [
-                    sequence.wrapping_add(1),
-                    endpoint.boot_id,
-                    lo,
-                    hi,
-                    words[0],
-                    words[1],
-                    words[2],
-                    0x0008_0013,
-                ],
-            )
-            .is_ok();
-        }
-        core::hint::spin_loop();
-    }
-    false
-}
-
-/// Actual IOIO exit under GIF/IF=0; prepared instruction precedes native I/O.
-pub(super) unsafe fn handle_io(state: &mut State, vmcb: &mut Vmcb) -> bool {
-    let exit = vmcb.exit_snapshot();
-    if !available() {
-        return stop(state, exit.code, exit.rip, 0xf200, 0);
-    }
-    let Some(guard) = (unsafe { terminal_control() }).diagnostic_lock() else {
-        return retry_routing(state, vmcb);
-    };
-    let prepared = match crate::svm::diagnostic_config::prepare_io(vmcb) {
-        Ok(p) => p,
-        Err(_) => {
-            drop(guard);
-            return stop(state, exit.code, exit.rip, 0xf201, exit.info1);
-        }
-    };
-    // IOIO interception precedes some instruction-specific faults (APM15.10.2).
-    // Never let the host's forwarded IN/OUT take HWCR.IoCfgGpFault itself.
-    if unsafe { read_msr(HWCR) } & HWCR_IO_CFG_GP_FAULT != 0 {
-        let result = prepared.fault_if_disabled();
-        drop(guard);
-        if result.is_err() {
-            return stop(state, exit.code, exit.rip, 0xf204, exit.info1);
-        }
-        state.pending_fault = true;
-        state.routing_retries = 0;
-        return true;
-    }
-    let port = prepared.port();
-    let width = prepared.width_bytes();
-    let mut value = prepared.output_value();
-    if prepared.revoke() {
-        unsafe {
-            note_config_write(port as u64, value as u64, width, 2);
-        }
-    }
-    unsafe {
-        if prepared.input() {
-            value = match width {
-                1 => {
-                    let v: u8;
-                    asm!("in al,dx",in("dx")port,out("al")v,options(nostack,preserves_flags));
-                    v as u32
-                }
-                2 => {
-                    let v: u16;
-                    asm!("in ax,dx",in("dx")port,out("ax")v,options(nostack,preserves_flags));
-                    v as u32
-                }
-                _ => {
-                    let v: u32;
-                    asm!("in eax,dx",in("dx")port,out("eax")v,options(nostack,preserves_flags));
-                    v
-                }
-            };
-        } else {
-            match width {
-                1 => {
-                    asm!("out dx,al",in("dx")port,in("al")value as u8,options(nostack,preserves_flags))
-                }
-                2 => {
-                    asm!("out dx,ax",in("dx")port,in("ax")value as u16,options(nostack,preserves_flags))
-                }
-                _ => {
-                    asm!("out dx,eax",in("dx")port,in("eax")value,options(nostack,preserves_flags))
-                }
-            }
-        }
-    }
-    prepared.commit(value);
-    state.routing_retries = 0;
-    true
-}
-
-/// Under lifetime guard, record this CPU's first native config mutation before
-/// it happens; Windows retains its real write. Publication continues and
-/// revalidates the endpoint each time (module decision above).
-pub(super) unsafe fn note_config_write(address: u64, value: u64, width: u8, reason: u32) {
-    let Some(endpoint) = (unsafe { endpoint() }) else {
-        return;
-    };
-    if progress_quiet() || CONFIG_WRITE_NOTED.swap(1, Ordering::AcqRel) != 0 {
-        return;
-    }
-    unsafe {
-        record_locked(
-            6,
-            false,
-            [endpoint.config_page, endpoint.bar0_host_page, address, value, width as u64, 0],
-            reason | TRANSPORT_CONTINUES,
-        );
-    }
-}
-
-pub(super) unsafe fn endpoint() -> Option<TerminalEndpoint> {
-    if available() { Some(unsafe { ptr::addr_of!(ENDPOINT).read() }) } else { None }
-}
-
-pub(super) fn available() -> bool {
-    READY.load(Ordering::Acquire) == 1
-}
-
-/// Caller owns the shared diagnostic lifetime guard.
-unsafe fn record_locked(event: u8, fault: bool, context: [u64; 6], aux: u32) {
-    let payload = unsafe { make_payload(event, fault, context, aux) };
-    if fault {
-        FIRST_FAULT.capture(payload);
-    }
-    let Some((_, bar)) = (unsafe { checked_endpoint_locked() }) else {
-        return;
-    };
-    if unsafe { flush_locked(bar) } {
-        let _ = journal::commit_diagnostic(&mut TerminalJournal(bar), unsafe { SLOT }, payload);
-    }
-}
-
-unsafe fn make_payload(event: u8, fault: bool, context: [u64; 6], aux: u32) -> [u32; 19] {
     let mut seq = SEQUENCE.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if seq == 0 {
         seq = SEQUENCE.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
@@ -422,73 +105,219 @@ unsafe fn make_payload(event: u8, fault: bool, context: [u64; 6], aux: u32) -> [
     unsafe {
         asm!("rdtsc",out("eax")lo,out("edx")hi,options(nostack,preserves_flags));
     }
-    journal::diagnostic_payload(
+    FIRST_FAULT.capture(journal::diagnostic_payload(
         seq,
         event,
-        fault,
+        true,
         unsafe { ENDPOINT.boot_id },
         unsafe { ASSIGNED_APIC_ID },
         lo as u64 | ((hi as u64) << 32),
         context,
         aux,
-    )
+    ));
 }
 
-unsafe fn flush_locked(bar: u64) -> bool {
-    if let Some(payload) = FIRST_FAULT.pending() {
-        if journal::commit_diagnostic(&mut TerminalJournal(bar), unsafe { SLOT }, payload).is_err()
-        {
-            FIRST_FAULT.failed();
-            return false;
+pub(super) fn available() -> bool {
+    READY.load(Ordering::Acquire) == 1
+}
+
+/// Classify private evidence without allowing an arbitrary payload to escape.
+/// Unknown/internal reasons intentionally collapse to Other.
+fn public_reason(code: u64, reason: u64) -> StopReason {
+    match (code, reason) {
+        (_, 0xf206) => StopReason::ConfigurationRoute,
+        (_, 0xf20a) => StopReason::SmiConfigurationTrap,
+        (_, 0xf200..=0xf209) => StopReason::ConfigurationAccess,
+        (0x400, _) => StopReason::MemoryPolicy,
+        (0x7c, _) => StopReason::ArchitecturalControl,
+        _ => StopReason::Other,
+    }
+}
+
+struct StopJournal(u64);
+
+impl JournalIo for StopJournal {
+    type Error = ();
+
+    fn read(&mut self, offset: u64) -> Result<u32, ()> {
+        if offset > 0x9c || offset & 3 != 0 {
+            return Err(());
         }
-        FIRST_FAULT.published();
+        Ok(unsafe { ((self.0 + offset) as *const u32).read_volatile() })
     }
-    true
+
+    fn write(&mut self, offset: u64, value: u32) -> Result<(), ()> {
+        if !(0x40..=0x60).contains(&offset) || offset & 3 != 0 {
+            return Err(());
+        }
+        unsafe { ((self.0 + offset) as *mut u32).write_volatile(value) };
+        Ok(())
+    }
 }
 
-/// Validate routing before touching the BAR. Caller holds the shared lifetime
-/// guard from this check through its final same-device completion read.
-unsafe fn checked_endpoint_locked() -> Option<(TerminalEndpoint, u64)> {
-    let control = unsafe { terminal_control() };
-    if !available() || !control.ready(unsafe { COUNT }) || control.diagnostic_revoked() {
-        return None;
+/// Sole terminal winner, after every admitted CPU has acknowledged its
+/// irreversible GIF=0 stop. Parking is NOT DMA drain or ownership evidence.
+/// No call from a resumable path or the asynchronous host-fault IST is allowed.
+/// Firmware/SMM and unchanged external fabric routing remain prerequisites.
+pub(super) unsafe fn publish_stop(state: &State) -> bool {
+    if !available() || !state.stopped_valid || __cpuid_count(1, 0).eax != TARGET_SIGNATURE {
+        return false;
     }
-    // SAFETY: caller holds the publication gate; no new configuration window can start.
-    if unsafe { configuration::publication_blocked() } {
-        return None;
+    let control = unsafe { terminal_control() };
+    if !control.all_acknowledged(state.count)
+        || control.diagnostic_snapshot()[2] != state.slot as u64 + 1
+        || control.diagnostic_revoked()
+        || control.configuration_pending()
+    {
+        return false;
+    }
+    // One nonblocking attempt. An interrupted route/configuration writer must
+    // suppress output, never be waited on or bypassed by the stopped winner.
+    let Ok(_route_guard) = try_lock_routes(unsafe { mailboxes(state.count) }) else {
+        return false;
+    };
+    let Some(_diagnostic_guard) = control.diagnostic_lock() else {
+        return false;
+    };
+    if PUBLIC_STOP_ATTEMPTED.swap(1, Ordering::AcqRel) != 0 {
+        return false;
     }
     let endpoint = unsafe { ptr::addr_of!(ENDPOINT).read() };
-    if unsafe { read_msr(MMIO_CFG_BASE_ADDR) } != endpoint.mmio_config_msr {
-        control.diagnostic_revoke();
-        return None;
+    let Some(route) = state.configuration else { return false };
+    if !endpoint.valid()
+        || unsafe { read_msr(MMIO_CFG_BASE_ADDR) } != endpoint.mmio_config_msr
+        || route.verify(endpoint.mmio_config_msr).is_err()
+    {
+        return false;
     }
-    let mtrrs = unsafe { native_mtrrs(PHYSICAL_BITS) }?;
+    let Some(mtrrs) = (unsafe { native_mtrrs(PHYSICAL_BITS) }) else { return false };
     if !mtrrs.terminal_page_is_uc(endpoint.config_page, 0)
         || !mtrrs.terminal_page_is_uc(endpoint.bar0_host_page, 0)
     {
-        return None;
+        return false;
     }
+    // PPR57896 physical pp40-41,210 (text and PNG): UC aligned EAX MOVs.
     let base = image_base();
-    let cfg = base + CONFIG_ALIAS;
-    let read_cfg = |offset| unsafe { card_endpoint::read_config_dword(cfg, offset) };
-    // Not permanent: the guest may be sizing BAR0 or toggling Command.MEM, and
-    // a later publication finds the endpoint routed again or stays silent.
-    if read_cfg(0) != PCI_VENDOR_DEVICE
-        || read_cfg(8) != PCI_CLASS_REVISION
-        || (read_cfg(0x0c) >> 16) & 0x7f != 0
-        || read_cfg(4) & 2 == 0
-        || read_cfg(0x10) != endpoint.bar0_raw
+    let cfg = |offset| unsafe { card_endpoint::read_config_dword(base + CONFIG_ALIAS, offset) };
+    if cfg(0) != PCI_VENDOR_DEVICE
+        || cfg(8) != PCI_CLASS_REVISION
+        || ((cfg(0x0c) >> 16) & 0xff) != 0
+        || cfg(4) as u16 != endpoint.command
+        || cfg(0x10) != endpoint.bar0_raw
     {
-        return None;
+        return false;
     }
-    let bar = base + BAR_ALIAS;
-    let read = |offset| unsafe { ((bar + offset) as *const u32).read_volatile() };
-    if read(0) != 0x4a4d5653
-        || read(4) != 0x00030001
-        || (u64::from(read(8)) | (u64::from(read(12)) << 32)) != endpoint.fpga_build_id
-        || (u64::from(read(16)) | (u64::from(read(20)) << 32)) != endpoint.rom_build_id
+    let mut io = StopJournal(base + BAR_ALIAS);
+    commit_public_stop(&mut io, endpoint, public_reason(state.stopped, state.stopped_info1))
+}
+
+/// Device validation and publication share one caller-held lifetime. This seam
+/// is pure with a fake journal; it accepts no private context or arbitrary words.
+fn commit_public_stop<I: JournalIo<Error = ()>>(
+    io: &mut I,
+    endpoint: TerminalEndpoint,
+    reason: StopReason,
+) -> bool {
+    let read64 = |io: &mut I, offset| -> Option<u64> {
+        Some(u64::from(io.read(offset).ok()?) | (u64::from(io.read(offset + 4).ok()?) << 32))
+    };
+    if io.read(0) != Ok(0x4a4d5653)
+        || io.read(4) != Ok(0x00030001)
+        || read64(io, 8) != Some(endpoint.fpga_build_id)
+        || read64(io, 16) != Some(endpoint.rom_build_id)
+        || io.read(0x24) != Ok(0)
+        || io.read(0x84) != Ok(endpoint.boot_id)
     {
-        return None;
+        return false;
     }
-    Some((endpoint, bar))
+    let Ok(previous) = io.read(0x2c) else { return false };
+    let Some(sequence) = previous.checked_add(1).filter(|v| *v != 0) else { return false };
+    journal::commit_record(io, stop_status::record(sequence, endpoint.boot_id, reason)).is_ok()
+}
+
+#[cfg(test)]
+mod public_tests {
+    use super::*;
+
+    #[test]
+    fn operands_and_addresses_cannot_become_public_reasons() {
+        for private in [0, 1, 0xdead_beef, 0xffff_8000_1234_5000, u64::MAX] {
+            assert_eq!(public_reason(0x400, private), StopReason::MemoryPolicy);
+            assert_eq!(public_reason(0x7c, private), StopReason::ArchitecturalControl);
+            assert_eq!(public_reason(private, private), StopReason::Other);
+        }
+        assert_eq!(public_reason(0x7b, 0xf207), StopReason::ConfigurationAccess);
+        assert_eq!(public_reason(0x7c, 0xf206), StopReason::ConfigurationRoute);
+        assert_eq!(public_reason(0x7b, 0xf20a), StopReason::SmiConfigurationTrap);
+    }
+
+    struct Journal {
+        words: [u32; 40],
+        writes: usize,
+        committed: [u32; 8],
+        fail_at: Option<u64>,
+    }
+
+    impl JournalIo for Journal {
+        type Error = ();
+        fn read(&mut self, offset: u64) -> Result<u32, ()> {
+            if self.fail_at == Some(offset) {
+                return Err(());
+            }
+            Ok(self.words[offset as usize / 4])
+        }
+        fn write(&mut self, offset: u64, value: u32) -> Result<(), ()> {
+            self.writes += 1;
+            self.words[offset as usize / 4] = value;
+            if offset == 0x60 {
+                self.committed.copy_from_slice(&self.words[16..24]);
+                self.words[32..40].copy_from_slice(&self.committed);
+                self.words[0x2c / 4] = value;
+            }
+            Ok(())
+        }
+    }
+
+    fn fixture() -> (TerminalEndpoint, Journal) {
+        let endpoint = TerminalEndpoint {
+            fpga_build_id: 0x1234_5678_9876_5432,
+            rom_build_id: 0x5432_9876_1234_5678,
+            boot_id: 31,
+            ..TerminalEndpoint::default()
+        };
+        let mut journal = Journal { words: [0; 40], writes: 0, committed: [0; 8], fail_at: None };
+        journal.words[0] = 0x4a4d5653;
+        journal.words[1] = 0x00030001;
+        journal.words[2] = endpoint.fpga_build_id as u32;
+        journal.words[3] = (endpoint.fpga_build_id >> 32) as u32;
+        journal.words[4] = endpoint.rom_build_id as u32;
+        journal.words[5] = (endpoint.rom_build_id >> 32) as u32;
+        journal.words[0x84 / 4] = endpoint.boot_id;
+        journal.words[0x2c / 4] = 7;
+        (endpoint, journal)
+    }
+
+    #[test]
+    fn stale_endpoint_or_boot_never_writes_and_success_is_redacted() {
+        for offset in [0, 4, 8, 12, 16, 20, 0x24, 0x84] {
+            let (endpoint, mut io) = fixture();
+            io.words[offset / 4] ^= 1;
+            assert!(!commit_public_stop(&mut io, endpoint, StopReason::MemoryPolicy));
+            assert_eq!(io.writes, 0);
+        }
+        for offset in [0, 4, 8, 12, 16, 20, 0x24, 0x84, 0x2c] {
+            let (endpoint, mut io) = fixture();
+            io.fail_at = Some(offset);
+            assert!(!commit_public_stop(&mut io, endpoint, StopReason::MemoryPolicy));
+            assert_eq!(io.writes, 0);
+        }
+        let (endpoint, mut io) = fixture();
+        io.words[0x2c / 4] = u32::MAX;
+        assert!(!commit_public_stop(&mut io, endpoint, StopReason::MemoryPolicy));
+        assert_eq!(io.writes, 0);
+        let (endpoint, mut io) = fixture();
+        assert!(commit_public_stop(&mut io, endpoint, StopReason::MemoryPolicy));
+        assert_eq!(io.committed, [8, 31, 0, 0, 0x501, 0, 0, 0x0008_0015]);
+        assert_eq!(io.writes, 9);
+    }
 }

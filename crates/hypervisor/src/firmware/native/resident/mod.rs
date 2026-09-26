@@ -9,6 +9,7 @@ pub use crate::firmware::native::resident::callback::{
 pub mod allocation;
 pub mod bootstrap_paging;
 mod callback;
+pub mod iommu;
 pub mod launch;
 pub mod memory;
 pub mod processors;

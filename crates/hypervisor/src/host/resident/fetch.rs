@@ -1,4 +1,4 @@
-//! Bounded stopped-guest instruction fetch for native MSR dispatch.
+//! Bounded stopped-guest instruction fetch for native MSR and #GP dispatch.
 //! Reuses the existing four-level paging parser; does not add a CPU decoder.
 //! AMD APM2 rev3.44 4.8,5.3,7.8,15.7,15.25 and Appendix B.
 use crate::{
@@ -101,6 +101,62 @@ pub fn instruction(
     Ok(bytes)
 }
 
+/// One requested byte of a faulting protected-mode instruction. Fetch only
+/// what the decoder consumes: a complete opcode may end at a page/CS boundary.
+/// Supports long64, compatibility code with four-level paging, and unpaged
+/// protected startup. Legacy paging and VM86 are outside this reader's contract.
+/// The physical reader has the same WB RAM ownership requirements as `instruction`.
+/// No register, page-table A/D bit, or architectural exception is changed here.
+pub fn general_protection_byte(
+    vmcb: &Vmcb,
+    physical_bits: u8,
+    pat: u64,
+    index: usize,
+    mut read: impl FnMut(u64, usize) -> Option<u64>,
+) -> Result<u8, FetchError> {
+    if vmcb.exit_snapshot().code != crate::svm::exit::EXIT_GP {
+        return Err(FetchError::UnsupportedExit);
+    }
+    if index >= 15 {
+        return Err(FetchError::AddressOverflow);
+    }
+    if vmcb.guest_in_64_bit_code() {
+        return instruction_byte(vmcb, physical_bits, pat, index, read);
+    }
+    let cs = u16::from_le_bytes(vmcb.bytes()[0x412..0x414].try_into().unwrap());
+    if !(32..=52).contains(&physical_bits)
+        || vmcb.guest_cr0() & 1 == 0
+        || vmcb.guest_rflags() & (1 << 17) != 0
+        || vmcb.guest_cpl() > 3
+        || cs & 0x298 != 0x98
+    {
+        return Err(FetchError::UnsupportedMode);
+    }
+    let ip = vmcb.guest_rip().checked_add(index as u64).ok_or(FetchError::AddressOverflow)?;
+    let limit = u32::from_le_bytes(vmcb.bytes()[0x414..0x418].try_into().unwrap());
+    if ip > u64::from(u32::MAX) {
+        return Err(FetchError::AddressOverflow);
+    }
+    if ip > u64::from(limit) {
+        return Err(FetchError::SegmentLimit);
+    }
+    let address = field(vmcb, 0x418).checked_add(ip).ok_or(FetchError::AddressOverflow)?;
+    if address > u64::from(u32::MAX) {
+        return Err(FetchError::AddressOverflow);
+    }
+    if vmcb.guest_cr0() & (1 << 31) != 0 {
+        // `translation` checks long-mode paging independently of CS.L.
+        return read_instruction_linear(vmcb, physical_bits, pat, address, read);
+    }
+    if vmcb.guest_cr0() & (1 << 30) != 0 {
+        return Err(FetchError::UnsupportedCacheControl);
+    }
+    read(address, 1)
+        .filter(|&value| value <= 255)
+        .map(|value| value as u8)
+        .ok_or(FetchError::UnreadableInstruction { address })
+}
+
 /// One byte of a bounded stopped long64 instruction, under the same owned,
 /// coherent WB physical-reader contract as `instruction`. The index is bounded
 /// by the architectural 15-byte instruction limit.
@@ -113,6 +169,10 @@ fn instruction_byte(
 ) -> Result<u8, FetchError> {
     if index >= 15 {
         return Err(FetchError::AddressOverflow);
+    }
+    let cs = u16::from_le_bytes(vmcb.bytes()[0x412..0x414].try_into().unwrap());
+    if cs & 0x600 != 0x200 {
+        return Err(FetchError::UnsupportedMode);
     }
     let address =
         vmcb.exit_snapshot().rip.checked_add(index as u64).ok_or(FetchError::AddressOverflow)?;
@@ -162,14 +222,13 @@ fn translation(
     let cr0 = field(vmcb, 0x558);
     let cr4 = field(vmcb, 0x548);
     let cr3 = field(vmcb, 0x550);
-    let cs = u16::from_le_bytes([vmcb.bytes()[0x412], vmcb.bytes()[0x413]]);
     let cpl = vmcb.bytes()[0x4cb];
-    // Instruction fetch requires long64 CS.L=1/CS.D=0.
+    // Four-level long-mode paging also serves compatibility code. Callers
+    // validate CS and form the linear instruction address before this walk.
     if cr0 & 0x8000_0001 != 0x8000_0001
         || cr4 & (1 << 5) == 0
         || cr4 & (1 << 12) != 0
         || efer & 0x500 != 0x500
-        || cs & 0x600 != 0x200
         || cpl > 3
     {
         return Err(FetchError::UnsupportedMode);

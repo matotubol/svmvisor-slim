@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 pub const CONTROL_OFFSET: u64 = 0x800;
 
 /// Shared backing follows all 32 startup mailboxes. Only atomics are accessed
-/// after entry; one reporter owns transport and every participant stays stopped.
+/// after entry; one owner coordinates the stop and every participant stays stopped.
 #[repr(C, align(64))]
 pub struct TerminalControl {
     ready: AtomicU32,
@@ -129,7 +129,7 @@ impl TerminalControl {
     }
     /// Owning stopped CPU only, after draining configuration writes, restoring its NPT
     /// restriction and requesting a full TLB flush. Closing needs no gate: it can only make
-    /// the mask less restrictive. Opening and MMIO publication still share the gate.
+    /// the mask less restrictive. Opening and native config I/O share the gate.
     pub fn finish_configuration(&self, slot: usize) {
         if slot < 32 {
             self.configuration_windows.fetch_and(!(1u32 << slot), Ordering::Release);
@@ -153,11 +153,11 @@ impl Default for TerminalControl {
     }
 }
 
-/// Nonblocking lifetime exclusion shared by publication and native config I/O.
+/// Nonblocking endpoint lifetime exclusion for native config I/O and write windows.
 pub struct DiagnosticGuard<'a>(&'a TerminalControl);
 
 impl DiagnosticGuard<'_> {
-    /// Publish under the same gate as MMIO, before enabling this stopped CPU's guest writes.
+    /// Mark the window under the config gate before enabling this CPU's guest writes.
     pub fn begin_configuration(&self, slot: usize) -> bool {
         if slot >= 32 {
             return false;

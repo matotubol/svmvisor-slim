@@ -34,19 +34,25 @@ def audit_minimal_producer(evidence):
     """Recheck the continuing producer's hash-bound link evidence."""
     symbols = {line.split()[-1] for line in (evidence / "symbols.log").read_text().splitlines()
                if line.split()}
-    required = {"entry_uefi", "svmvisor_minimal_prepare", "svmvisor_resident_enter",
-                "svmvisor_local_read_service"}
+    required = {"entry_uefi", "svmvisor_minimal_prepare", "svmvisor_resident_enter"}
     if not required <= symbols:
         raise ValueError("minimal producer missing required linked symbols")
     if symbols.intersection({"svmvisor_minimal_enter", "svmvisor_minimal_stop", "svmvisor_minimal_halt"}):
         raise ValueError("minimal producer contains payload-only linked entry points")
+    if any(symbol.startswith(("svmvisor_entry_trial_", "svmvisor_local_read_"))
+           for symbol in symbols):
+        raise ValueError("reader-disabled producer contains retired linked guest service")
 
 
 def verify(evidence, image, current=True):
     evidence = evidence.resolve()
     summary = json.loads((evidence / "summary.json").read_text(encoding="utf-8-sig"))
     driver = "driver.efi"
-    if (summary.get("boot") is not True or summary.get("test_output") is not False
+    if (summary.get("entry_trial") is not False
+            or summary.get("reader_enabled") is not False
+            or summary.get("authenticated_reader") is not False
+            or summary.get("payload_features") != "resident-runtime"
+            or summary.get("boot") is not True or summary.get("test_output") is not False
             or summary.get("payload_only") is not False
             or summary.get("no_fp_simd_xstate_instructions") is not True
             or summary.get("undefined_symbols") != 0
@@ -80,6 +86,7 @@ def verify(evidence, image, current=True):
     return {"status": "verified", "image_sha256": artifacts[driver],
             "summary_sha256": sha(evidence / "summary.json"),
             "source_manifest_sha256": sha(evidence / "source-manifest.json"),
+            "entry_trial": False, "reader_enabled": False, "authenticated_reader": False,
             "physical_execution_proven": False}
 
 

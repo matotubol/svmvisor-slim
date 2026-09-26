@@ -470,10 +470,35 @@ def slot_refusal_detail(reason, status, address):
             "refusal_code": status, "refusal_name": slot_refusal_name(reason, status)}
 
 
+def iommu_boot_discovery(detail: int) -> dict | None:
+    """Version-2 stage-5 observation; never attests DMA ownership or protection."""
+    statuses = {1: "observed", 2: "unavailable", 3: "unsupported",
+                4: "malformed", 5: "ambiguous", 6: "partial"}
+    observed, units, status = (detail >> 16) & 0xff, (detail >> 8) & 0xff, (detail >> 4) & 0xf
+    if (detail >> 24 != 2 or detail & 0xe or status not in statuses
+            or not 0 <= observed <= units <= 16
+            or (status == 1 and (units == 0 or observed != units))):
+        return None
+    return {"status": statuses[status], "unit_count": units,
+            "mmio_observed_unit_count": observed, "evidence": "preboot_inventory_only",
+            "ownership": "not_established_by_this_record"}
+
+
 def resident_boot_observation(words: tuple[int, ...], phase: int) -> dict | None:
     """Detail8; use actual journal4/5/6 -> snapshot10/11/9 wire rotation."""
     metadata, detail, last = words[10], words[11], words[9]
     raw = {"journal4": metadata, "journal5": detail, "journal6": last}
+    if phase == 0x15:
+        reasons = {1: "other", 2: "configuration_access", 3: "configuration_route",
+                   4: "smi_configuration_trap", 5: "memory_policy", 6: "architectural_control"}
+        reason = (metadata >> 8) & 0xff
+        valid = metadata == (1 | (reason << 8)) and reason in reasons and detail == last == 0
+        return {"format": "resident_public_stop_v1", "encoding_valid": valid,
+                "reason": reasons[reason] if valid else None,
+                "all_cpus_parked": True if valid else None,
+                "runtime_details_exported": False if valid else None,
+                "dma_drained": None, "ownership": "not_established_by_this_record",
+                "windows_boot_proven": False, "raw_words": raw}
     if phase == 0x14:
         stage, reason = metadata & 0xff, (metadata >> 8) & 0xff
         stages = {1: "ebs_hook_admission", 2: "cpu_admission", 3: "processor_inventory",
@@ -772,18 +797,34 @@ def resident_boot_observation(words: tuple[int, ...], phase: int) -> dict | None
                     "post_loader_failure_exported": False, "raw_words": raw}
         stage, slot = metadata & 0xffff, metadata >> 16
         names = {1: "hook_armed", 2: "firmware_ebs_returned", 3: "ap_release",
-                 4: "bsp_capture", 5: "all_activated_before_loader_return", 0x80: "activation_failed"}
-        terminal_prepared = bool(detail & 1) if stage == 5 and detail in (0x01000000, 0x01000001) else None
+                 4: "bsp_capture", 5: "all_activated_before_loader_return",
+                 6: "iommu_published_guests_held", 0x80: "activation_failed"}
+        iommu = iommu_boot_discovery(detail) if stage == 5 else None
+        terminal_prepared = (bool(detail & 1) if stage == 5
+                             and (detail in (0x01000000, 0x01000001) or iommu is not None) else None)
         valid = (stage in names and 1 <= last <= 32
                  and (slot < last if stage in (3, 4) else slot == 0)
-                 and (stage == 0x80 or detail == 0 or (stage == 5 and terminal_prepared is not None)))
+                 and ((stage == 6 and detail == 1) or (stage != 6 and
+                      (stage == 0x80 or detail == 0 or (stage == 5 and terminal_prepared is not None)))))
+        iommu_failures = {80: "iommu_native_context", 81: "iommu_control_manifest",
+            82: "iommu_unit_binding", 83: "iommu_initially_disabled_drain_missing",
+            84: "iommu_old_device_table_backing", 85: "iommu_old_device_bypass_profile",
+            86: "iommu_old_buffer_geometry", 87: "iommu_mmio_write_mapping",
+            88: "iommu_composed_image", 89: "iommu_physical_protocol",
+            90: "iommu_remote_ats_closure_missing", 91: "iommu_noncoherent_profile",
+            92: "platform_power_route_drift"}
         return {"format": "resident_boot_v1", "encoding_valid": valid,
                 "stage": stage, "stage_name": names.get(stage) if valid else None,
                 "processor_slot": slot if valid and stage in (3, 4) else None,
                 "processor_count": last if valid else None,
                 "activation_failure": detail if valid and stage == 0x80 else None,
+                "activation_failure_name": iommu_failures.get(detail) if valid and stage == 0x80 else None,
+                "iommu_publication_completed": True if valid and stage == 6 else None,
+                "guest_release_held": True if valid and stage == 6 else None,
+                "guest_hold_reason": "virtual_iommu_continuation_pending" if valid and stage == 6 else None,
                 "all_cpus_activated": valid and stage == 5,
                 "terminal_reporter_prepared": terminal_prepared if valid else None,
+                "iommu_discovery": iommu if valid else None,
                 "windows_boot_proven": False, "post_loader_failure_exported": False,
                 "raw_words": raw}
     return None

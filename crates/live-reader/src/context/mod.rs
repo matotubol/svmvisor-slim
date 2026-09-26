@@ -8,9 +8,10 @@ use std::fmt;
 use svmvisor_hypervisor::{
     memory::address::{PAGE_BYTES, is_canonical_48},
     reader::{
+        batch::SLICE_BYTES,
         paging::{PagingConfig, PagingError},
         process::{self, ProcessError, ProcessRequest},
-        read::{self, ReadError},
+        read::{self, ReadError, ReadReport, VirtualRead, VirtualReader},
     },
 };
 
@@ -94,9 +95,9 @@ struct ContextReader<'a, F> {
     read: &'a mut F,
 }
 
-impl<F: FnMut(u64, &mut [u8]) -> Result<(), PagingError>> ContextReader<'_, F> {
+impl<F: VirtualRead> ContextReader<'_, F> {
     fn exact(&mut self, address: u64, output: &mut [u8]) -> Result<(), ContextError> {
-        let report = read::read_virtual(self.config, self.root, address, output, self.read);
+        let report = self.read.read_virtual(self.config, self.root, address, output);
         if let Some(error) = report.error {
             return Err(ContextError::Read(error));
         }
@@ -235,13 +236,13 @@ impl fmt::Display for ContextError {
     }
 }
 
-/// Try only observed roots and exact profiled entry RVAs, with one shared physical-read budget.
+/// Try only observed roots and exact profiled entry RVAs, with one shared callback budget.
 /// A physical callback failure ends discovery immediately; it is never retried with another root.
 pub(crate) fn discover(
     profile: &KernelProfile,
     candidates: &[ContextObservation],
     max_nodes: usize,
-    read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
+    read: &mut impl VirtualRead,
 ) -> Result<ValidatedContext, String> {
     if candidates.is_empty()
         || candidates.len() > MAX_CANDIDATES
@@ -257,18 +258,35 @@ pub(crate) fn discover(
     for candidate in candidates {
         for &anchor in profile.syscall_rvas() {
             let calls_before = calls;
-            let mut bounded = |address, output: &mut [u8]| {
-                if calls >= MAX_PHYSICAL_READS {
-                    return Err(PagingError::PhysicalRead);
+            let mut bounded = VirtualReader(|config, root, address, output: &mut [u8]| {
+                if let Err(error) = read::validate_range(address, output.len()) {
+                    return ReadReport { bytes_read: 0, error: Some(error) };
                 }
-                calls += 1;
-                read(address, output)
-            };
+                // Charge four table reads plus data for each resident fragment, including
+                // splits at page boundaries. Local image readers may do less work.
+                let mut offset = 0;
+                let mut cost = 0;
+                while offset < output.len() {
+                    let page_remaining =
+                        PAGE_BYTES - ((address + offset as u64) as usize & (PAGE_BYTES - 1));
+                    let length = page_remaining.min(output.len() - offset);
+                    cost += length.div_ceil(SLICE_BYTES) * 5;
+                    offset += length;
+                }
+                if cost > MAX_PHYSICAL_READS - calls {
+                    return ReadReport {
+                        bytes_read: 0,
+                        error: Some(PagingError::PhysicalRead.into()),
+                    };
+                }
+                calls += cost;
+                read.read_virtual(config, root, address, output)
+            });
             match validate(profile, *candidate, anchor, max_nodes, &mut bounded) {
                 Ok(context) => return Ok(context),
                 Err(error) if error.backend_failed() => {
                     return Err(format!(
-                        "context discovery stopped after {calls} physical reads: {error}"
+                        "context discovery stopped after reserving {calls} physical callbacks: {error}"
                     ));
                 }
                 Err(error) => {
@@ -287,7 +305,7 @@ fn validate(
     candidate: ContextObservation,
     anchor: u32,
     max_nodes: usize,
-    read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
+    read: &mut impl VirtualRead,
 ) -> Result<ValidatedContext, ContextError> {
     let image_bytes = profile.identity().image_bytes;
     let base = candidate

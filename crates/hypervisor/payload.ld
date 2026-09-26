@@ -13,7 +13,8 @@ SECTIONS {
     /* A file-backed alignment byte makes the flat-image extent unambiguous. */
     .padding : { BYTE(0); . = ALIGN(4096); }
     image_load_end = .;
-    .bss (NOLOAD) : { *(.bss .bss.*) *(COMMON) }
+    /* Pack page-aligned storage first, avoiding holes between small statics. */
+    .bss (NOLOAD) : { *(SORT_BY_ALIGNMENT(.bss.*)) *(.bss) *(COMMON) }
     . = ALIGN(4096);
     image_bss_end = .;
     /DISCARD/ : { *(.eh_frame*) *(.comment) *(.note*) }

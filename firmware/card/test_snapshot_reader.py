@@ -614,6 +614,54 @@ class ResidentBootSnapshotTests(unittest.TestCase):
             self.assertEqual(observed["raw_words"]["journal4"], metadata)
 
 
+class IommuBootDiscovery(unittest.TestCase):
+    @staticmethod
+    def observation(detail, metadata=5, cpus=24):
+        return decode_frame(frame(phase_detail=0x00080013, cpu_id=cpus,
+            context=(metadata, detail)))["native_resident_observation"]
+
+    def test_discovery_survives_final_boot_record_without_attesting_protection(self):
+        for status, name in ((1, "observed"), (2, "unavailable"), (3, "unsupported"),
+                             (4, "malformed"), (5, "ambiguous"), (6, "partial")):
+            units, observed = (1, 1) if status in (1, 5) else (0, 0)
+            for terminal in (0, 1):
+                detail = 0x02000000 | (observed << 16) | (units << 8) | (status << 4) | terminal
+                value = self.observation(detail)
+                self.assertTrue(value["encoding_valid"])
+                self.assertTrue(value["all_cpus_activated"])
+                self.assertEqual(value["terminal_reporter_prepared"], bool(terminal))
+                self.assertEqual(value["iommu_discovery"], {
+                    "status": name, "unit_count": units, "mmio_observed_unit_count": observed,
+                    "evidence": "preboot_inventory_only", "ownership": "not_established_by_this_record"})
+                self.assertFalse(value["windows_boot_proven"])
+                self.assertFalse(value["post_loader_failure_exported"])
+
+    def test_partial_counts_and_capacity_are_preserved(self):
+        value = self.observation(0x02031061)
+        self.assertTrue(value["encoding_valid"])
+        self.assertEqual(value["iommu_discovery"]["unit_count"], 16)
+        self.assertEqual(value["iommu_discovery"]["mmio_observed_unit_count"], 3)
+
+    def test_unknown_reserved_and_inconsistent_fields_stay_raw(self):
+        for detail in (0x03010111, 0x02010101, 0x02010171, 0x02010113,
+                       0x02111111, 0x02020161, 0x02000011, 0x02000111):
+            value = self.observation(detail)
+            self.assertFalse(value["encoding_valid"])
+            self.assertIsNone(value["iommu_discovery"])
+            self.assertIsNone(value["terminal_reporter_prepared"])
+            self.assertEqual(value["raw_words"]["journal5"], detail)
+        for metadata, cpus in ((4, 24), (5 | (1 << 16), 24), (5, 0), (5, 33)):
+            value = self.observation(0x02010111, metadata, cpus)
+            self.assertFalse(value["encoding_valid"])
+            self.assertIsNone(value["iommu_discovery"])
+
+    def test_legacy_records_make_no_discovery_claim(self):
+        for detail in (0, 0x01000000, 0x01000001):
+            value = self.observation(detail)
+            self.assertTrue(value["encoding_valid"])
+            self.assertIsNone(value["iommu_discovery"])
+
+
 class TerminalStopDiagnostics(unittest.TestCase):
     def test_activation_reports_prepared_observer_without_claiming_transport_or_boot(self):
         for detail, prepared in ((0, None), (0x01000000, False), (0x01000001, True)):

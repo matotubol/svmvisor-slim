@@ -1,9 +1,9 @@
 //! The connection to the resident runtime and the process handles it hands out.
 
-use svmvisor_hypervisor::reader::{
-    paging::{PagingConfig, PagingError},
-    process::{MAX_PROCESS_NODES, ProcessRequest},
-};
+use svmvisor_hypervisor::reader::{paging::PagingConfig, process::ProcessRequest};
+
+#[cfg(test)]
+use svmvisor_hypervisor::reader::process::MAX_PROCESS_NODES;
 
 use crate::{
     binding::{self, Bound},
@@ -15,11 +15,12 @@ use crate::{
     pack,
     plain::Plain,
     process::{self, Details, ProcessEntry},
-    profile::{self, KernelProfile},
+    profile::KernelProfile,
 };
 
-/// An open process, like a Windows process `HANDLE`. It is valid until it is closed, another
-/// process is opened on the same connection, or the process exits.
+/// A local identifier for a resident process binding. Closing it or opening another process
+/// invalidates it. Samples recheck the process identity; this does not hold a Windows object
+/// reference or keep the process or its address space alive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProcessHandle {
     pid: u32,
@@ -56,7 +57,10 @@ struct Open {
     details: Details,
 }
 
-/// One connection to the resident runtime, owned by the thread that created it.
+/// Retained reader API; live connections are currently disabled.
+///
+/// [`connect`](Self::connect) always returns [`ErrorKind::ReaderDisabled`]. The methods below
+/// remain available for source compatibility and are exercised by in-memory tests.
 ///
 /// The runtime keeps one bound process per connection, so opening a process closes the handle
 /// opened before it. Reads are best-effort observations of a running process: each runtime
@@ -72,26 +76,19 @@ pub struct Svm {
 }
 
 impl Svm {
-    /// Verifies the kernel/PDB files, pins this thread to `config`'s CPU and starts a session.
+    /// Returns [`ErrorKind::ReaderDisabled`] without opening files or contacting the runtime.
     ///
-    /// # Safety
-    /// The redesigned svmvisor runtime (local runtime v2) must be running on this boot. The
-    /// first request is a VMMCALL: without a hypervisor it faults and ends this process, and an
-    /// older svmvisor runtime can stop the machine. This call cannot detect either case.
-    pub unsafe fn connect(config: Config) -> Result<Self> {
-        let paging = check(&config)?;
-        let profile = profile::load_kernel(&config.kernel, &config.pdb)
-            .map_err(|message| Error::new(ErrorKind::Profile, message))?;
-        let bridge = ReadBridge::start(
-            config.cpu,
-            config.max_calls.unwrap_or(u64::MAX),
-            config.session_timeout,
-            config.response_timeout,
-        )
-        .map_err(|message| Error::new(ErrorKind::Connect, message))?;
-        Ok(Self::with_bridge(bridge, profile, config, paging))
+    /// The legacy guest interface has been retired. An authenticated replacement is not yet
+    /// available, and no configuration value enables a fallback. This function is safe:
+    /// it performs no native allocation, affinity change, or hypercall.
+    pub fn connect(_config: Config) -> Result<Self> {
+        Err(Error::new(
+            ErrorKind::ReaderDisabled,
+            "live reader is disabled: the legacy guest interface is retired and the authenticated reader is not available",
+        ))
     }
 
+    #[cfg(test)]
     fn with_bridge(
         bridge: ReadBridge,
         profile: KernelProfile,
@@ -114,8 +111,8 @@ impl Svm {
     /// open.
     ///
     /// Names come from the full image path the kernel recorded when each process started, or
-    /// from the 14-byte `ImageFileName` when there is none. Each process costs a few dozen
-    /// runtime requests.
+    /// from the short `ImageFileName` when there is none. PID, links and metadata share one
+    /// field-range read per process; full names require two additional pointer-following reads.
     pub fn list_processes(&mut self) -> Result<Vec<ProcessEntry>> {
         self.alive()?;
         self.bridge.begin_phase("list", self.config.open_timeout).map_err(|m| self.ended(m))?;
@@ -155,8 +152,9 @@ impl Svm {
     /// also discovers the kernel context. Any handle opened earlier is closed.
     ///
     /// Windows is not asked for a handle. The PEB address and bitness the module calls need are
-    /// read from the process's kernel object while it is found, and the runtime pins the process
-    /// by its creation time, so a reused PID never reads the new process through an old handle.
+    /// read from the process's kernel object after discovery. The runtime compares PID,
+    /// creation time, root and links before and after each sample to detect identity changes.
+    /// These checks are best-effort observations; they do not pin the object or its pages.
     pub fn open_process(&mut self, pid: u32) -> Result<ProcessHandle> {
         self.alive()?;
         if pid == 0 {
@@ -321,7 +319,8 @@ impl Svm {
         self.context.map(|context| context.kernel)
     }
 
-    /// Runtime requests made so far, including discovery.
+    /// Logical runtime requests made so far, including discovery. Continuation VM exits
+    /// are part of the same request and are not counted separately.
     pub fn calls(&self) -> u64 {
         self.bridge.calls()
     }
@@ -351,14 +350,9 @@ impl Svm {
             &self.profile,
             &[candidate],
             self.config.max_nodes,
-            &mut |pa, bytes| {
-                bridge.read(pa, bytes).map_err(|error| {
-                    backend_error = Some(error);
-                    PagingError::PhysicalRead
-                })
-            },
-        )
-        .map_err(|error| {
+            &mut process::memory(bridge, &mut backend_error),
+        );
+        let validated = validated.map_err(|error| {
             self.discovery(format!("automatic context failed: {error}; backend={backend_error:?}"))
         })?;
         Ok(Resolved {
@@ -420,6 +414,7 @@ impl Svm {
     }
 }
 
+#[cfg(test)]
 fn check(config: &Config) -> Result<Option<PagingConfig>> {
     let invalid = |message: &str| Error::new(ErrorKind::InvalidArgument, message);
     if config.cpu >= 32 {

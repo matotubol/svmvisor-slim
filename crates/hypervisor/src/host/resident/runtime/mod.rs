@@ -20,9 +20,10 @@ use crate::{
     },
     memory::{
         address::PAGE_BYTES,
-        npt::{CACHE_TABLE_COUNT, CacheTableStorage},
+        npt::{CACHE_TABLE_COUNT, CacheTableStorage, ControlPageDenials},
     },
     svm::{
+        configuration::ConfigurationRoute,
         control_msrs::VisibleSvmControls,
         dispatch::NativeEfer,
         instructions::NativeSvmInstructions,
@@ -54,20 +55,18 @@ mod arm;
 mod cache;
 mod configuration;
 mod diagnostics;
-#[cfg(feature = "native-entry-trial")]
-mod entry;
 mod exit;
 mod guest_reader;
 mod interrupt;
-mod local;
 mod maintenance;
 mod minimal;
 mod msr;
-mod service;
+mod protection;
 mod startup;
 mod stop;
 #[cfg(test)]
 mod tests;
+mod viommu;
 
 const INITIAL_STATE: State = State {
     prepared: false,
@@ -79,6 +78,9 @@ const INITIAL_STATE: State = State {
     vmcr: None,
     svm_controls: None,
     svm_instructions: None,
+    configuration: None,
+    control_denials: ControlPageDenials::EMPTY,
+    platform_io: None,
     icr: None,
     icr_value: 0,
     host_apic_base: 0,
@@ -117,7 +119,7 @@ static mut EXIT_HISTORY: [[u64; 6]; 5] = [[0; 6]; 5];
 static mut EXIT_HISTORY_NEXT: usize = 0;
 static mut EXIT_HISTORY_COUNT: usize = 0;
 
-static mut TABLES: HostTables = HostTables([[0; 512]; 4]);
+static mut TABLES: HostTables = HostTables([[0; 512]; super::inventory::HOST_TABLE_PAGES]);
 static mut NPT: CacheTableStorage = CacheTableStorage([[0; PAGE_BYTES]; CACHE_TABLE_COUNT]);
 static mut VMCB: Vmcb = Vmcb::new();
 static mut AUX: Vmcb = Vmcb::new();
@@ -229,6 +231,11 @@ struct State {
     vmcr: Option<crate::svm::vmcr::VisibleVmCr>,
     svm_controls: Option<VisibleSvmControls>,
     svm_instructions: Option<NativeSvmInstructions>,
+    /// Per-vCPU physical configuration route, independent of terminal export.
+    configuration: Option<ConfigurationRoute>,
+    /// Immutable per-CPU copy, re-applied on every cache-policy rebuild.
+    control_denials: ControlPageDenials,
+    platform_io: Option<super::platform::PlatformIo>,
     icr: Option<NativeIcr>,
     /// Last guest ICR value, separate from the host's private startup notifications.
     icr_value: u64,
@@ -237,7 +244,7 @@ struct State {
     host_apic_base: u64,
     startup_owned: bool,
     startup: NativeStartupState,
-    /// Latched by `startup::finish_guest_startup`: ICR passthrough, quiet progress.
+    /// Latched by `startup::finish_guest_startup`: ICR passthrough is installed.
     guest_started: bool,
     /// Same-CPU PAUSE filtering admission; only maintenance work needs this exit.
     pause_filter_supported: bool,
@@ -314,4 +321,4 @@ const _: () = {
 struct Pages<const N: usize>([[u8; 4096]; N]);
 
 #[repr(C, align(4096))]
-struct HostTables([[u64; 512]; 4]);
+struct HostTables([[u64; 512]; super::inventory::HOST_TABLE_PAGES]);

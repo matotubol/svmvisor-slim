@@ -58,10 +58,13 @@ impl Build {
         let executable = which(&tool).ok_or(format!("missing tool {tool}"))?;
         let log = self.out.join(format!("{name}.log"));
         let sink = io(fs::File::create(&log), "create", &log)?;
+        let temporary = process_temp(&self.root, name)?;
         let status = Command::new(&executable)
             .args(&args[1..])
             .current_dir(&self.root)
             .envs(env.iter().copied())
+            .env("TEMP", &temporary)
+            .env("TMP", &temporary)
             .stdin(Stdio::null())
             .stdout(io(sink.try_clone(), "create", &log)?)
             .stderr(sink)
@@ -81,19 +84,31 @@ impl Build {
     }
 }
 
+/// Each build/verification invocation owns fresh scratch space under target.
+/// Retain it with the evidence instead of sharing the user's global TEMP.
+pub(crate) fn process_temp(root: &Path, label: &str) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = root.join("target").join("process-temporary");
+    io(fs::create_dir_all(&parent), "create", &parent)?;
+    let label: String = label.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+    for _ in 0..128 {
+        let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!("{label}-{}-{suffix}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create {}: {error}", path.display())),
+        }
+    }
+    Err("could not allocate fresh process temporary directory".into())
+}
+
 /// Build the one supported native profile: SMP guest startup behind the
 /// successful-EBS interposer, with the shared allocation/bootstrap DXE and
-/// runtime audits and the platform-specific below-1GiB runtime allocation. The payload continues the Windows guest through the resident runtime.
+/// runtime audits and the platform-specific below-1GiB runtime allocation.
+/// Reader and entry-trial admission remain disabled until a protected service exists.
 pub fn build(out: &Path) -> Result<(), String> {
-    build_profile(out, false)
-}
-
-/// Build the explicit, dormant-until-VMMCALL experiment with the same mandatory audits.
-pub fn build_entry_trial(out: &Path) -> Result<(), String> {
-    build_profile(out, true)
-}
-
-fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
     let producer = &PRODUCER;
     let root = root();
     let out = io(std::path::absolute(out), "resolve", out)?;
@@ -117,11 +132,7 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
     let build = Build { root: root.clone(), out: out.clone() };
     let path = |relative: &str| root.join(relative).into_os_string();
     let artifact = |name: &str| out.join(name).into_os_string();
-    let target = root.join(if entry_trial {
-        "target/entry-trial-cargo"
-    } else {
-        "target/native-resident-cargo"
-    });
+    let target = out.join("cargo-payload");
     let resident = "crates/hypervisor/src/firmware/native/resident";
 
     let payload_manifest = path(producer.manifest);
@@ -136,7 +147,7 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
         "--crate-type".as_ref(),
         "staticlib".as_ref(),
         "--features".as_ref(),
-        if entry_trial { "native-entry-trial" } else { "resident-runtime" }.as_ref(),
+        "resident-runtime".as_ref(),
         "--target".as_ref(),
         "x86_64-unknown-none".as_ref(),
         "--target-dir".as_ref(),
@@ -233,7 +244,7 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
         &[],
     )?;
     audit_minimal_symbols(&symbols)?;
-    audit_entry_trial_symbols(&symbols, entry_trial)?;
+    audit_retired_services(&symbols)?;
     let text = build.command(
         &["llvm-objdump".as_ref(), "-d".as_ref(), "--no-show-raw-insn".as_ref(), &elf],
         "disassembly",
@@ -246,6 +257,7 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
     let host_fault_audit = audit::audit_host_fault(&text)?;
     let count = audit::audit_extended_state(&text)?;
 
+    let target = out.join("cargo-dxe");
     build.command(
         &[
             "cargo".as_ref(),
@@ -323,16 +335,18 @@ fn build_profile(out: &Path, entry_trial: bool) -> Result<(), String> {
     }
     // verify-resident-build.py requires these fixed profile fields.
     let mut result = vec![
-        ("entry_trial".to_string(), Value::Bool(entry_trial)),
-        (
-            "payload_features".to_string(),
-            Value::str(if entry_trial { "native-entry-trial" } else { "resident-runtime" }),
-        ),
+        ("entry_trial".to_string(), Value::Bool(false)),
+        ("reader_enabled".to_string(), Value::Bool(false)),
+        ("authenticated_reader".to_string(), Value::Bool(false)),
+        ("payload_features".to_string(), Value::str("resident-runtime")),
         ("test_output".to_string(), Value::Bool(false)),
         ("payload_only".into(), Value::Bool(false)),
         ("boot".into(), Value::Bool(true)),
         ("low_runtime".into(), Value::Bool(true)),
         ("diagnostic_read".into(), Value::Bool(false)),
+        ("native_iommu_bootstrap".into(), Value::str("enabled-translated-no-ats-v1")),
+        ("guest_release_enabled".into(), Value::Bool(false)),
+        ("windows_boot_candidate".into(), Value::Bool(false)),
         ("linked_instruction_count".into(), Value::Int(count as i64)),
         ("bootstrap_audit".into(), bootstrap_audit),
         ("debug_reset_audit".into(), debug_reset_audit),
@@ -396,42 +410,24 @@ pub(crate) fn which(tool: &str) -> Option<PathBuf> {
     })
 }
 
-fn audit_entry_trial_symbols(symbols: &str, enabled: bool) -> Result<(), String> {
-    // Reject future experiment exports as well as the three current adapters.
-    // The feature selection and this linked-artifact check are independent:
-    // defaults must not silently widen the production profile.
-    if !enabled {
-        if let Some(symbol) = symbols
-            .lines()
-            .filter_map(|line| line.split_whitespace().last())
-            .find(|symbol| symbol.starts_with("svmvisor_entry_trial_"))
-        {
-            return Err(format!("entry-trial interface linked into production: {symbol}"));
-        }
-        return Ok(());
-    }
-    for symbol in [
-        "svmvisor_entry_trial_request",
-        "svmvisor_entry_trial_final",
-        "svmvisor_entry_trial_complete",
-    ] {
-        let present = symbols.lines().any(|line| line.split_whitespace().last() == Some(symbol));
-        if present != enabled {
-            return Err(format!(
-                "entry-trial profile {enabled} disagrees with linked symbol {symbol}"
-            ));
-        }
+fn audit_retired_services(symbols: &str) -> Result<(), String> {
+    // Verify the linked artifact independently of Cargo features and metadata.
+    // Prefix checks also reject future adapters under either retired interface.
+    if let Some(symbol) =
+        symbols.lines().filter_map(|line| line.split_whitespace().last()).find(|symbol| {
+            symbol.starts_with("svmvisor_entry_trial_")
+                || symbol.starts_with("svmvisor_local_read_")
+        })
+    {
+        return Err(format!(
+            "retired guest service linked into reader-disabled resident: {symbol}"
+        ));
     }
     Ok(())
 }
 
 fn audit_minimal_symbols(symbols: &str) -> Result<(), String> {
-    for required in [
-        "entry_uefi",
-        "svmvisor_minimal_prepare",
-        "svmvisor_resident_enter",
-        "svmvisor_local_read_service",
-    ] {
+    for required in ["entry_uefi", "svmvisor_minimal_prepare", "svmvisor_resident_enter"] {
         if !symbols.lines().any(|line| line.split_whitespace().last() == Some(required)) {
             return Err(format!("minimal continuation lacks linked symbol {required}"));
         }
@@ -501,46 +497,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn experimental_profile_must_match_all_linked_adapter_symbols() {
-        let symbols = "100000 T svmvisor_entry_trial_request\n100010 T svmvisor_entry_trial_final\n100020 T svmvisor_entry_trial_complete\n";
-        assert!(audit_entry_trial_symbols(symbols, true).is_ok());
-        assert!(audit_entry_trial_symbols(symbols, false).is_err());
-        assert!(audit_entry_trial_symbols("", false).is_ok());
-        assert!(audit_entry_trial_symbols("", true).is_err());
-        assert!(
-            audit_entry_trial_symbols(
-                &symbols.replace("svmvisor_entry_trial_final", "other"),
-                true
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn production_rejects_each_experimental_export_independently() {
+    fn reader_disabled_resident_rejects_every_retired_service_export() {
+        assert!(audit_retired_services("").is_ok());
+        assert!(audit_retired_services("100000 T svmvisor_resident_enter\n").is_ok());
         for symbol in [
             "svmvisor_entry_trial_request",
             "svmvisor_entry_trial_final",
             "svmvisor_entry_trial_complete",
             "svmvisor_entry_trial_future_adapter",
+            "svmvisor_local_read_service",
+            "svmvisor_local_read_future_adapter",
         ] {
-            let error =
-                audit_entry_trial_symbols(&format!("100000 T {symbol}\n"), false).unwrap_err();
+            let error = audit_retired_services(&format!("100000 T {symbol}\n")).unwrap_err();
             assert!(error.contains(symbol));
         }
-        assert!(audit_entry_trial_symbols("100000 T svmvisor_local_read_service\n", false).is_ok());
     }
 
     #[test]
     fn minimal_link_audit_rejects_terminal_component_and_missing_producer() {
-        let symbols = "100000 T entry_uefi\n100020 T svmvisor_minimal_prepare\n100040 T svmvisor_resident_enter\n100060 T svmvisor_local_read_service\n";
+        let symbols = "100000 T entry_uefi\n100020 T svmvisor_minimal_prepare\n100040 T svmvisor_resident_enter\n";
         assert!(audit_minimal_symbols(symbols).is_ok());
         assert!(
             audit_minimal_symbols(&symbols.replace("svmvisor_minimal_prepare", "other")).is_err()
         );
         assert!(
-            audit_minimal_symbols(&symbols.replace("svmvisor_local_read_service", "other"))
-                .is_err()
+            audit_minimal_symbols(&symbols.replace("svmvisor_resident_enter", "other")).is_err()
         );
         assert!(
             audit_minimal_symbols(&format!("{symbols}100060 T svmvisor_minimal_stop\n")).is_err()
