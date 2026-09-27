@@ -319,7 +319,7 @@ fn msrpm_passes_apic_and_native_msrs_but_protects_monitor_controls() {
     }
     // Guest PAT is replicated by SVM rather than redirected to the MTRR bank.
     assert_eq!(map.bytes()[0x277 * 2 / 8] & (3 << ((0x277 * 2) % 8)), 0);
-    // Only OSVW accesses and firmware SMRAM configuration reads bypass this
+    // OSVW/IGNNE accesses and firmware SMRAM configuration reads bypass this
     // protected region. All SMRAM writes and neighboring controls still exit.
     for index in 0xc001_0100u32..=0xc001_01ff {
         let bit = ((index - 0xc001_0000) * 2) as usize;
@@ -327,7 +327,7 @@ fn msrpm_passes_apic_and_native_msrs_but_protects_monitor_controls() {
         assert_eq!(
             accesses,
             match index {
-                0xc001_0140 | 0xc001_0141 => 0,
+                0xc001_0115 | 0xc001_0140 | 0xc001_0141 => 0,
                 0xc001_0111..=0xc001_0113 => 2,
                 _ => 3,
             },

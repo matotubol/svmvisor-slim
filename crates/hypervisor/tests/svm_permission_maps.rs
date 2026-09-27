@@ -164,31 +164,33 @@ fn native_boot_protects_vmcr_hsave_and_scaling_at_architectural_slots() {
         (0xc000_0105, 0x0841, 0x0c, false),
         (0xc001_00ff, 0x103f, 0xc0, false),
         (0xc001_0100, 0x1040, 0x03, true),
-        (0xc001_0114, 0x1045, 0x03, true), // VM_CR
-        (0xc001_0117, 0x1045, 0xc0, true), // VM_HSAVE_PA
+        (0xc001_0114, 0x1045, 0x03, true),  // VM_CR
+        (0xc001_0115, 0x1045, 0x0c, false), // IGNNE
+        (0xc001_0117, 0x1045, 0xc0, true),  // VM_HSAVE_PA
         (0xc001_013f, 0x104f, 0xc0, true),
         (0xc001_0140, 0x1050, 0x03, false), // OSVW_ID_Length
         (0xc001_0141, 0x1050, 0x0c, false), // OSVW_Status
         (0xc001_0142, 0x1050, 0x30, true),
         (0xc001_0143, 0x1050, 0xc0, true),
         (0xc001_01ff, 0x107f, 0xc0, true),
-        (0xc001_0200, 0x1080, 0x03, false),
+        (0xc001_0200, 0x1080, 0x03, true), // PERF_CTL0.
     ] {
         assert_eq!(map.bytes()[byte] & mask, if intercepted { mask } else { 0 }, "MSR {msr:08x}");
     }
 }
 
 #[test]
-fn native_boot_allows_only_smram_configuration_reads_in_the_protected_block() {
+fn native_boot_preserves_documented_native_registers_in_the_protected_block() {
     let map = Msrpm::native_boot();
     // Independent full-map byte fixture: APM2 physical p580, Table 15-8.
-    // The protected C00101xx block is FF except OSVW and the three readable
+    // The protected C00101xx block is FF except OSVW, IGNNE and the three readable
     // SMRAM controls (57896-3.00_PPR physical pp213-215). Byte 1044h covers
     // C0010110..113: clear read bits 2/4/6, retaining every write and 110h.
     let mut expected = [0; MSRPM_BYTES];
     expected[0x1800..].fill(0xff);
     expected[0x1040..0x1080].fill(0xff);
     expected[0x1044] = 0xab;
+    expected[0x1045] = 0xf3; // IGNNE retains native reads/writes and x87 signal semantics.
     expected[0x1050] = 0xf0; // OSVW length/status retain native reads and writes.
     expected[0x0820] = 0x03; // EFER.
     expected[0x0841] = 0x03; // TSC_RATIO.
@@ -202,7 +204,49 @@ fn native_boot_allows_only_smram_configuration_reads_in_the_protected_block() {
     expected[0x1005] = 0xf0; // IORR 16h/17h.
     expected[0x1006] = 0x3f; // IORR 18h/19h and TOP_MEM.
     expected[0x1007] = 0x0c; // TOM2.
+    expected[0x1000] = 0xff; // Four legacy PERF_CTL aliases.
+    expected[0x1080..0x1083].fill(0x33); // Six extended selectors; counter accesses stay native.
     assert_eq!(map.bytes(), &expected);
+}
+
+#[test]
+fn native_pmu_owns_both_selector_aliases_and_leaves_counter_and_global_accesses_native() {
+    let map = Msrpm::native_boot();
+    // Literal MSRPM locations from APM2 physical p580, with target MSRs from
+    // 57896-3.00_PPR pp190-191,200-201,218-229. Each mask tests both access bits.
+    for (msr, byte, mask) in [
+        (0xc001_0000u32, 0x1000, 0x03),
+        (0xc001_0001, 0x1000, 0x0c),
+        (0xc001_0002, 0x1000, 0x30),
+        (0xc001_0003, 0x1000, 0xc0),
+        (0xc001_0200, 0x1080, 0x03),
+        (0xc001_0202, 0x1080, 0x30),
+        (0xc001_0204, 0x1081, 0x03),
+        (0xc001_0206, 0x1081, 0x30),
+        (0xc001_0208, 0x1082, 0x03),
+        (0xc001_020a, 0x1082, 0x30),
+    ] {
+        assert_eq!(map.bytes()[byte] & mask, mask, "selector MSR {msr:08x}");
+    }
+    for (msr, byte, mask) in [
+        (0xc001_0004u32, 0x1001, 0x03),
+        (0xc001_0005, 0x1001, 0x0c),
+        (0xc001_0006, 0x1001, 0x30),
+        (0xc001_0007, 0x1001, 0xc0),
+        (0xc001_0201, 0x1080, 0x0c),
+        (0xc001_0203, 0x1080, 0xc0),
+        (0xc001_0205, 0x1081, 0x0c),
+        (0xc001_0207, 0x1081, 0xc0),
+        (0xc001_0209, 0x1082, 0x0c),
+        (0xc001_020b, 0x1082, 0xc0),
+        (0xc001_020c, 0x1083, 0x03),
+        (0xc000_0300, 0x08c0, 0x03),
+        (0xc000_0301, 0x08c0, 0x0c),
+        (0xc000_0302, 0x08c0, 0x30),
+        (0xc000_0303, 0x08c0, 0xc0),
+    ] {
+        assert_eq!(map.bytes()[byte] & mask, 0, "native MSR {msr:08x}");
+    }
 }
 
 #[test]

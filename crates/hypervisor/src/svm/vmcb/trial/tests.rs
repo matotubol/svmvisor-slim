@@ -294,3 +294,56 @@ fn entry_trial_event_before_pointer_is_refused_by_final_guard() {
     restored(&v);
     assert_eq!(v.event_injection(), VALID | 0x202);
 }
+
+#[test]
+fn entry_trial_vnmi_requires_capability_and_preserves_physical_nmi_for_runtime_ack() {
+    let mut v = canonical();
+    v.configure_native_nmi_virtualization(1 << 25).unwrap();
+    let before = v.bytes;
+    assert!(unsafe { Ticket::arm(&mut v, FEATURES) }.is_err());
+    assert_eq!(v.bytes, before);
+
+    let ticket = unsafe { Ticket::arm(&mut v, FEATURES | (1 << 25)) }.unwrap();
+    exit(&mut v, 0x61, 0, 0, 3);
+    let registers = v.bytes[0x400..].to_vec();
+    assert_eq!(unsafe { ticket.finish(&mut v, None) }, Ok(Outcome::InterruptPending));
+    restored(&v);
+    assert_eq!(&v.bytes[0x400..], registers.as_slice());
+    assert_eq!(v.virtual_interrupt_control(), VNMI_ENABLE);
+    assert!(v.event_intercept(super::super::EventIntercept::Nmi));
+    assert!(!v.virtual_nmi_pending(), "only the host acknowledgment may queue the request");
+    assert_eq!(v.event_injection(), 0);
+}
+
+#[test]
+fn entry_trial_refuses_pending_or_in_service_nmi_before_entry_without_consuming_it() {
+    for state in [1 << 11, 1 << 12, VNMI_STATE] {
+        let mut v = canonical();
+        v.configure_native_nmi_virtualization(1 << 25).unwrap();
+        put(&mut v, 0x060, VNMI_ENABLE | state, 8);
+        let before = v.bytes;
+        assert!(unsafe { Ticket::arm(&mut v, FEATURES | (1 << 25)) }.is_err());
+        assert_eq!(v.bytes, before);
+
+        put(&mut v, 0x060, VNMI_ENABLE, 8);
+        let mut trial = unsafe { Trial::begin(&mut v, FEATURES | (1 << 25)) }.unwrap();
+        put(trial.vmcb, 0x060, VNMI_ENABLE | state, 8);
+        assert_eq!(unsafe { trial.entry_pointer() }.err(), Some(Error::PendingEvent));
+        drop(trial);
+        assert_eq!(v.virtual_interrupt_control(), VNMI_ENABLE | state);
+        restored(&v);
+    }
+}
+
+#[test]
+fn entry_trial_vnmi_control_drift_is_refused_without_repairing_unowned_state() {
+    let mut v = canonical();
+    v.configure_native_nmi_virtualization(1 << 25).unwrap();
+    let mut trial = unsafe { Trial::begin(&mut v, FEATURES | (1 << 25)) }.unwrap();
+    unsafe { trial.entry_pointer() }.unwrap();
+    put(trial.vmcb, 0x060, 0, 8);
+    exit(trial.vmcb, 0x61, 0, 0, 3);
+    assert_eq!(unsafe { trial.finish(None) }, Err(Error::ControlDrift));
+    restored(&v);
+    assert_eq!(v.virtual_interrupt_control(), 0);
+}

@@ -1,4 +1,4 @@
-//! Cache-control, SVM control and platform MSR indices shared by DXE and the
+//! Cache-control, SVM, PMU and platform MSR indices shared by DXE and the
 //! resident runtime.
 //!
 //! Architectural MTRR/PAT registers follow AMD APM vol. 2 rev. 3.44 sections
@@ -35,6 +35,19 @@ pub const TSC_RATIO: u32 = 0xc000_0104;
 pub const TSC_RATIO_UNITY: u64 = 1 << 32;
 /// Bits 39:0 are read-write; bits 63:40 are MBZ (APM2 physical page 648).
 pub const TSC_RATIO_DEFINED: u64 = (1 << 40) - 1;
+
+/// Core PMU selectors: six extended pairs and four legacy selector aliases.
+/// 57896-3.00_PPR physical pp200-201,218-229.
+pub const PERF_LEGACY_CTL0: u32 = 0xc001_0000;
+pub const PERF_CTL0: u32 = 0xc001_0200;
+pub const PERF_CTL_EN: u64 = 1 << 22;
+pub const PERF_CTL_HOST_GUEST_ONLY: u64 = 3 << 40;
+pub const PERF_CTL_GUEST_ONLY: u64 = 1 << 40;
+/// Defined on counter 2 only when CPUID enumerates PreciseRetire (PPR p222).
+pub const PERF_CTL_PRECISE_RETIRE: u64 = 1 << 43;
+pub const PERF_CTL_EVENT_SELECT: u64 = 0x0000_000f_0000_00ff;
+/// Writable common fields; CntMask values 80h..FFh are reserved (PPR p218).
+pub const PERF_CTL_DEFINED: u64 = 0x0000_030f_7fd7_ffff;
 
 pub const SYS_CFG: u32 = 0xc001_0010;
 pub const HWCR: u32 = 0xc001_0015;

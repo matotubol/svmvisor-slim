@@ -230,6 +230,8 @@ fn uncached_instruction_event_and_tlb_changes_keep_cached_groups() {
     vmcb.queue_native_general_protection().unwrap();
     assert_eq!(vmcb.event_injection(), 0x8000_0b0d);
     assert_eq!(clean(&vmcb), 0x03ff);
+    // Model #VMEXIT consuming the request before retiring its bookkeeping.
+    vmcb.write_u64::<0x0a8>(0);
     vmcb.clear_event_injection_after_exit().unwrap();
     vmcb.request_full_tlb_flush();
     assert_eq!(clean(&vmcb), 0x03ff);

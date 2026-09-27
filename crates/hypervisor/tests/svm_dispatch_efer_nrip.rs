@@ -184,6 +184,59 @@ fn nrip_boundaries_are_checked_without_wrapping() {
 }
 
 #[test]
+fn faulting_write_at_canonical_boundary_does_not_require_a_continuation() {
+    // APM2 physical pp305, 571, 580: an MSR operand fault retains the current
+    // instruction. All of its bytes are canonical; only the successor is not.
+    for length in [2, 15] {
+        for input in [0x700, 0x100] {
+            for trap in [0, 1 << 8] {
+                let (mut vmcb, mut frame) = stopped(0x0000_8000_0000_0000 - length);
+                let mut efer = owner();
+                put(&mut vmcb, 0x078, 1);
+                put(&mut vmcb, 0x0c8, 0x0000_8000_0000_0000);
+                put(&mut vmcb, 0x068, 1);
+                put(&mut vmcb, 0x570, 0x0001_0002 | trap);
+                put(&mut vmcb, 0x5f8, input);
+                frame.rdx = 0;
+                let before = (efer, frame);
+                let mut expected = *vmcb.bytes();
+                expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0b0du64.to_le_bytes());
+
+                assert_eq!(
+                    handle_native_efer_with_nrip(
+                        &mut efer,
+                        &mut vmcb,
+                        &mut frame,
+                        &capabilities(true),
+                    ),
+                    Ok(NativeMsrOutcome::GeneralProtectionPrepared)
+                );
+                assert_eq!((efer, frame), before);
+                assert_eq!(*vmcb.bytes(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn nonfaulting_write_at_canonical_boundary_refuses_before_committing() {
+    for input in [0x500, 0xd01] {
+        let (mut vmcb, mut frame) = stopped(0x0000_7fff_ffff_fffe);
+        let mut efer = owner();
+        put(&mut vmcb, 0x078, 1);
+        put(&mut vmcb, 0x5f8, input);
+        frame.rdx = 0;
+        let before = (efer, *vmcb.bytes(), frame);
+
+        assert!(
+            handle_native_efer_with_nrip(&mut efer, &mut vmcb, &mut frame, &capabilities(true),)
+                .is_err()
+        );
+        assert_eq!((efer, *vmcb.bytes(), frame), before);
+    }
+}
+
+#[test]
 fn prefixed_fault_uses_original_rip_and_real_efer_fault_owner() {
     for length in [3, 15] {
         let (mut v, mut f) = stopped(0x2000);

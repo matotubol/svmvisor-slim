@@ -28,6 +28,7 @@ use crate::{
         instructions::NativeSvmInstructions,
         permission_maps::{Iopm, Msrpm},
         startup::{NativeIcr, NativeStartupState},
+        target_msrs::TargetMsrPolicy,
         vmcb::{Vmcb, VmcbCacheOwner},
     },
 };
@@ -63,6 +64,7 @@ mod local;
 mod maintenance;
 mod minimal;
 mod msr;
+mod pmu;
 mod service;
 mod startup;
 mod stop;
@@ -76,8 +78,10 @@ const INITIAL_STATE: State = State {
     vmcb_cache: VmcbCacheOwner::new(),
     ack: None,
     efer: None,
+    pmu: None,
     vmcr: None,
     svm_controls: None,
+    target_msrs: None,
     svm_instructions: None,
     icr: None,
     icr_value: 0,
@@ -102,12 +106,17 @@ const INITIAL_STATE: State = State {
 #[unsafe(no_mangle)]
 static svmvisor_resident_init_acks: AtomicU64 = AtomicU64::new(0);
 
-/// Set to 1 by the host NMI gate (vector 2, irq.S) when a physical NMI is
-/// taken in a host GIF window, and swapped back to 0 by the dispatcher, which
-/// re-presents it to the guest through EVENTINJ. This CPU is
+/// Set to 1 by the host NMI gate (vector 2, nmi.S) when a physical NMI is
+/// taken in a host GIF window, and cleared after transfer to V_NMI. This CPU is
 /// the only writer (its own NMI) and reader (its own dispatcher).
 #[unsafe(no_mangle)]
 static svmvisor_resident_nmi_pending: AtomicU32 = AtomicU32::new(0);
+
+/// Same-CPU acknowledgment witness, separate from the coalescing pending bit.
+/// A physical NMI intercept leaves the source pending; only the returning host
+/// gate advances this counter after taking it (APM2 physical p598).
+#[unsafe(no_mangle)]
+static svmvisor_resident_nmi_acks: AtomicU64 = AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
 static mut svmvisor_resident_raw_vmexit: RawVmexitCapture = unsafe { core::mem::zeroed() };
@@ -226,8 +235,12 @@ struct State {
     vmcb_cache: VmcbCacheOwner,
     ack: Option<NativeBootstrapAck>,
     efer: Option<NativeEfer>,
+    /// Guest selector state and physical filtering on this nonmigrating CPU.
+    pmu: Option<pmu::PmuRuntime>,
     vmcr: Option<crate::svm::vmcr::VisibleVmCr>,
     svm_controls: Option<VisibleSvmControls>,
+    /// Documented non-SNP target register contracts captured on this CPU.
+    target_msrs: Option<TargetMsrPolicy>,
     svm_instructions: Option<NativeSvmInstructions>,
     icr: Option<NativeIcr>,
     /// Last guest ICR value, separate from the host's private startup notifications.
@@ -237,12 +250,14 @@ struct State {
     host_apic_base: u64,
     startup_owned: bool,
     startup: NativeStartupState,
-    /// Latched by `startup::finish_guest_startup`: ICR passthrough, quiet progress.
+    /// Initial all-AP startup milestone; quiet progress, never ICR passthrough.
     guest_started: bool,
     /// Same-CPU PAUSE filtering admission; only maintenance work needs this exit.
     pause_filter_supported: bool,
     slot: usize,
     count: usize,
+    /// Delivery obligation for a queued fault or any recovered interrupted event.
+    /// Completion transfers it to replay, or retires it once EXITINTINFO is clear.
     pending_fault: bool,
     exits: u64,
     stopped: u64,

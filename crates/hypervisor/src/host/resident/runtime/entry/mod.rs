@@ -197,6 +197,8 @@ pub(super) unsafe fn final_entry(state: &mut State, vmcb: &mut Vmcb) -> bool {
         && !unsafe { terminal_requested(state) }
         && unsafe { mailboxes(state.count) }[state.slot].peek().is_none()
         && svmvisor_resident_nmi_pending.load(Ordering::Acquire) == 0
+        && !vmcb.virtual_nmi_pending()
+        && !vmcb.virtual_nmi_masked()
         && interrupt::validate_entry(vmcb)
         && minimal::valid(vmcb)
         && vmcb.guest_cr3() == channel.record.root

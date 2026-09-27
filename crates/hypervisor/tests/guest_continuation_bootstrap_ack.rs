@@ -1,7 +1,7 @@
 use svmvisor_hypervisor::{
     arch::x86_64::registers::GuestRegisters,
     guest::continuation::{BootstrapAckError as E, NATIVE_BOOTSTRAP_ACK, NativeBootstrapAck},
-    svm::vmcb::Vmcb,
+    svm::vmcb::{EventIntercept, Vmcb},
 };
 
 fn initial() -> (Vmcb, GuestRegisters) {
@@ -87,4 +87,60 @@ fn changed_frame_and_unbound_sites_cannot_authorize_return() {
     let before = *v.bytes();
     assert_eq!(ack.acknowledge(&mut v, &r), Err(E::StateMismatch));
     assert_eq!(v.bytes(), &before);
+}
+
+#[test]
+fn bootstrap_ack_accepts_armed_nmi_virtualization_without_changing_its_controls() {
+    for other_controls in [0, 0xf | (1 << 24)] {
+        let (mut v, r) = initial();
+        put(&mut v, 0x060, other_controls);
+        v.configure_native_nmi_virtualization(1 << 25).unwrap();
+        let mut ack = NativeBootstrapAck::new(&v, &r, 0x1000, 0x1005, 0x1008).unwrap();
+        exited(&mut v);
+        let mut expected = *v.bytes();
+        expected[0x578..0x580].copy_from_slice(&0x1008u64.to_le_bytes());
+
+        ack.acknowledge(&mut v, &r).unwrap();
+
+        assert_eq!(v.bytes(), &expected);
+        assert!(ack.acknowledged());
+        assert!(v.nmi_virtualization_enabled());
+        assert!(v.event_intercept(EventIntercept::Nmi));
+        assert!(!v.virtual_nmi_pending());
+        assert!(!v.virtual_nmi_masked());
+        assert_eq!(ack.acknowledge(&mut v, &r), Err(E::AlreadyAcknowledged));
+        assert_eq!(v.bytes(), &expected);
+    }
+}
+
+#[test]
+fn bootstrap_ack_refuses_pending_masked_or_mismatched_nmi_state_without_consuming_ack() {
+    const ENABLE: u64 = 1 << 26;
+    for (control, intercept) in [
+        (ENABLE | (1 << 11), true),
+        (ENABLE | (1 << 12), true),
+        (ENABLE | (1 << 11) | (1 << 12), true),
+        (ENABLE, false),
+        (0, true),
+    ] {
+        let (mut v, r) = initial();
+        v.configure_native_nmi_virtualization(1 << 25).unwrap();
+        let mut ack = NativeBootstrapAck::new(&v, &r, 0x1000, 0x1005, 0x1008).unwrap();
+        exited(&mut v);
+        put(&mut v, 0x060, control);
+        v.set_event_intercept(EventIntercept::Nmi, intercept);
+        let before = *v.bytes();
+
+        assert_eq!(ack.acknowledge(&mut v, &r), Err(E::PendingEvent));
+
+        assert_eq!(v.bytes(), &before);
+        assert!(!ack.acknowledged());
+
+        // A new, valid modeled exit can still complete the unconsumed witness.
+        // This does not clear or repair real guest NMI state in production.
+        put(&mut v, 0x060, ENABLE);
+        v.set_event_intercept(EventIntercept::Nmi, true);
+        ack.acknowledge(&mut v, &r).unwrap();
+        assert!(ack.acknowledged());
+    }
 }

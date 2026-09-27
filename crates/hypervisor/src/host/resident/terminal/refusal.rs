@@ -29,6 +29,9 @@ pub enum StartupStage {
     EferReset = 6,
     MailboxCompletion = 8,
     InitPreparation = 10,
+    /// The native LAPIC backend needs a retained physical rebootstrap path.
+    /// Never acknowledge a later guest INIT through the partial boot helper.
+    PostbootInitUnsupported = 11,
     OwnerMissing = 15,
 }
 
@@ -209,6 +212,12 @@ pub fn stop_words(slot: usize, code: u64, rip: u64, info1: u64, info2: u64) -> O
             0xf107 => (9, info2),
             // A runtime context mismatch carries a host pointer, never a GPA.
             0xf10a => (0, rip),
+            // Interrupted injected delivery carries EXITINTINFO, not an NPF
+            // GPA (APM2 physical pp571-573). Keep the exact event in the full
+            // stopped record; the compact unhandled-exit record retains RIP.
+            0xf115 => (0, rip),
+            // Missing bootstrap acknowledgment owner has no fault address.
+            0xf116 => (0, rip),
             _ if code == 0x400 => (3, info2),
             _ => (0, rip),
         };

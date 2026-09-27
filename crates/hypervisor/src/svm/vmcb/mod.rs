@@ -48,8 +48,11 @@ const TSC_OFFSET: usize = 0x050;
 const GUEST_ASID: usize = 0x058;
 const VIRTUAL_INTERRUPT_CONTROL: usize = 0x060;
 const V_IRQ: u64 = 1 << 8;
+const V_NMI: u64 = 1 << 11;
+const V_NMI_MASK: u64 = 1 << 12;
+const V_NMI_ENABLE: u64 = 1 << 26;
 const SUPPORTED_VIRTUAL_INTERRUPT_CONTROL: u64 =
-    0xf | V_IRQ | (0xf << 16) | (1 << 24) | (0xff << 32);
+    0xf | V_IRQ | V_NMI | V_NMI_MASK | (0xf << 16) | (1 << 24) | V_NMI_ENABLE | (0xff << 32);
 const NESTED_CR3: usize = 0x0b0;
 const CLEAN_BITS: usize = 0x0c0;
 const GUEST_EFER: usize = 0x4d0;
@@ -138,9 +141,26 @@ impl Vmcb {
         self.read_u64::<0x0a8>()
     }
 
-    /// Retained classic virtual interrupt controls (APM Appendix B, 60h).
+    /// Retained virtual interrupt controls (APM Appendix B, 60h).
     pub fn virtual_interrupt_control(&self) -> u64 {
         self.read_u64::<VIRTUAL_INTERRUPT_CONTROL>()
+    }
+
+    /// Retained enable bit only; admission also requires CPU support and the
+    /// physical NMI intercept. APM volume 2 physical pages 598 and 802.
+    pub fn nmi_virtualization_enabled(&self) -> bool {
+        self.virtual_interrupt_control() & V_NMI_ENABLE != 0
+    }
+
+    /// Hardware clears this request when it recognizes a virtual NMI.
+    pub fn virtual_nmi_pending(&self) -> bool {
+        self.virtual_interrupt_control() & V_NMI != 0
+    }
+
+    /// Hardware owns blocking until successful guest IRET, or an exit during
+    /// NMI delivery. Retained state is meaningful only after a valid exit.
+    pub fn virtual_nmi_masked(&self) -> bool {
+        self.virtual_interrupt_control() & V_NMI_MASK != 0
     }
 
     /// CR8's REX encoding requires 64-bit code, not compatibility mode.
@@ -248,17 +268,6 @@ impl Vmcb {
     }
 }
 
-impl Vmcb {
-    /// Queue a physical NMI taken by a private host GIF window.
-    #[cfg(feature = "resident-runtime")]
-    pub(crate) fn queue_native_nmi(&mut self) -> Result<(), ExternalInterruptError> {
-        self.validate_external_interrupt_conflicts()?;
-        self.validate_virtual_interrupt_controls()?;
-        self.write_u64::<0x0a8>((1 << 31) | (2 << 8) | 2);
-        Ok(())
-    }
-}
-
 // Instruction-fault queueing for the stopped instruction's owner.
 impl Vmcb {
     pub(crate) fn queue_validated_msr_general_protection(
@@ -361,10 +370,13 @@ impl Vmcb {
         self.write_u64::<GUEST_RIP>(0xfff0);
         self.write_u64::<GUEST_RSP>(0);
         self.write_u64::<GUEST_RAX>(0);
-        self.write_u64::<VIRTUAL_INTERRUPT_CONTROL>(self.virtual_interrupt_control() & (1 << 24));
-        // INIT clears any pending/masked virtual NMI (V_NMI, V_NMI_MASK) but
-        // keeps V_NMI_ENABLE armed, matching Table 14-1's NMI reset: a fresh AP
-        // takes NMIs once started (APM2 15.21.10 p537).
+        self.write_u64::<VIRTUAL_INTERRUPT_CONTROL>(
+            self.virtual_interrupt_control() & ((1 << 24) | V_NMI_ENABLE),
+        );
+        // The modeled guest INIT retires pre-INIT virtual-NMI pending/masking
+        // state while preserving the configured delivery mechanism. A new NMI
+        // received while waiting for SIPI must remain pending in the startup
+        // owner (APM2 physical p705), not be discarded by a later SIPI.
         self.write_u64::<0x068>(0); // interrupt shadow
         self.request_guest_rap_clear();
         self.request_full_tlb_flush();

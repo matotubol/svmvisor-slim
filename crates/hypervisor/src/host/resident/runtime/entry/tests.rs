@@ -16,6 +16,7 @@ fn put(vmcb: &mut Vmcb, offset: usize, value: u64, bytes: usize) {
 fn guest() -> Vmcb {
     let mut vmcb = Vmcb::new();
     vmcb.configure_native_boot_intercepts().unwrap();
+    vmcb.configure_native_nmi_virtualization(1 << 25).unwrap();
     assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
     for (offset, value, bytes) in [
         (0x090, 1, 8),
@@ -37,7 +38,7 @@ fn guest() -> Vmcb {
 fn active(vmcb: &mut Vmcb) -> Active {
     let address = ptr::from_mut(vmcb) as u64;
     Active {
-        ticket: unsafe { Ticket::arm(vmcb, (1 << 17) | 1) }.unwrap(),
+        ticket: unsafe { Ticket::arm(vmcb, (1 << 25) | (1 << 17) | 1) }.unwrap(),
         sequence: 19,
         cpu: 3,
         vmcb: address,
@@ -120,6 +121,7 @@ fn native_entry_trial_reflection_waits_for_the_next_actual_delivery() {
     // Only a subsequent hardware exit establishes completion. The outer adapter
     // skips native completion on the trial exit that just queued this injection.
     put(&mut vmcb, 0x070, 0x81, 8);
+    put(&mut vmcb, 0x0a8, 0, 8); // #VMEXIT clears EVENTINJ on that later exit.
     assert!(check_exit_event(&mut state, &mut vmcb));
     assert!(!state.pending_fault);
 }
@@ -153,14 +155,39 @@ fn native_entry_trial_timer_interrupt_is_not_injected_or_acknowledged() {
 }
 
 #[test]
+fn native_entry_trial_nmi_returns_to_the_canonical_acknowledgment_path() {
+    let mut vmcb = guest();
+    let active = active(&mut vmcb);
+    put(&mut vmcb, 0x070, 0x61, 8);
+    let mut state = INITIAL_STATE;
+    let mut record = Record::default();
+    let registers = GuestRegisters { r12: 0x1234, ..Default::default() };
+    assert_eq!(
+        unsafe {
+            complete_owned(&mut state, &mut vmcb, &registers, &mut record, active, true, None)
+        },
+        Ok(INTERRUPTED)
+    );
+    assert_eq!(record.exit_registers, registers);
+    assert_eq!(vmcb.guest_rip(), 0x400000);
+    assert_eq!(vmcb.event_injection(), 0);
+    assert!(!vmcb.virtual_nmi_pending() && !vmcb.virtual_nmi_masked());
+    assert!(!state.pending_fault);
+    assert!(interrupt::validate_entry(&vmcb));
+    // Only the subsequent physical host handler may acknowledge the source;
+    // the outer dispatcher then transfers its pending indication to V_NMI.
+}
+
+#[test]
 fn native_entry_trial_refuses_late_event_and_preserves_pending_request() {
     let mut vmcb = guest();
     // The real final boundary sees outer-dispatch NMI injection in canonical state.
     vmcb.queue_native_nmi().unwrap();
     let before = *vmcb.bytes();
-    assert!(unsafe { Ticket::arm(&mut vmcb, (1 << 17) | 1) }.is_err());
+    assert!(unsafe { Ticket::arm(&mut vmcb, (1 << 25) | (1 << 17) | 1) }.is_err());
     assert_eq!(*vmcb.bytes(), before);
-    assert_ne!(vmcb.event_injection(), 0);
+    assert!(vmcb.virtual_nmi_pending());
+    assert_eq!(vmcb.event_injection(), 0);
 }
 
 #[test]

@@ -9,34 +9,81 @@ use crate::{
 };
 
 #[test]
-fn interrupted_fault_refusal_preserves_request_and_records_terminal_reason() {
-    for (code, interrupted) in [(0x400, 0x8000_0b0d_u64), (u64::MAX, 0), (0x7f, 0)] {
+fn interrupted_fault_replay_survives_repeated_exits_then_completes_once() {
+    for event in [0x0000_0030_8000_0b0d_u64, 0x8000_0306] {
         let mut vmcb = Vmcb::new();
-        for (offset, value) in [(0x70, code), (0x88, interrupted), (0xa8, 0x8000_0b0d)] {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    value.to_le_bytes().as_ptr(),
-                    (&mut vmcb as *mut Vmcb).cast::<u8>().add(offset),
-                    8,
-                );
-            }
+        for (offset, value) in [
+            (0x0c0, 0x1122_3344_a5a5_5a5a),
+            (0x570, 0x10102),
+            (0x578, 0xffff_f800_1234_5678),
+            (0x5d8, 0xffff_9000_8765_4320),
+            (0x5f8, 0xa1b2_c3d4_e5f6_0718),
+            (0x640, 0xffff_c000_3141_5920),
+        ] {
+            put(&mut vmcb, offset, value);
         }
-        let before = *vmcb.bytes();
         let mut state = INITIAL_STATE;
         state.pending_fault = true;
-        assert!(!check_exit_event(&mut state, &mut vmcb));
-        assert!(state.pending_fault && state.stopped_valid);
-        assert_eq!(
-            (state.stopped, state.stopped_info1, state.stopped_info2),
-            (code, if code == 0x400 { 0xf10c } else { 0xf110 }, interrupted)
-        );
-        assert_eq!(*vmcb.bytes(), before);
+        // Model successive hardware exits while delivering the same fault. This
+        // tests event bookkeeping, not authorization to resume every NPF.
+        for code in [0x63, 0x400, 0x63] {
+            put(&mut vmcb, 0x70, code);
+            put(&mut vmcb, 0x88, event);
+            // #VMEXIT clears EVENTINJ, including when delivery is unfinished
+            // (APM3 physical p540); EXITINTINFO is the recovery authority.
+            put(&mut vmcb, 0xa8, 0);
+            let mut expected = *vmcb.bytes();
+            expected[0xa8..0xb0].copy_from_slice(&event.to_le_bytes());
+            assert!(check_exit_event(&mut state, &mut vmcb));
+            assert!(state.pending_fault && !state.stopped_valid);
+            assert_eq!(*vmcb.bytes(), expected);
+        }
+
+        // Successful delivery and later exits must neither replay the completed
+        // fault nor mutate the hardware-saved RIP, flags, stack, RAX or CR2.
+        put(&mut vmcb, 0x70, 0x77);
+        put(&mut vmcb, 0x88, 0);
+        put(&mut vmcb, 0xa8, 0);
+        let delivered = *vmcb.bytes();
+        for _ in 0..2 {
+            assert!(check_exit_event(&mut state, &mut vmcb));
+            assert!(!state.pending_fault && !state.stopped_valid);
+            assert_eq!(*vmcb.bytes(), delivered);
+        }
     }
+}
+
+#[test]
+fn fresh_injection_refusal_preserves_request_and_exportable_terminal_reason() {
     let mut vmcb = Vmcb::new();
+    for (offset, value) in [(0x70, 0x400u64), (0xa8, 0x8000_0b0d), (0x578, 0x1234)] {
+        put(&mut vmcb, offset, value);
+    }
+    let before = *vmcb.bytes();
     let mut state = INITIAL_STATE;
     state.pending_fault = true;
-    assert!(check_exit_event(&mut state, &mut vmcb));
-    assert!(!state.pending_fault && !state.stopped_valid);
+    // A valid EVENTINJ surviving here was queued after the exit. Consuming the
+    // preceding entry's obligation must not erase this new request.
+    assert!(!check_exit_event(&mut state, &mut vmcb));
+    assert!(state.pending_fault && state.stopped_valid);
+    assert_eq!((state.stopped, state.stopped_info1, state.stopped_info2), (0x400, 0xf115, 0));
+    let words = crate::host::resident::terminal::stop_words(
+        state.slot,
+        state.stopped,
+        state.stopped_rip,
+        state.stopped_info1,
+        state.stopped_info2,
+    )
+    .expect("injection completion refusal must remain exportable");
+    assert_eq!(((words[0] >> 24) & 15, (words[0] >> 13) & 0x7ff), (0, 0x400));
+    assert_eq!(*vmcb.bytes(), before);
+}
+
+fn put(vmcb: &mut Vmcb, offset: usize, value: u64) {
+    // SAFETY: this fixture exclusively owns its inert VMCB and all offsets are in bounds.
+    unsafe {
+        ptr::from_mut(vmcb).cast::<u8>().add(offset).cast::<u64>().write_unaligned(value);
+    }
 }
 
 #[test]
@@ -59,7 +106,7 @@ fn interrupted_delivery_is_reinjected_through_eventinj_before_resume() {
         }
         let mut state = INITIAL_STATE;
         assert!(check_exit_event(&mut state, &mut vmcb));
-        assert!(!state.pending_fault && !state.stopped_valid);
+        assert!(state.pending_fault && !state.stopped_valid);
         // EXITINTINFO is retained; EVENTINJ now carries the same event and
         // cached state remains reusable because EVENTINJ is explicitly uncached.
         assert_eq!(vmcb.event_injection(), interrupted);
@@ -69,71 +116,102 @@ fn interrupted_delivery_is_reinjected_through_eventinj_before_resume() {
 }
 
 #[test]
+fn interrupted_virtual_nmi_replay_preserves_a_second_pending_nmi() {
+    let mut vmcb = Vmcb::new();
+    vmcb.configure_native_nmi_virtualization(1 << 25).unwrap();
+    let mut state = INITIAL_STATE;
+    let interrupted_nmi = 0x8000_0202;
+    // Hardware clears V_NMI_MASK on an exit during NMI delivery and reports
+    // that unfinished event in EXITINTINFO (APM2 physical p599).
+    put(&mut vmcb, 0x70, 0x61);
+    put(&mut vmcb, 0x88, interrupted_nmi);
+    assert!(check_exit_event(&mut state, &mut vmcb));
+    assert!(state.pending_fault);
+    assert_eq!(vmcb.event_injection(), interrupted_nmi);
+    assert!(!vmcb.virtual_nmi_masked());
+
+    // A separately acknowledged physical NMI is pending beside the replay,
+    // never substituted for it. EVENTINJ(TYPE2) with VNMI enabled causes
+    // hardware to establish blocking for the replay at the next VMRUN.
+    vmcb.queue_native_nmi().unwrap();
+    assert!(vmcb.virtual_nmi_pending());
+    assert_eq!(vmcb.event_injection(), interrupted_nmi);
+    for _ in 0..2 {
+        put(&mut vmcb, 0xa8, 0);
+        let mut expected = *vmcb.bytes();
+        expected[0xa8..0xb0].copy_from_slice(&interrupted_nmi.to_le_bytes());
+        assert!(check_exit_event(&mut state, &mut vmcb));
+        assert_eq!(*vmcb.bytes(), expected);
+        assert!(state.pending_fault && vmcb.virtual_nmi_pending());
+    }
+
+    // Model completed replay while the handler is still running: its NMI
+    // mask stays set and the second request remains pending until guest IRET.
+    put(&mut vmcb, 0xa8, 0);
+    put(&mut vmcb, 0x88, 0);
+    let masked_control = vmcb.virtual_interrupt_control() | (1 << 12);
+    put(&mut vmcb, 0x60, masked_control);
+    let completed = *vmcb.bytes();
+    for _ in 0..2 {
+        assert!(check_exit_event(&mut state, &mut vmcb));
+        assert!(!state.pending_fault && !state.stopped_valid);
+        assert!(vmcb.virtual_nmi_masked() && vmcb.virtual_nmi_pending());
+        assert_eq!(*vmcb.bytes(), completed);
+    }
+}
+
+#[test]
 fn software_interrupt_and_conflicting_delivery_stay_terminal() {
-    // TYPE 4 (INTn) is not re-injectable and stays a terminal stop.
-    let mut vmcb = Vmcb::new();
-    for (offset, value) in [(0x70, 0x400u64), (0x88, 0x8000_0451), (0x578, 0x1234)] {
-        unsafe {
-            ptr::copy_nonoverlapping(
-                value.to_le_bytes().as_ptr(),
-                (&mut vmcb as *mut Vmcb).cast::<u8>().add(offset),
-                8,
+    for pending_fault in [false, true] {
+        for (interrupted, queued, reason) in [
+            // TYPE 4 (INTn) is outside this bounded recovery path.
+            (0x8000_0451u64, 0, 0xf10f),
+            // A different pending EVENTINJ conflicts with re-injection.
+            (0x8000_0051, 0x8000_0b0d, 0xf112),
+        ] {
+            let mut vmcb = Vmcb::new();
+            for (offset, value) in
+                [(0x70, 0x400u64), (0x88, interrupted), (0xa8, queued), (0x578, 0x1234)]
+            {
+                put(&mut vmcb, offset, value);
+            }
+            let before = *vmcb.bytes();
+            let mut state = INITIAL_STATE;
+            state.pending_fault = pending_fault;
+            assert!(!check_exit_event(&mut state, &mut vmcb));
+            assert_eq!(state.pending_fault, pending_fault);
+            assert!(state.stopped_valid);
+            assert_eq!(
+                (state.stopped, state.stopped_rip, state.stopped_info1, state.stopped_info2),
+                (0x400, 0x1234, reason, interrupted)
             );
+            assert_eq!(*vmcb.bytes(), before);
         }
     }
-    let before = *vmcb.bytes();
-    let mut state = INITIAL_STATE;
-    assert!(!check_exit_event(&mut state, &mut vmcb));
-    assert_eq!(
-        (state.stopped, state.stopped_rip, state.stopped_info1, state.stopped_info2),
-        (0x400, 0x1234, 0xf10f, 0x8000_0451)
-    );
-    assert_eq!(*vmcb.bytes(), before);
-    // A different pending EVENTINJ conflicts with re-injection: terminal.
-    let mut vmcb = Vmcb::new();
-    for (offset, value) in
-        [(0x70, 0x400u64), (0x88, 0x8000_0051), (0xa8, (1 << 31) | (3 << 8) | 13), (0x578, 0x1234)]
-    {
-        unsafe {
-            ptr::copy_nonoverlapping(
-                value.to_le_bytes().as_ptr(),
-                (&mut vmcb as *mut Vmcb).cast::<u8>().add(offset),
-                8,
-            );
-        }
-    }
-    let before = *vmcb.bytes();
-    let mut state = INITIAL_STATE;
-    assert!(!check_exit_event(&mut state, &mut vmcb));
-    assert_eq!(
-        (state.stopped, state.stopped_info1, state.stopped_info2),
-        (0x400, 0xf112, 0x8000_0051)
-    );
-    assert_eq!(*vmcb.bytes(), before);
 }
 
 #[test]
 fn shutdown_and_invalid_entry_do_not_interpret_poisoned_saved_event_or_rip() {
-    for code in [0x7f_u64, u64::MAX] {
-        let mut vmcb = Vmcb::new();
-        for (offset, value) in [(0x70, code), (0x88, u64::MAX), (0x578, u64::MAX)] {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    value.to_le_bytes().as_ptr(),
-                    (&mut vmcb as *mut Vmcb).cast::<u8>().add(offset),
-                    8,
-                );
+    for pending_fault in [false, true] {
+        for code in [0x7f_u64, u64::MAX] {
+            let mut vmcb = Vmcb::new();
+            for (offset, value) in
+                [(0x70, code), (0x88, u64::MAX), (0xa8, u64::MAX), (0x578, u64::MAX)]
+            {
+                put(&mut vmcb, offset, value);
             }
+            let before = *vmcb.bytes();
+            let mut state = INITIAL_STATE;
+            state.pending_fault = pending_fault;
+            assert!(!check_exit_event(&mut state, &mut vmcb));
+            assert_eq!(
+                (state.stopped, state.stopped_rip, state.stopped_info1, state.stopped_info2),
+                (code, 0, 0xf110, 0)
+            );
+            assert_eq!(state.pending_fault, pending_fault);
+            assert!(state.stopped_valid);
+            assert_eq!(*vmcb.bytes(), before);
         }
-        let before = *vmcb.bytes();
-        let mut state = INITIAL_STATE;
-        assert!(!check_exit_event(&mut state, &mut vmcb));
-        assert_eq!(
-            (state.stopped, state.stopped_rip, state.stopped_info1, state.stopped_info2),
-            (code, 0, 0xf110, 0)
-        );
-        assert!(state.stopped_valid);
-        assert_eq!(*vmcb.bytes(), before);
     }
 }
 

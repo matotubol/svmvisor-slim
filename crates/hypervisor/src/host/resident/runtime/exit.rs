@@ -1,7 +1,7 @@
 //! The dispatcher: exit history, exit sequencing against the startup service and
 //! the acknowledged guest's exit handlers.
 
-use core::ptr;
+use core::{ptr, sync::atomic::Ordering};
 
 use crate::{
     arch::x86_64::{
@@ -17,7 +17,8 @@ use crate::{
             diagnostics::{self, record as diagnostic_record},
             guest_reader::fetch_instruction,
             interrupt, local,
-            msr::{handle_mcax_msr, handle_native_icr},
+            msr::{handle_mcax_msr, handle_native_icr, handle_target_msr},
+            pmu,
             startup::{
                 acknowledge_init, finish_guest_startup, mailboxes, route_physical_nmi_to_guest,
                 service_startup,
@@ -48,6 +49,10 @@ struct ExitContext<'a> {
 /// Called only by the audited integer assembly after VMEXIT, host auxiliary
 /// restore, private stack and GIF/IF clear. The one stopped guest is exclusive.
 pub(super) unsafe extern "win64" fn dispatch(context: *mut BridgeContext) -> bool {
+    // Capture before trial completion or any other path can open a host GIF
+    // window. A stale pending bit cannot prove this exit's physical NMI was
+    // acknowledged; the same-CPU NMI gate must advance this generation.
+    let nmi_acks_before = super::svmvisor_resident_nmi_acks.load(Ordering::Acquire);
     let state = unsafe { &mut *ptr::addr_of_mut!(STATE) };
     if context != ptr::addr_of_mut!(CONTEXT) {
         let exit = unsafe { &*ptr::addr_of!(VMCB) }.exit_snapshot();
@@ -98,7 +103,7 @@ pub(super) unsafe extern "win64" fn dispatch(context: *mut BridgeContext) -> boo
     }
 
     // The inner body's RAII route guards must be gone before terminal work.
-    let resume = unsafe { dispatch_body(context, trial_exit) };
+    let resume = unsafe { dispatch_body(context, trial_exit, nmi_acks_before) };
     let state = unsafe { &mut *ptr::addr_of_mut!(STATE) };
     // Every terminal return needs evidence, including an unforeseen callee
     // refusal. Route guards have unwound before publishing the stop/barrier.
@@ -132,14 +137,14 @@ pub(super) unsafe extern "win64" fn dispatch(context: *mut BridgeContext) -> boo
         }
     }
     if resume {
-        // Requeue NMIs caught in a host GIF window after old EVENTINJ completion and
-        // guest instruction/startup handling, so new injection remains pending for VMRUN.
+        // Transfer host-acknowledged NMIs after every GIF-capable service. Hardware
+        // owns V_NMI delivery and blocking independently of a queued EVENTINJ.
         let vmcb = unsafe { &mut *ptr::addr_of_mut!(VMCB) };
         if !unsafe { super::cache::service(state, vmcb) } {
             unsafe { terminal_finish(state) };
             return false;
         }
-        unsafe { route_physical_nmi_to_guest(vmcb) };
+        unsafe { route_physical_nmi_to_guest(state, vmcb) };
         // No host GIF window follows this decision on the ordinary entry path.
         // Preserve opportunistic exits only while an existing service needs them.
         super::maintenance::prepare_pause(
@@ -149,6 +154,12 @@ pub(super) unsafe extern "win64" fn dispatch(context: *mut BridgeContext) -> boo
             super::svmvisor_resident_nmi_pending.load(core::sync::atomic::Ordering::Acquire) != 0,
             unsafe { configuration::pending(state) },
         );
+        // Logical EFER may have changed through an MSR or guest INIT. Apply
+        // its PMU filtering before the final trial boundary and any guest entry.
+        if !unsafe { pmu::prepare_entry(state, vmcb) } {
+            unsafe { terminal_finish(state) };
+            return false;
+        }
         #[cfg(feature = "native-entry-trial")]
         if !unsafe { super::entry::final_entry(state, vmcb) } {
             return false;
@@ -186,7 +197,9 @@ pub(super) fn check_exit_event(state: &mut State, vmcb: &mut Vmcb) -> bool {
         DeliveryError::UnusableGuestState => stop(state, exit.code, 0, 0xf110, 0),
         DeliveryError::InjectionCompletion(_) => {
             let interrupted = u64::from_le_bytes(vmcb.bytes()[0x088..0x090].try_into().unwrap());
-            stop(state, exit.code, exit.rip, 0xf10c, interrupted)
+            // F10Ch belongs to packed startup failures. Keep this raw delivery
+            // refusal distinct so the terminal encoder can export it.
+            stop(state, exit.code, exit.rip, 0xf115, interrupted)
         }
         DeliveryError::UnsupportedInterruptedEvent { interrupted } => {
             stop(state, exit.code, exit.rip, 0xf10f, interrupted)
@@ -207,7 +220,11 @@ pub(super) fn record_unexplained_stop(
     }
 }
 
-unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
+unsafe fn dispatch_body(
+    context: *mut BridgeContext,
+    trial_exit: bool,
+    nmi_acks_before: u64,
+) -> bool {
     // The outer dispatcher validated context without dereferencing it.
     debug_assert!(context == ptr::addr_of_mut!(CONTEXT));
     let state = unsafe { &mut *ptr::addr_of_mut!(STATE) };
@@ -219,6 +236,11 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
         // record retired, `stop_words` exports it as an unhandled exit.
         let exit = vmcb.exit_snapshot();
         return stop(state, exit.code, exit.rip, 0xf10b, 0);
+    }
+    // Neither entry failure nor shutdown supplies a resumable event state.
+    // Refuse before opening GIF or interpreting poisoned interrupt controls.
+    if matches!(vmcb.exit_snapshot().code, u64::MAX | 0xffff_ffff | 0x7f) {
+        return stop(state, vmcb.exit_snapshot().code, 0, 0xf110, 0);
     }
     if !interrupt::validate_entry(vmcb) {
         let exit = vmcb.exit_snapshot();
@@ -265,13 +287,21 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
     if !unsafe { configuration::close(state, vmcb) } {
         return false;
     }
-    if state.startup_owned {
+    if state.startup_owned || observed.code == 0x61 {
         let Some(acknowledged) = (unsafe { acknowledge_init() }) else {
             return stop(state, vmcb.exit_snapshot().code, vmcb.guest_rip(), 0xf102, 0);
         };
         if vmcb.exit_snapshot().code == 0x63 && acknowledged == 0 {
             return stop(state, 0x63, vmcb.guest_rip(), 0xf105, 0);
         }
+    }
+    if !check_physical_nmi_acknowledgment(
+        state,
+        vmcb,
+        nmi_acks_before,
+        super::svmvisor_resident_nmi_acks.load(Ordering::Acquire),
+    ) {
+        return false;
     }
     if !trial_exit && !check_exit_event(state, vmcb) {
         return false;
@@ -281,9 +311,17 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
     }
     let exit = vmcb.exit_snapshot();
     let Some(ack) = state.ack.as_mut() else {
-        return stop(state, exit.code, exit.rip, 0xf10d, 0);
+        // F10Dh is the packed SYS_CFG diagnostic namespace on MSR exits.
+        return stop(state, exit.code, exit.rip, 0xf116, 0);
     };
     if !ack.acknowledged() {
+        if exit.code == 0x61 {
+            // Physical NMI interception can precede the bootstrap VMMCALL.
+            // Its source was consumed above. Reenter without pretending the
+            // bootstrap handshake has completed. Retain the host pending
+            // latch until ACK, before allowing firmware NMI handlers to run.
+            return true;
+        }
         if ack.acknowledge(vmcb, frame).is_ok() {
             unsafe {
                 super::cache::ready(state);
@@ -325,9 +363,22 @@ unsafe fn dispatch_body(context: *mut BridgeContext, trial_exit: bool) -> bool {
     };
     // A still-intercepted ICR write in this exit has already been routed above.
     if resume {
-        unsafe { finish_guest_startup(context.state, context.vmcb) };
+        unsafe { finish_guest_startup(context.state) };
     }
     resume
+}
+
+fn check_physical_nmi_acknowledgment(
+    state: &mut State,
+    vmcb: &Vmcb,
+    before: u64,
+    after: u64,
+) -> bool {
+    let exit = vmcb.exit_snapshot();
+    if exit.code == 0x61 && after == before {
+        return stop(state, exit.code, exit.rip, 0xf117, after);
+    }
+    true
 }
 
 /// `service_startup` for one exit, with its stop fallback.
@@ -428,8 +479,19 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
             // p509), which it has re-injected, so EVENTINJ.V is not a refusal.
             return true;
         }
+        0x61 if vmcb.nmi_virtualization_enabled() => {
+            // The physical source was acknowledged before dispatch. Its
+            // coalesced host latch is transferred to V_NMI at final entry;
+            // queueing again here would count one physical NMI twice.
+            return true;
+        }
         0x7b if diagnostics::available() => return unsafe { diagnostics::handle_io(state, vmcb) },
         0x7c => {
+            // Recovered event delivery must finish before any retained MSR
+            // instruction owner reads physical state or commits an access.
+            if vmcb.event_injection() & (1 << 31) != 0 {
+                return true;
+            }
             if frame.rcx as u32 == MMIO_CFG_BASE_ADDR && diagnostics::available() {
                 // Dynamic ECAM relocation is not yet an owned instruction path.
                 // Keep the actual stopped operands before any native write.
@@ -446,10 +508,13 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
             if let Some(resume) = unsafe { handle_mcax_msr(state, vmcb, frame) } {
                 return resume;
             }
-            let svm_control = control_msrs::owned_msr(frame.rcx as u32);
-            if svm_control && vmcb.event_injection() & (1 << 31) != 0 {
-                return true;
+            if let Some(resume) = unsafe { pmu::handle(state, vmcb, frame) } {
+                return resume;
             }
+            if let Some(resume) = unsafe { handle_target_msr(state, vmcb, frame) } {
+                return resume;
+            }
+            let svm_control = control_msrs::owned_msr(frame.rcx as u32);
             // Actual same-CPU MSR exit plus NRIPS owns the decoded instruction
             // length, including prefixes. Route owned MSRs before guest-byte fetch.
             // Other MSRs and non-long64 profiles retain their existing byte owner.
@@ -708,6 +773,32 @@ mod tests {
         unsafe { handle_exit(&mut context) }
     }
 
+    #[test]
+    fn physical_nmi_exit_requires_fresh_acknowledgment_before_reentry() {
+        for (before, after, acknowledged) in [(7, 7, false), (7, 8, true), (u64::MAX, 0, true)] {
+            let (mut state, mut vmcb, mut frame) = stopped(0, 0);
+            vmcb.configure_native_nmi_virtualization(1 << 25).unwrap();
+            put(&mut vmcb, 0x70, 0x61);
+            let image = *vmcb.bytes();
+            let registers = frame;
+            assert_eq!(
+                check_physical_nmi_acknowledgment(&mut state, &vmcb, before, after),
+                acknowledged
+            );
+            if acknowledged {
+                // The handler itself must not also schedule delivery; the
+                // physical host latch transfers once at the final boundary.
+                assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+                assert!(!vmcb.virtual_nmi_pending());
+                assert!(!state.stopped_valid && !state.pending_fault);
+            } else {
+                assert_eq!((state.stopped, state.stopped_info1), (0x61, 0xf117));
+            }
+            assert_eq!(*vmcb.bytes(), image);
+            assert_eq!(frame, registers);
+        }
+    }
+
     fn stopped_svm() -> (State, Vmcb, GuestRegisters) {
         use crate::{
             arch::x86_64::{
@@ -919,6 +1010,130 @@ mod tests {
     }
 
     #[test]
+    fn all_msr_dispatch_owners_wait_for_replay_before_access_or_fetch() {
+        use crate::{
+            arch::x86_64::msr::{MTRR_DEF_TYPE, TARGET_SIGNATURE},
+            svm::target_msrs::{SMM_CTL, SMM_KEY, TargetMsrPolicy},
+        };
+
+        for index in [0xc000_2000, apic::ICR_MSR, MTRR_DEF_TYPE, SMM_KEY, SMM_CTL, 0xdead_beef] {
+            for write in [false, true] {
+                let (mut state, mut vmcb, mut frame) = stopped_svm();
+                state.target_msrs =
+                    TargetMsrPolicy::admit(TARGET_SIGNATURE, Some(1 << 9), 1, 0, 0, 0);
+                state.pending_fault = true;
+                state.routing_retries = 7;
+                state.icr_value = 0x1234_5678_9abc_def0;
+                state.exits = 11;
+                vmcb.configure_native_nmi_virtualization(1 << 25).unwrap();
+                put(&mut vmcb, 0x060, (1 << 26) | (1 << 12) | (1 << 11));
+                put(&mut vmcb, 0x070, 0x7c);
+                put(&mut vmcb, 0x078, u64::from(write));
+                // Model the state after check_exit_event recovered an interrupted
+                // #GP delivery. Neither the original access nor its retry has retired.
+                put(&mut vmcb, 0x088, 0x0000_0030_8000_0b0d);
+                put(&mut vmcb, 0x0a8, 0x0000_0030_8000_0b0d);
+                // No continuation or guest-memory backing is available in this fixture.
+                put(&mut vmcb, 0x0c8, u64::MAX);
+                put(&mut vmcb, 0x5f8, 0xaaaa_bbbb_0000_0000);
+                frame.rcx = 0xcccc_dddd_0000_0000 | u64::from(index);
+                frame.rdx = 0xeeee_ffff_0000_0000;
+                let before = (*vmcb.bytes(), frame);
+                let owners = (state.efer, state.vmcr, state.svm_controls, state.target_msrs);
+                let lifecycle = (
+                    state.pending_fault,
+                    state.routing_retries,
+                    state.icr_value,
+                    state.exits,
+                    state.stopped_valid,
+                    state.stopped,
+                    state.stopped_rip,
+                    state.stopped_info1,
+                    state.stopped_info2,
+                );
+
+                assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+                assert_eq!((*vmcb.bytes(), frame), before, "MSR {index:#x}, write={write}");
+                assert_eq!((state.efer, state.vmcr, state.svm_controls, state.target_msrs), owners);
+                assert_eq!(
+                    (
+                        state.pending_fault,
+                        state.routing_retries,
+                        state.icr_value,
+                        state.exits,
+                        state.stopped_valid,
+                        state.stopped,
+                        state.stopped_rip,
+                        state.stopped_info1,
+                        state.stopped_info2,
+                    ),
+                    lifecycle
+                );
+                assert!(state.icr.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn target_msr_dispatch_routes_fault_completion_and_bad_nrip_without_fallback_fetch() {
+        use crate::{
+            arch::x86_64::msr::TARGET_SIGNATURE,
+            svm::target_msrs::{SMM_CTL, SMM_KEY, TargetMsrPolicy},
+        };
+
+        for (index, write, nrip, flags) in [
+            (SMM_CTL, false, u64::MAX, 0x10102),
+            (SMM_CTL, true, u64::MAX, 0x10102),
+            (SMM_KEY, false, 0x3000, 2),
+            (SMM_KEY, false, u64::MAX, 2),
+        ] {
+            let (mut state, mut vmcb, mut frame) = stopped_svm();
+            state.target_msrs = TargetMsrPolicy::admit(TARGET_SIGNATURE, Some(1 << 9), 1, 0, 0, 0);
+            state.routing_retries = 7;
+            vmcb.configure_native_nmi_virtualization(1 << 25).unwrap();
+            put(&mut vmcb, 0x060, (1 << 26) | (1 << 12) | (1 << 11));
+            put(&mut vmcb, 0x070, 0x7c);
+            put(&mut vmcb, 0x078, u64::from(write));
+            put(&mut vmcb, 0x0c8, nrip);
+            put(&mut vmcb, 0x570, flags);
+            put(&mut vmcb, 0x5f8, 0xaaaa_bbbb_ffff_ffff);
+            frame.rcx = 0xcccc_dddd_0000_0000 | u64::from(index);
+            frame.rdx = u64::MAX;
+            let mut expected = *vmcb.bytes();
+            let mut registers = frame;
+            let owners = (state.efer, state.vmcr, state.svm_controls, state.target_msrs);
+
+            let resume = dispatch_unclaimed(&mut state, &mut vmcb, &mut frame);
+            if index == SMM_CTL {
+                // Architectural absence faults before NRIP/TF can block completion.
+                assert!(resume);
+                expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0b0du64.to_le_bytes());
+                assert!(state.pending_fault && !state.stopped_valid);
+                assert_eq!(state.routing_retries, 0);
+            } else if nrip == 0x3000 {
+                assert!(resume);
+                expected[0x578..0x580].copy_from_slice(&nrip.to_le_bytes());
+                expected[0x5f8..0x600].copy_from_slice(&0u64.to_le_bytes());
+                registers.rdx = 0;
+                assert!(!state.pending_fault && !state.stopped_valid);
+                assert_eq!(state.routing_retries, 0);
+            } else {
+                // An owned MSR with unusable NRIP stops here, rather than losing
+                // ownership and reaching the generic guest-fetch/F001h path.
+                assert!(!resume);
+                assert!(state.stopped_valid && !state.pending_fault);
+                assert_eq!(
+                    (state.stopped, state.stopped_rip, state.stopped_info1, state.stopped_info2),
+                    (0x7c, 0x2ffe, 0xf104, u64::from(SMM_KEY))
+                );
+                assert_eq!(state.routing_retries, 7);
+            }
+            assert_eq!((*vmcb.bytes(), frame), (expected, registers));
+            assert_eq!((state.efer, state.vmcr, state.svm_controls, state.target_msrs), owners);
+        }
+    }
+
+    #[test]
     fn unclaimed_hypercall_fault_preserves_saved_state_and_all_registers() {
         for magic in [0, u64::MAX, 0x1234_5678_9abc_def0] {
             for cpl in [0, 3] {
@@ -982,6 +1197,7 @@ mod tests {
                 // Model successful fault delivery followed by another exit. The existing
                 // dispatcher lifecycle consumes the injection without completing VMMCALL.
                 put(&mut vmcb, 0x070, 0x77);
+                put(&mut vmcb, 0x0a8, 0); // #VMEXIT clears EVENTINJ.
                 assert!(check_exit_event(&mut state, &mut vmcb));
                 assert!(!state.pending_fault && !state.stopped_valid);
                 assert_eq!(vmcb.event_injection(), 0);
@@ -997,9 +1213,54 @@ mod tests {
         // Model the subsequent completed entry/exit with no interrupted event. This is a
         // bookkeeping fixture, not evidence of hardware delivery or a Windows exception handler.
         put(&mut vmcb, 0x070, 0x77);
+        put(&mut vmcb, 0x0a8, 0); // #VMEXIT clears EVENTINJ.
         assert!(check_exit_event(&mut state, &mut vmcb));
         assert!(!state.pending_fault && !state.stopped_valid);
         assert_eq!(vmcb.event_injection(), 0);
+    }
+
+    #[test]
+    fn injected_fault_replays_across_private_init_notifications_then_completes_once() {
+        for magic in [0, svmvisor_card_abi::local::MAGIC] {
+            let (mut state, mut vmcb, mut frame) = stopped(magic, 3);
+            // Exercise the real fault producers: unclaimed VMMCALL -> #UD;
+            // the local ABI with this fixture's TF set -> #GP(0).
+            assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+            let event = vmcb.event_injection();
+            assert_eq!(event, if magic == 0 { 0x8000_0306 } else { 0x8000_0b0d });
+            assert!(state.pending_fault);
+            let registers = frame;
+            state.startup_owned = true;
+
+            for _ in 0..3 {
+                // Model an acknowledged private INIT notification interrupting
+                // delivery. This tests the post-ack handler, not the physical wire
+                // or a queued guest INIT command. Hardware clears EVENTINJ.
+                put(&mut vmcb, 0x070, 0x63);
+                put(&mut vmcb, 0x088, event);
+                put(&mut vmcb, 0x0a8, 0);
+                let mut expected = *vmcb.bytes();
+                expected[0x0a8..0x0b0].copy_from_slice(&event.to_le_bytes());
+                assert!(check_exit_event(&mut state, &mut vmcb));
+                assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+                assert!(state.pending_fault && !state.stopped_valid);
+                assert_eq!(*vmcb.bytes(), expected);
+                assert_eq!(frame, registers);
+            }
+
+            // Successful delivery followed by a notification, then another
+            // completed entry/exit: neither may queue the old fault again.
+            for _ in 0..2 {
+                put(&mut vmcb, 0x088, 0);
+                put(&mut vmcb, 0x0a8, 0);
+                let expected = *vmcb.bytes();
+                assert!(check_exit_event(&mut state, &mut vmcb));
+                assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+                assert!(!state.pending_fault && !state.stopped_valid);
+                assert_eq!(*vmcb.bytes(), expected);
+                assert_eq!(frame, registers);
+            }
+        }
     }
 
     #[test]

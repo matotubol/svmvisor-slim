@@ -22,11 +22,10 @@ use core::arch::asm;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MsrCompletion {
     Complete { read: Option<u64> },
-    Fault,
 }
 
 /// Intercept only the native x2APIC ICR. Startup commands use retained CPU mailboxes;
-/// ordinary fixed/NMI IPIs go to the physical LAPIC without software interrupt delivery.
+/// ordinary IPIs go to the physical LAPIC; the destination owns NMI virtualization.
 pub(super) unsafe fn handle_native_icr(
     state: &mut State,
     vmcb: &mut Vmcb,
@@ -34,6 +33,17 @@ pub(super) unsafe fn handle_native_icr(
 ) -> bool {
     let exit = vmcb.exit_snapshot();
     let boundary = 0xf104;
+    if frame.rcx as u32 != apic::ICR_MSR || !native_msr_exit_ready(vmcb, state.startup_owned) {
+        return stop(state, exit.code, exit.rip, boundary, 3);
+    }
+    let value = (vmcb.guest_rax() as u32 as u64) | ((frame.rdx as u32 as u64) << 32);
+    if exit.info1 == 1 && (value & apic::ICR_RESERVED != 0 || matches!((value >> 8) & 7, 1 | 3 | 7))
+    {
+        // APM2 physical pp580,721,723: MSR-specific faults follow interception.
+        // A fault retires nothing, so neither a continuation nor single-step
+        // completion is required (physical pp305,470). No IPI may be sent.
+        return reflect_msr_fault(state, vmcb, apic::ICR_MSR);
+    }
     let Some(caps) = state.capabilities else {
         return stop(state, exit.code, exit.rip, boundary, 0);
     };
@@ -63,13 +73,7 @@ pub(super) unsafe fn handle_native_icr(
     {
         return stop(state, exit.code, exit.rip, boundary, 3);
     }
-    let value = (vmcb.guest_rax() as u32 as u64) | ((frame.rdx as u32 as u64) << 32);
-    let fault = vmcb.bytes()[0x4cb] != 0
-        || (exit.info1 == 1
-            && (value & apic::ICR_RESERVED != 0 || matches!((value >> 8) & 7, 1 | 3 | 7)));
-    let completion = if fault {
-        MsrCompletion::Fault
-    } else if exit.info1 == 0 {
+    let completion = if exit.info1 == 0 {
         MsrCompletion::Complete { read: Some(state.icr_value) }
     } else if matches!((value >> 8) & 7, 5 | 6) {
         let Some(icr) = state.icr.as_mut() else {
@@ -109,8 +113,9 @@ pub(super) unsafe fn handle_native_icr(
 /// Intercepted MCAX machine-check MSR (`mcax`): the MSRPM cannot cover
 /// C000_2000h-23FFh (APM2 rev3.44 Table 15-8 p518), so every guest access
 /// exits and is repeated here on its own CPU. `None`: not an MCAX MSR, or a
-/// boundary this path does not own (no NRIPS, outside 64-bit code, TF, a
-/// changed profile or a pending event); the caller keeps its F104h stop.
+/// boundary this path does not own; the caller keeps its F104h stop. All
+/// instruction/profile checks precede physical MSR writes. Metadata reads
+/// discover implemented banks rather than assuming all 64 banks exist.
 /// # Safety
 /// This CPU's armed dispatcher with its guest stopped and IF/GIF clear.
 pub(super) unsafe fn handle_mcax_msr(
@@ -118,33 +123,29 @@ pub(super) unsafe fn handle_mcax_msr(
     vmcb: &mut Vmcb,
     frame: &mut GuestRegisters,
 ) -> Option<bool> {
-    use crate::svm::{
-        exit::MsrInstruction,
-        mcax::{self, Access},
-    };
+    use crate::svm::mcax::{self, Access};
     let exit = vmcb.exit_snapshot();
     let index = frame.rcx as u32;
-    if !(mcax::FIRST..=mcax::LAST).contains(&index) {
+    if !(mcax::FIRST..=mcax::LAST).contains(&index)
+        || state.target_msrs.is_none()
+        || !native_msr_exit_ready(vmcb, state.startup_owned)
+    {
         return None;
     }
     let write = (exit.info1 == 1)
         .then(|| (vmcb.guest_rax() as u32 as u64) | ((frame.rdx as u32 as u64) << 32));
-    let status_writable = unsafe { read_msr(HWCR) } & HWCR_MC_STATUS_WR_EN != 0;
-    let access = mcax::plan(index, write, status_writable)?;
-    // RDMSR/WRMSR above CPL0 fault before the MSRPM check (15.11 p518).
-    let caps = state.capabilities.filter(|caps| {
-        caps.optional_features().nrip_save
-            && vmcb.guest_in_64_bit_code()
-            && vmcb.bytes()[0x4cb] == 0
-    })?;
-    let evidence = MsrInstruction::hardware(exit, &caps).ok()?;
-    let next = evidence.continuation(exit).ok()?;
-    if vmcb.validate_external_interrupt_conflicts().is_err()
-        || !dispatch::native_startup_instruction_mode(vmcb, evidence.length())
-        || vmcb.guest_rflags() & (1 << 8) != 0
-    {
-        return None;
+    // Only documented, side-effect-free same-CPU metadata is read here.
+    // Guest-controlled MSR writes occur only after continuation validation.
+    let Some(access) = plan_mcax_access(index, write, |msr| unsafe { read_msr(msr) }) else {
+        return Some(stop(state, exit.code, exit.rip, 0xf104, u64::from(index)));
+    };
+    if access == Access::GeneralProtection {
+        return Some(reflect_msr_fault(state, vmcb, index));
     }
+    let next = match unsafe { native_msr_continuation(state, vmcb) } {
+        Ok(next) => next,
+        Err(error) => return Some(msr_continuation_failure(state, vmcb, index, error)),
+    };
     let completion = match access {
         // PPR57896 rev3.00 p300: unimplemented and unused registers in this
         // space are RAZ/WRIG, so neither host access can fault.
@@ -158,7 +159,7 @@ pub(super) unsafe fn handle_mcax_msr(
         Access::ReadZeroIgnoreWrite => {
             MsrCompletion::Complete { read: write.is_none().then_some(0) }
         }
-        Access::GeneralProtection => MsrCompletion::Fault,
+        Access::GeneralProtection => unreachable!(),
     };
     Some(match apply_msr_completion(vmcb, frame, completion, next) {
         Ok(fault) => {
@@ -170,11 +171,162 @@ pub(super) unsafe fn handle_mcax_msr(
     })
 }
 
+/// Read only documented bank metadata, with no speculative access to an
+/// arbitrary guest-selected MSR. PPR physical pp123,300-301,307,321.
+fn plan_mcax_access(
+    index: u32,
+    write: Option<u64>,
+    mut read: impl FnMut(u32) -> u64,
+) -> Option<crate::svm::mcax::Access> {
+    use crate::svm::mcax;
+    if !(mcax::FIRST..=mcax::LAST).contains(&index) {
+        return None;
+    }
+    let bank = (index - mcax::FIRST) >> 4;
+    let cap = read(mcax::MCG_CAP);
+    let ipid = if bank != 4 && bank < (cap & 0xff) as u32 {
+        read((index & !0xf) | mcax::IPID_OFFSET)
+    } else {
+        0
+    };
+    let implemented = mcax::bank_implemented(index, cap, ipid);
+    let status_writable = implemented
+        && index & 0xf == 1
+        && write.is_some_and(|value| value != 0)
+        && read(HWCR) & HWCR_MC_STATUS_WR_EN != 0;
+    mcax::plan(index, write, status_writable, implemented)
+}
+
+/// Complete documented target accesses without reading or writing the
+/// corresponding physical control. Unknown contracts keep the caller's
+/// diagnostic stop rather than becoming invented #GP exceptions.
+/// # Safety
+/// Same-CPU actual MSR exit; the stopped VMCB/frame and arm-time policy belong
+/// to this admitted classic, non-SEV guest. No reference survives entry.
+pub(super) unsafe fn handle_target_msr(
+    state: &mut State,
+    vmcb: &mut Vmcb,
+    frame: &mut GuestRegisters,
+) -> Option<bool> {
+    use crate::svm::target_msrs::Access;
+    let exit = vmcb.exit_snapshot();
+    if !native_msr_exit_ready(vmcb, state.startup_owned) {
+        return None;
+    }
+    let index = frame.rcx as u32;
+    let write = (exit.info1 == 1)
+        .then(|| (vmcb.guest_rax() as u32 as u64) | ((frame.rdx as u32 as u64) << 32));
+    let access = state.target_msrs?.plan(index, write)?;
+    if access == Access::GeneralProtection {
+        // Hardware already decoded RDMSR/WRMSR before this actual exit. A
+        // proven fault retires nothing and needs neither nRIP nor guest fetch.
+        return Some(reflect_msr_fault(state, vmcb, index));
+    }
+    let next = match unsafe { native_msr_continuation(state, vmcb) } {
+        Ok(next) => next,
+        Err(error) => return Some(msr_continuation_failure(state, vmcb, index, error)),
+    };
+    let completion =
+        MsrCompletion::Complete { read: if access == Access::ReadZero { Some(0) } else { None } };
+    Some(match apply_msr_completion(vmcb, frame, completion, next) {
+        Ok(_) => {
+            state.routing_retries = 0;
+            true
+        }
+        Err((tag, value)) => stop(state, exit.code, exit.rip, tag, value),
+    })
+}
+
+pub(super) fn native_msr_exit_ready(vmcb: &Vmcb, startup_owned: bool) -> bool {
+    let exit = vmcb.exit_snapshot();
+    // Common privilege faults precede the MSRPM intercept (APM2 physical p580).
+    exit.code == 0x7c
+        && exit.info1 <= 1
+        && vmcb.guest_cpl() == 0
+        && vmcb.validate_external_interrupt_conflicts().is_ok()
+        && dispatch::validate_native_interrupt_profile(vmcb, startup_owned).is_ok()
+}
+
+fn msr_continuation_from_instruction(
+    vmcb: &Vmcb,
+    instruction: MsrInstruction<'_>,
+    startup_owned: bool,
+) -> Option<ResumeCandidate> {
+    dispatch::validate_native_msr_boundary(vmcb, instruction, startup_owned).ok()?;
+    if vmcb.guest_cpl() != 0
+        || !dispatch::native_startup_instruction_mode(vmcb, instruction.length())
+        || vmcb.guest_rflags() & (1 << 8) != 0
+    {
+        return None;
+    }
+    instruction.continuation(vmcb.exit_snapshot()).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MsrContinuationError {
+    Unsupported,
+    Fetch(u16),
+}
+
+pub(super) unsafe fn native_msr_continuation(
+    state: &State,
+    vmcb: &Vmcb,
+) -> Result<ResumeCandidate, MsrContinuationError> {
+    use MsrContinuationError::{Fetch, Unsupported};
+    let caps = state.capabilities.as_ref().ok_or(Unsupported)?;
+    if caps.optional_features().nrip_save && vmcb.guest_in_64_bit_code() {
+        let instruction =
+            dispatch::hardware_msr_instruction(vmcb, caps).map_err(|_| Unsupported)?;
+        return msr_continuation_from_instruction(vmcb, instruction, state.startup_owned)
+            .ok_or(Unsupported);
+    }
+    let bytes =
+        unsafe { fetch_instruction(vmcb, state.startup_owned, state.count) }.map_err(Fetch)?;
+    msr_continuation_from_instruction(vmcb, MsrInstruction::Bytes(&bytes), state.startup_owned)
+        .ok_or(Unsupported)
+}
+
+pub(super) fn msr_continuation_failure(
+    state: &mut State,
+    vmcb: &Vmcb,
+    index: u32,
+    error: MsrContinuationError,
+) -> bool {
+    let exit = vmcb.exit_snapshot();
+    match error {
+        MsrContinuationError::Fetch(reason)
+            if reason
+                == crate::host::resident::terminal::FetchReadFailure::MemoryControlBusy as u16 =>
+        {
+            // No access has committed. Retry the unchanged instruction using
+            // the dispatcher budget; do not refetch and lose the first result.
+            super::exit::retry_routing(state, vmcb)
+        }
+        MsrContinuationError::Fetch(reason) => {
+            stop(state, exit.code, exit.rip, 0xf001, u64::from(reason))
+        }
+        MsrContinuationError::Unsupported => {
+            stop(state, exit.code, exit.rip, 0xf104, u64::from(index))
+        }
+    }
+}
+
+fn reflect_msr_fault(state: &mut State, vmcb: &mut Vmcb, index: u32) -> bool {
+    if vmcb.queue_native_general_protection().is_ok() {
+        state.pending_fault = true;
+        state.routing_retries = 0;
+        true
+    } else {
+        let exit = vmcb.exit_snapshot();
+        stop(state, exit.code, exit.rip, 0xf104, u64::from(index))
+    }
+}
+
 /// Apply one completion to the stopped guest. A completed RDMSR loads
 /// EDX:EAX (in 64-bit mode the upper halves of RAX and RDX become zero), and
 /// every completed access continues at `next` with the interrupt shadow and
-/// RF consumed. A fault queues #GP(0) at the unchanged RIP (`Ok(true)`).
-/// `Err` is a stop reason and value; the guest is then unchanged.
+/// RF consumed. Faults are reflected before constructing a continuation.
+/// The shared completion interface retains its result for the runtime callers.
 pub(super) fn apply_msr_completion(
     vmcb: &mut Vmcb,
     frame: &mut GuestRegisters,
@@ -194,10 +346,6 @@ pub(super) fn apply_msr_completion(
             vmcb.complete_native_instruction_state();
             Ok(false)
         }
-        MsrCompletion::Fault => match vmcb.queue_native_general_protection() {
-            Ok(()) => Ok(true),
-            Err(_) => Err((0xf104, 4)),
-        },
     }
 }
 
@@ -226,3 +374,6 @@ pub(super) unsafe fn write_msr(index: u32, value: u64) {
             in("edx") (value >> 32) as u32, options(nostack, preserves_flags));
     }
 }
+
+#[cfg(test)]
+mod tests;

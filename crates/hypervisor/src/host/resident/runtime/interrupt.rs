@@ -1,4 +1,4 @@
-//! Native physical LAPIC ownership; only INIT/SIPI ICR writes need software routing.
+//! Native physical LAPIC ownership with hardware virtual-NMI blocking.
 
 use crate::{
     arch::x86_64::{apic, capabilities::ValidatedCapabilities},
@@ -66,14 +66,16 @@ impl InterruptError {
     }
 }
 
-/// Direct delivery cannot coexist with interrupt masking, AVIC or virtual NMI state.
+/// Fixed interrupts remain physical; all NMIs use the admitted VNMI lifecycle.
 /// V_TPR (bits 3:0) is guest state: with V_INTR_MASKING clear, guest CR8 writes update it
 /// and every #VMEXIT writes it back (APM volume 2 physical pages 569, 595 and 802).
+/// VNMI pending/mask are hardware writeback, not control drift (p598–599).
 pub(super) fn validate_entry(vmcb: &Vmcb) -> bool {
     use crate::svm::vmcb::EventIntercept;
     !vmcb.event_intercept(EventIntercept::PhysicalInterrupt)
-        && !vmcb.event_intercept(EventIntercept::Nmi)
-        && vmcb.virtual_interrupt_control() & !0xf == 0
+        && vmcb.event_intercept(EventIntercept::Nmi)
+        && vmcb.nmi_virtualization_enabled()
+        && vmcb.virtual_interrupt_control() & !(0xf | (1 << 11) | (1 << 12) | (1 << 26)) == 0
 }
 
 #[cfg(test)]
@@ -91,28 +93,51 @@ mod tests {
         {
             let mut vmcb = Vmcb::new();
             vmcb.configure_native_boot_intercepts().unwrap();
+            vmcb.configure_native_nmi_virtualization(1 << 25).unwrap();
             // SAFETY: exclusive inert VMCB and its in-bounds offset 60h control field.
             unsafe {
                 ptr::from_mut(&mut vmcb)
                     .cast::<u8>()
                     .add(0x60)
                     .cast::<u64>()
-                    .write_unaligned(control);
+                    .write_unaligned(control | (1 << 26));
             }
             assert_eq!(validate_entry(&vmcb), valid, "{control:#x}");
         }
     }
 
     #[test]
-    fn direct_delivery_refuses_physical_interrupt_intercepts() {
+    fn native_profile_requires_vnmi_and_keeps_fixed_interrupts_physical() {
         let mut vmcb = Vmcb::new();
         vmcb.configure_native_boot_intercepts().unwrap();
+        assert!(!validate_entry(&vmcb));
+        vmcb.configure_native_nmi_virtualization(1 << 25).unwrap();
         assert!(validate_entry(&vmcb));
-        for intercept in [EventIntercept::PhysicalInterrupt, EventIntercept::Nmi] {
-            vmcb.set_event_intercept(intercept, true);
-            assert!(!validate_entry(&vmcb));
-            vmcb.set_event_intercept(intercept, false);
+        vmcb.set_event_intercept(EventIntercept::PhysicalInterrupt, true);
+        assert!(!validate_entry(&vmcb));
+        vmcb.set_event_intercept(EventIntercept::PhysicalInterrupt, false);
+        vmcb.set_event_intercept(EventIntercept::Nmi, false);
+        assert!(!validate_entry(&vmcb));
+    }
+
+    #[test]
+    fn hardware_pending_and_mask_writeback_are_admitted_without_mutation() {
+        for bits in [0, 1 << 11, 1 << 12, (1 << 11) | (1 << 12)] {
+            let mut vmcb = Vmcb::new();
+            vmcb.configure_native_boot_intercepts().unwrap();
+            vmcb.configure_native_nmi_virtualization(1 << 25).unwrap();
+            // Model hardware writeback, including an in-service NMI with
+            // another pending. Software must leave unmasking to guest IRET.
+            unsafe {
+                ptr::from_mut(&mut vmcb)
+                    .cast::<u8>()
+                    .add(0x60)
+                    .cast::<u64>()
+                    .write_unaligned((1 << 26) | bits | 0xf);
+            }
+            let before = *vmcb.bytes();
             assert!(validate_entry(&vmcb));
+            assert_eq!(*vmcb.bytes(), before);
         }
     }
 }

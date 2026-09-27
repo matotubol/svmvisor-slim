@@ -5,8 +5,11 @@
 //! or a live VMCB. IOIO_PROT/MSR_PROT must also be enabled by the caller.
 
 use crate::{
-    arch::x86_64::msr::{EFER, TSC_RATIO},
-    svm::control_msrs::{SMM_ADDR, SMM_BASE, SMM_MASK},
+    arch::x86_64::msr::{EFER, PERF_LEGACY_CTL0, TSC_RATIO},
+    svm::{
+        control_msrs::{SMM_ADDR, SMM_BASE, SMM_MASK},
+        pmu::{CONTROL_COUNT, control_msr},
+    },
 };
 
 pub const IOPM_BYTES: usize = 12 * 1024;
@@ -69,7 +72,8 @@ impl Msrpm {
     }
 
     /// Trusted native first boot: execute covered native MSRs directly except
-    /// EFER and monitor/SVM controls. APM2 rev3.44 15.11/Table15-8 and 15.30.
+    /// EFER, PMU selectors and monitor/SVM controls. APM2 rev3.44 15.11/Table15-8
+    /// and 15.30; target PMU register layout in 57896-3.00_PPR pp200-229.
     /// Protect C00101xx by default, including VM_CR, VM_HSAVE_PA, lock keys
     /// and encrypted-guest controls. OSVW accesses and SMRAM configuration reads
     /// stay native. Activation requires the exact target CPU and locked SMRAM
@@ -88,6 +92,16 @@ impl Msrpm {
                 map.set(index, access, Permission::Intercept).expect("covered monitor MSR");
             }
         }
+        // Selector readback and HG filtering follow logical EFER, not the
+        // mandatory physical SVME backing. Both aliases reach the same owner.
+        // Counters, RDPMC and global PMU controls remain guest-owned hardware.
+        for index in
+            (0..CONTROL_COUNT).filter_map(control_msr).chain(PERF_LEGACY_CTL0..PERF_LEGACY_CTL0 + 4)
+        {
+            for access in [MsrAccess::Read, MsrAccess::Write] {
+                map.set(index, access, Permission::Intercept).expect("covered PMU selector");
+            }
+        }
         // PPR57896 rev3.00 pp.87/217: advertised OSVW length/status are RW
         // hardware state, not monitor controls. Preserve firmware values and
         // native write/fault semantics; do not synthesize workaround metadata.
@@ -95,6 +109,13 @@ impl Msrpm {
             for access in [MsrAccess::Read, MsrAccess::Write] {
                 map.set(index, access, Permission::Allow).expect("covered OSVW MSR");
             }
+        }
+        // IGNNE is this nonmigrating guest's physical x87 error signal. The
+        // audited host never executes FP/xstate instructions or changes it.
+        // Let hardware own the signal and MBZ faults (APM2 physical p646),
+        // rather than keeping a software value disconnected from x87 state.
+        for access in [MsrAccess::Read, MsrAccess::Write] {
+            map.set(0xc001_0115, access, Permission::Allow).expect("covered IGNNE MSR");
         }
         // 57896-3.00_PPR physical pp213-215: these firmware-owned registers
         // remain readable with SmmLock set. The monitor does not modify them;

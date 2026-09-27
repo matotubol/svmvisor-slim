@@ -4,3 +4,5 @@ mod context;
 mod reinjection;
 #[cfg(test)]
 mod tlb_lifecycle;
+#[cfg(test)]
+mod vnmi;

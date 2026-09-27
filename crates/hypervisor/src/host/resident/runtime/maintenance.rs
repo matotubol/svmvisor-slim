@@ -28,6 +28,7 @@ mod tests {
     fn steady_state_releases_pause_and_each_deferred_service_rearms_it() {
         let mut vmcb = Vmcb::new();
         vmcb.configure_native_boot_intercepts().unwrap();
+        vmcb.configure_native_nmi_virtualization(1 << 25).unwrap();
         assert!(vmcb.configure_native_pause_filter(1 << 10));
         vmcb.queue_native_nmi().unwrap();
         let event = vmcb.event_injection();
@@ -43,6 +44,7 @@ mod tests {
             prepare_pause(&mut vmcb, true, started, nmi, configuration);
             assert_eq!(vmcb.instruction_intercept(InstructionIntercept::Pause), enabled);
             assert_eq!(vmcb.event_injection(), event);
+            assert!(vmcb.virtual_nmi_pending());
             assert_eq!(vmcb.guest_rip(), rip);
             assert!(!vmcb.instruction_intercept(InstructionIntercept::Cpuid));
             assert!(!vmcb.instruction_intercept(InstructionIntercept::Rdtsc));

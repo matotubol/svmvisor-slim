@@ -8,7 +8,7 @@
 //! modeled, nor is CET. Unsupported upper software/protection-key bits fail
 //! conservatively.
 
-use crate::memory::address::{ADDRESS_MASK, NX, is_canonical_48};
+use crate::memory::address::{ADDRESS_MASK, NX, PML4_RESERVED_MASK, is_canonical_48};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PagingConfig {
@@ -94,7 +94,9 @@ pub fn translate(
         user &= entry & 4 != 0;
         executable &= entry & NX == 0;
         let large = level > 1 && entry & (1 << 7) != 0;
-        if level == 4 && large {
+        // Both bits 8 and 7 are MBZ in a present PML4 entry, unlike lower levels.
+        // 24593_3.44_APM_Vol2 p206 Figure 5-20 (physical PDF page).
+        if level == 4 && entry & PML4_RESERVED_MASK != 0 {
             return Err(ReservedEntry { level });
         }
         if level == 3 && large && !config.page1gb {

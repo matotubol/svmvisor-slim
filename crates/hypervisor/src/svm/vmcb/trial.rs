@@ -13,6 +13,8 @@ const CR2: usize = 0x640;
 const GMET: u64 = 1 << 3;
 const PF: u32 = 1 << 14;
 const VALID: u64 = 1 << 31;
+const VNMI_ENABLE: u64 = 1 << 26;
+const VNMI_STATE: u64 = (1 << 11) | (1 << 12);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -58,6 +60,7 @@ pub struct Trial<'a> {
     asid: u32,
     // Intercept words, including the CR/DR and instruction intercept profiles.
     intercepts: [u32; 6],
+    interrupt_control: u64,
     pointer_issued: bool,
     physical_stop: bool,
 }
@@ -80,7 +83,10 @@ impl<'a> Trial<'a> {
             || vmcb.read_u64::<NESTED_CONTROL>() != 1
             || vmcb.read_u32::<EXCEPTIONS>() != 0
             || vmcb.read_u32::<GUEST_ASID>() == 0
-            || vmcb.virtual_interrupt_control() != 0
+            || vmcb.virtual_interrupt_control() & !VNMI_ENABLE != 0
+            || (vmcb.nmi_virtualization_enabled()
+                && (svm_features & (1 << 25) == 0
+                    || !vmcb.event_intercept(super::EventIntercept::Nmi)))
         {
             return Err(Error::Admission);
         }
@@ -90,6 +96,7 @@ impl<'a> Trial<'a> {
         let guest_root = vmcb.guest_cr3();
         let nested_root = vmcb.read_u64::<NESTED_CR3>();
         let asid = vmcb.read_u32::<GUEST_ASID>();
+        let interrupt_control = vmcb.virtual_interrupt_control();
         let mut intercepts = [0; 6];
         for (value, bytes) in intercepts.iter_mut().zip(vmcb.bytes[..24].chunks_exact(4)) {
             *value = u32::from_le_bytes(bytes.try_into().unwrap());
@@ -104,6 +111,7 @@ impl<'a> Trial<'a> {
             nested_root,
             asid,
             intercepts,
+            interrupt_control,
             pointer_issued: false,
             physical_stop: false,
         })
@@ -166,11 +174,14 @@ impl<'a> Trial<'a> {
         self.restore();
         controls?;
         let exit = self.vmcb.exit_snapshot();
-        if pending_event(self.vmcb) || self.vmcb.virtual_interrupt_control() != 0 {
+        if pending_event(self.vmcb) {
             return Err(Error::PendingEvent);
         }
         match exit.code {
             0x60 if self.physical_stop => Ok(Outcome::InterruptPending),
+            // The physical NMI remains pending. Canonical runtime must take it
+            // through the host GIF window before queuing V_NMI (APM2 p598).
+            0x61 if self.interrupt_control & VNMI_ENABLE != 0 => Ok(Outcome::InterruptPending),
             0x400 => {
                 // GMET erratum: do not use NPF U/S as the original access CPL.
                 // Refuse all other fault flags, including shadow-stack faults
@@ -204,11 +215,13 @@ impl<'a> Trial<'a> {
 
     fn check_controls(&self) -> Result<(), Error> {
         let vmcb = &self.vmcb;
+        let hardware_nmi_state =
+            if self.interrupt_control & VNMI_ENABLE != 0 { VNMI_STATE } else { 0 };
         if vmcb.read_u64::<NESTED_CONTROL>() != 1 | GMET
             || vmcb.read_u64::<NESTED_CR3>() != self.nested_root
             || vmcb.read_u64::<GUEST_CR3>() != self.guest_root
             || vmcb.read_u32::<GUEST_ASID>() != self.asid
-            || vmcb.virtual_interrupt_control() != 0
+            || vmcb.virtual_interrupt_control() & !hardware_nmi_state != self.interrupt_control
         {
             return Err(Error::ControlDrift);
         }
@@ -244,6 +257,8 @@ impl Drop for Trial<'_> {
 
 fn pending_event(vmcb: &Vmcb) -> bool {
     (vmcb.event_injection() | vmcb.read_u64::<0x088>()) & VALID != 0
+        || vmcb.virtual_nmi_pending()
+        || vmcb.virtual_nmi_masked()
 }
 
 /// Owned continuation across the resident assembly boundary. No Rust reference
@@ -255,6 +270,7 @@ pub struct Ticket {
     nested_root: u64,
     asid: u32,
     intercepts: [u32; 6],
+    interrupt_control: u64,
 }
 
 impl Ticket {
@@ -280,6 +296,7 @@ impl Ticket {
             nested_root: trial.nested_root,
             asid: trial.asid,
             intercepts: trial.intercepts,
+            interrupt_control: trial.interrupt_control,
         };
         // Ownership moves into the non-borrowing, one-use assembly ticket.
         core::mem::forget(trial);
@@ -316,6 +333,7 @@ impl Ticket {
             nested_root: self.nested_root,
             asid: self.asid,
             intercepts: self.intercepts,
+            interrupt_control: self.interrupt_control,
             pointer_issued: true,
             physical_stop: true,
         })

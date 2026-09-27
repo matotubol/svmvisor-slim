@@ -45,6 +45,39 @@ fn huge_pages_allow_pat_but_reject_misaligned_address_bits() {
 }
 
 #[test]
+fn pml4_reserved_bits_stop_before_reading_a_child_table() {
+    // 24593_3.44_APM_Vol2 p206 Figure 5-20: PML4 bits 8 and 7 are MBZ.
+    for bits in [1 << 7, 1 << 8, (1 << 7) | (1 << 8)] {
+        let mut reads = 0;
+        assert_eq!(
+            translate(config(), 0, |pa| {
+                reads += 1;
+                assert_eq!(pa, 0x1000, "reserved PML4 must not authorize a child read");
+                Some(0x2007 | bits)
+            }),
+            Err(WalkError::ReservedEntry { level: 4 })
+        );
+        assert_eq!(reads, 1);
+        // Not-present entries retain software use of every other bit.
+        assert_eq!(walk([bits, 0, 0, 0]), Err(WalkError::NotPresent { level: 4 }));
+    }
+}
+
+#[test]
+fn bit8_is_ignored_in_lower_tables_and_allowed_in_leaves() {
+    // 24593_3.44_APM_Vol2 p206 Figures 5-21/22: bit 8 is IGN in table links;
+    // p218: the same bit is the global-page flag in a leaf.
+    let expected = walk([0x2007, 0x3007, 0x4007, 0x9007]).unwrap();
+    for index in 1..4 {
+        let mut entries = [0x2007, 0x3007, 0x4007, 0x9007];
+        entries[index] |= 1 << 8;
+        assert_eq!(walk(entries), Ok(expected));
+    }
+    assert_eq!(walk([0x2007, 0x4000_0187, 0, 0]), walk([0x2007, 0x4000_0087, 0, 0]));
+    assert_eq!(walk([0x2007, 0x3007, 0x0020_0187, 0]), walk([0x2007, 0x3007, 0x0020_0087, 0]));
+}
+
+#[test]
 fn leaf_pat_index_uses_the_correct_size_bit_and_ignores_parent_cache_controls() {
     for index in 0u64..8 {
         let controls = (index & 3) << 3;

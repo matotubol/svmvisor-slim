@@ -367,13 +367,16 @@ fn native_efer_inner(
     Ok(NativeMsrOutcome::Completed)
 }
 
-fn validate_native_interrupt_profile(
+pub(crate) fn validate_native_interrupt_profile(
     vmcb: &Vmcb,
     startup_owned: bool,
 ) -> Result<(), super::events::ExternalInterruptError> {
     let control = vmcb.virtual_interrupt_control();
     vmcb.validate_virtual_interrupt_controls()?;
-    let permitted = 0xf | if startup_owned { 1 << 24 } else { 0 };
+    // Pending/masked virtual NMIs are independent of instruction completion.
+    // The common validator above proves ENABLE is paired with NMI interception.
+    let permitted =
+        0xf | (1 << 11) | (1 << 12) | (1 << 26) | if startup_owned { 1 << 24 } else { 0 };
     if control & !permitted != 0 {
         return Err(super::events::ExternalInterruptError::ControlMismatch);
     }

@@ -32,17 +32,22 @@ use crate::{
                 STACK, STATE, TABLES, VMCB, data_start, diagnostics, image_base, image_bss_end,
                 interrupt::CapturedInterrupts,
                 msr::{read_msr, write_msr},
+                pmu::PmuRuntime,
                 svmvisor_resident_enter, svmvisor_resident_fault_offsets, svmvisor_resident_nmi,
                 svmvisor_resident_sx, text_end,
             },
         },
     },
     svm::{
-        control_msrs::{HsaveAddressPolicy, SMM_ADDR, SMM_MASK, VM_HSAVE_PA, VisibleSvmControls},
+        control_msrs::{
+            HsaveAddressPolicy, SMM_ADDR, SMM_BASE, SMM_MASK, VM_HSAVE_PA, VisibleSvmControls,
+        },
         dispatch::NativeEfer,
         instructions::NativeSvmInstructions,
         permission_maps::{MsrAccess, Msrpm, Permission},
+        pmu::{PmuEvidence, PmuProfile},
         startup::{NativeDestinationMode, NativeIcr, NativeStartupMailbox, try_lock_routes},
+        target_msrs::TargetMsrPolicy,
     },
 };
 
@@ -99,7 +104,7 @@ pub unsafe extern "win64" fn prepare(
     });
     handlers[30] = svmvisor_resident_sx as *const () as u64;
     // Vector 2: the returning host NMI gate (irq.S) on IST2, replacing the
-    // terminal fault stub. Host-window NMIs are requeued through EVENTINJ.
+    // terminal fault stub. Acknowledged physical NMIs are queued through V_NMI.
     handlers[2] = svmvisor_resident_nmi as *const () as u64;
     let request = HostDescriptorRequest {
         gdt_base: gdt,
@@ -347,12 +352,26 @@ unsafe extern "win64" fn arm(
     // and unity TSC scaling. capabilities() gates the TSC ratio MSR via CPUID.
     // Exact-target admission above gates these SMRAM reads. Firmware must have
     // locked SMRAM and supplied the zero-key SVM profile documented by the PPR.
+    let hwcr = unsafe { read_msr(HWCR) };
+    let smm_base = unsafe { read_msr(SMM_BASE) };
+    let smm_addr = unsafe { read_msr(SMM_ADDR) };
+    let smm_mask = unsafe { read_msr(SMM_MASK) };
     let Ok(hsave_policy) = HsaveAddressPolicy::admit_target(
         TARGET_SIGNATURE,
         caps.address_policy().physical_bits(),
-        unsafe { read_msr(HWCR) },
-        unsafe { read_msr(SMM_ADDR) },
-        unsafe { read_msr(SMM_MASK) },
+        hwcr,
+        smm_addr,
+        smm_mask,
+    ) else {
+        return 15;
+    };
+    let Some(target_msrs) = TargetMsrPolicy::admit(
+        __cpuid_count(1, 0).eax,
+        extended21,
+        hwcr,
+        smm_base,
+        smm_addr,
+        smm_mask,
     ) else {
         return 15;
     };
@@ -384,7 +403,7 @@ unsafe extern "win64" fn arm(
     if ValidatedMemoryMap::new(descriptors, policy.physical_bits()).is_err() {
         return 6;
     }
-    // Preserve physical LAPIC delivery; intercept only the ICR for INIT/SIPI routing.
+    // Preserve fixed interrupt delivery; intercept the ICR for INIT/SIPI routing.
     unsafe {
         interrupts.configure_msrpm(&mut *ptr::addr_of_mut!(MSRPM));
     }
@@ -404,12 +423,31 @@ unsafe extern "win64" fn arm(
         return 2;
     }
     let performance = __cpuid_count(EXTENDED_PERFORMANCE_LEAF, 0);
+    // This read-only capability gate precedes all PMU hardware access. The
+    // nonreturning entry captures the selectors, preserving current firmware
+    // values without adding rollback obligations to this fallible arm path.
+    let Some(pmu_profile) = PmuProfile::admit(PmuEvidence {
+        signature: __cpuid_count(1, 0).eax,
+        extended01_ecx: extended.ecx,
+        extended21_eax: extended21.unwrap_or(0),
+        extended22_eax: performance.eax,
+        extended22_ebx: performance.ebx,
+    }) else {
+        return 2;
+    };
     if !vmcb.configure_native_lbr(
         maximum_extended_leaf,
         __cpuid_count(0x8000_000a, 0).edx,
         performance.eax,
         performance.ebx,
     ) {
+        return 2;
+    }
+    // Normal firmware continuation, outside an active NMI handler. This is not
+    // a late-launch capture of an unknowable physical NMI-blocking state.
+    // Each owning CPU supplies its own CPUID evidence (PPR physical p101).
+    // Complete fallible control admission before committing physical R_INIT.
+    if vmcb.configure_native_nmi_virtualization(__cpuid_count(0x8000_000a, 0).edx).is_err() {
         return 2;
     }
     if !startup_owned || id_count < 2 {
@@ -453,8 +491,10 @@ unsafe extern "win64" fn arm(
     }
     state.ack = Some(ack_owner);
     state.efer = Some(owner);
+    state.pmu = Some(PmuRuntime::new(pmu_profile));
     state.vmcr = Some(vmcr);
     state.svm_controls = Some(svm_controls);
+    state.target_msrs = Some(target_msrs);
     state.svm_instructions = Some(svm_instructions);
     state.icr = Some(icr_owner);
     state.icr_value = interrupts.icr_value();
@@ -500,7 +540,7 @@ unsafe fn capabilities() -> Option<ValidatedCapabilities> {
     if one.ecx >> 31 != 0
         || extone.ecx & 4 == 0
         || extone.edx & ((1 << 20) | (1 << 26)) != ((1 << 20) | (1 << 26))
-        || svm.edx & ((1 << 4) | 1) != ((1 << 4) | 1)
+        || svm.edx & ((1 << 25) | (1 << 4) | 1) != ((1 << 25) | (1 << 4) | 1)
         || svm.eax != 1
     {
         return None;

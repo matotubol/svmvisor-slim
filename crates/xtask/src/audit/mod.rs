@@ -12,17 +12,20 @@ use crate::json::Value;
 pub use capture::audit_entry_capture;
 pub use lbr::audit_lbr_capture;
 pub use msr_capture::audit_msr_capture;
+pub use pmu::audit_pmu_commit;
 pub use tsc_ratio::audit_tsc_ratio_init;
 
 mod capture;
 mod lbr;
 mod msr_capture;
+mod pmu;
 mod tsc_ratio;
 
 const ERROR_CODE_VECTORS: [u32; 10] = [8, 10, 11, 12, 13, 14, 17, 21, 29, 30];
 const NMI_VECTOR: i64 = 2;
 const NMI_GATE: &str = "svmvisor_resident_nmi";
 const NMI_FLAG: &str = "svmvisor_resident_nmi_pending";
+const NMI_ACKS: &str = "svmvisor_resident_nmi_acks";
 
 /// One element of a full-match line pattern.
 enum Token {
@@ -179,11 +182,13 @@ pub fn audit_host_fault(text: &str) -> Result<Value, String> {
     }
     // Returning NMI gate (nmi.S): the IDT names it for vector 2 in place of
     // the terminal stub, which stays linked (fault.S offsets table) and is
-    // still checked above. It may only flag the NMI and return with GIF clear.
+    // still checked above. It may only flag/acknowledge the NMI and return
+    // with GIF clear; IRET restores the flags changed by the local increment.
     let nmi = returning(&bodies, NMI_GATE);
     let expected = [
         vec![literal("clgi")],
         rip_operand("movl $0x1, ".into(), NMI_FLAG),
+        rip_operand("incq ".into(), NMI_ACKS),
         vec![literal("iretq")],
     ];
     if !shaped(nmi, &expected) {
@@ -209,6 +214,7 @@ pub fn audit_host_fault(text: &str) -> Result<Value, String> {
                 ("vector".into(), Value::Int(NMI_VECTOR)),
                 ("symbol".into(), Value::str(NMI_GATE)),
                 ("flag".into(), Value::str(NMI_FLAG)),
+                ("acknowledgments".into(), Value::str(NMI_ACKS)),
             ]),
         ),
         ("sx_non_init_path".into(), Value::strs(&["svmvisor_resident_fault_30"])),

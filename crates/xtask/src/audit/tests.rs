@@ -166,7 +166,8 @@ fn nmi() -> String {
     "00000000001002c0 <svmvisor_resident_nmi>:\n\
   1002c0:      \tclgi\n\
   1002c3:      \tmovl\t$0x1, 0x7adf3(%rip)     # 0x17b0c0 <svmvisor_resident_nmi_pending>\n\
-  1002cd:      \tiretq\n\n"
+  1002cd:      \tincq\t0x7adf4(%rip)           # 0x17b0c8 <svmvisor_resident_nmi_acks>\n\
+  1002d4:      \tiretq\n\n"
         .into()
 }
 
@@ -212,6 +213,7 @@ fn nmi_and_sx_gates_pass() {
             ("vector".into(), Value::Int(2)),
             ("symbol".into(), Value::str("svmvisor_resident_nmi")),
             ("flag".into(), Value::str("svmvisor_resident_nmi_pending")),
+            ("acknowledgments".into(), Value::str("svmvisor_resident_nmi_acks")),
         ]))
     );
     assert_eq!(result.get("sx_non_init_path"), Some(&Value::strs(&["svmvisor_resident_fault_30"])));
@@ -257,6 +259,10 @@ fn nmi_gate_is_exact_and_vector_2_is_not_terminal() {
         nmi_with("<svmvisor_resident_nmi_pending>", "<svmvisor_resident_nmi_pending+0x4>"),
         nmi_with("$0x1,", "$0x0,"),
         nmi_with("\tmovl\t", "\tmovq\t"),
+        nmi_with("<svmvisor_resident_nmi_acks>", "<svmvisor_resident_init_acks>"),
+        nmi_with("<svmvisor_resident_nmi_acks>", "<svmvisor_resident_nmi_acks+0x4>"),
+        nmi_with("\tincq\t", "\tincl\t"),
+        nmi_with("\tincq\t", "\tdecq\t"),
     ];
     for (index, text) in cases.iter().enumerate() {
         assert_ne!(text, &good, "case {index} did not mutate the image");

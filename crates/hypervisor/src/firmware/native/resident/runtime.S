@@ -136,6 +136,20 @@ svmvisor_resident_lbr_capture_end:
     shr $32, %rdx
     mov $0xc0010117, %ecx
     wrmsr
+    /* The exact CPU profile was admitted without changing PMU hardware.
+     * Capture selectors now, at the nonreturning commit, and apply logical
+     * EFER filtering. Counter values and global PMU state remain live. The
+     * private root, stack, descriptors and terminal gates are already active. */
+.globl svmvisor_resident_pmu_commit
+svmvisor_resident_pmu_commit:
+    cld
+    mov (%rsp), %rcx
+    sub $32, %rsp
+    call svmvisor_resident_pmu_initialize
+    add $32, %rsp
+    test %al, %al
+    jz svmvisor_resident_terminal
+    mov (%rsp), %r10
     /* Arm captured this CPU's original TSC_RATIO and required CPUID.TscRateMsr.
      * The logical guest runs as a native host, whose own clock is not scaled by
      * its ratio MSR (APM2 physical p647; PPR57896 p189). Keep the physical

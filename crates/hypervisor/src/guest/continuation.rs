@@ -148,7 +148,9 @@ impl NativeBootstrapAck {
         if vmcb.event_injection() != 0
             || read_u64(vmcb.bytes(), 0x088) & (1 << 31) != 0
             || read_u64(vmcb.bytes(), 0x068) & 1 != 0
-            || vmcb.virtual_interrupt_control() & !(0xf | (1 << 24)) != 0
+            || vmcb.virtual_interrupt_control() & !(0xf | (1 << 24) | (1 << 26)) != 0
+            || vmcb.nmi_virtualization_enabled()
+                != vmcb.event_intercept(crate::svm::vmcb::EventIntercept::Nmi)
         {
             return Err(E::PendingEvent);
         }

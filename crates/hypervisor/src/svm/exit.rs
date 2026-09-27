@@ -384,9 +384,6 @@ impl<'a> MsrInstruction<'a> {
         if !crate::memory::address::is_canonical_48(exit.rip) {
             return Err(ResumeError::NonCanonicalRip);
         }
-        if !crate::memory::address::is_canonical_48(exit.nrip) {
-            return Err(ResumeError::NonCanonicalNrip);
-        }
         let length = exit
             .nrip
             .checked_sub(exit.rip)
@@ -417,7 +414,14 @@ impl<'a> MsrInstruction<'a> {
         self.validate(stopped)?;
         match self {
             Self::Bytes(bytes) => stopped.msr_continuation(bytes),
-            Self::Hardware { next, .. } => Ok(next),
+            Self::Hardware { next, .. } => {
+                // APM2 physical pp305, 571, 580: an operand fault retains RIP
+                // and needs no successor. Validate it only for completion.
+                if !crate::memory::address::is_canonical_48(next.address) {
+                    return Err(ResumeError::NonCanonicalNrip);
+                }
+                Ok(next)
+            }
         }
     }
 }
