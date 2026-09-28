@@ -1,15 +1,19 @@
 //! Transport-independent process batches with bounded service opportunities.
 //! Identity checks are observations, not page pins or atomic snapshots.
 
-use svmvisor_card_abi::batch::{
-    self, BatchRequest, MAX_DATA_BYTES, MAX_RANGES, MAX_RESPONSE_BYTES, Operation, Status,
+use svmvisor_card_abi::{
+    batch::{
+        self, BatchRequest, MAX_DATA_BYTES, MAX_RANGES, MAX_RESPONSE_BYTES, Operation, Status,
+    },
+    diagnostic::{DiagnosticEntry, DiagnosticObservation},
 };
 
 use crate::{
-    memory::address::is_canonical_48,
+    memory::address::{PAGE_BYTES, is_canonical_48},
     reader::{
         paging::{self, PagingConfig, PagingError},
-        process::{self, ProcessLayoutEvidence, ProcessObservation, ProcessProfile},
+        process::{self, ProcessError, ProcessLayoutEvidence, ProcessObservation, ProcessProfile},
+        read::ReadError,
     },
 };
 
@@ -162,14 +166,19 @@ impl BatchEngine {
                 });
                 BatchPhase::Before
             }
-            Operation::Sample => {
+            Operation::Sample | Operation::Explain => {
                 if self.binding.is_none_or(|binding| binding.token != request.token) {
+                    if request.operation == Operation::Explain {
+                        self.binding = None;
+                    }
                     self.finish(Status::Binding);
                     return Ok(());
                 }
                 for range in &request.ranges[..request.count] {
-                    let end = range.address + u64::from(range.length) - 1;
-                    if !is_canonical_48(range.address) || !is_canonical_48(end) {
+                    let end = range.address + (u64::from(range.length) - 1);
+                    if request.operation == Operation::Sample
+                        && (!is_canonical_48(range.address) || !is_canonical_48(end))
+                    {
                         self.finish(Status::Shape);
                         return Ok(());
                     }
@@ -180,11 +189,19 @@ impl BatchEngine {
         Ok(())
     }
 
-    /// Each call performs one metadata validation or one <=256-byte page fragment.
+    /// Each call performs one metadata validation, one diagnostic walk, or one <=256-byte fragment.
     /// The callback budget is enforced even if a future validator grows more expensive.
     pub fn advance(
         &mut self,
         read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
+    ) -> bool {
+        self.advance_with_translation(read, &mut None)
+    }
+
+    fn advance_with_translation(
+        &mut self,
+        read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
+        translation: &mut Option<FragmentTranslation>,
     ) -> bool {
         let Some(request) = self.request else {
             return false;
@@ -201,13 +218,39 @@ impl BatchEngine {
             return true;
         }
         self.steps += 1;
+        // The ordinary data and diagnostic paths share the same physical callback type and
+        // paging walker. Only the diagnostic data phase initializes and records wire evidence.
+        let mut diagnostic =
+            if request.operation == Operation::Explain && self.phase == BatchPhase::Data {
+                self.binding.map(|binding| DiagnosticObservation {
+                    root: binding.observation.kernel_root_pa,
+                    address: request.ranges[0].address,
+                    physical_bits: config.physical_bits(),
+                    nxe: config.nxe(),
+                    page_1g: config.page_1g(),
+                    ..DiagnosticObservation::EMPTY
+                })
+            } else {
+                None
+            };
         let mut calls = 0;
         let mut bounded = |address, bytes: &mut [u8]| {
             if calls == MAX_SLICE_CALLS || bytes.len() > SLICE_BYTES {
                 return Err(PagingError::PhysicalRead);
             }
             calls += 1;
-            read(address, bytes)
+            read(address, bytes).map_err(|_| PagingError::PhysicalRead)?;
+            if let Some(observation) = diagnostic.as_mut() {
+                let bytes: &mut [u8; 8] =
+                    bytes.try_into().map_err(|_| PagingError::PhysicalRead)?;
+                let entry = observation
+                    .entries
+                    .get_mut(observation.count)
+                    .ok_or(PagingError::PhysicalRead)?;
+                *entry = DiagnosticEntry { address, value: u64::from_le_bytes(*bytes) };
+                observation.count += 1;
+            }
+            Ok(())
         };
         match self.phase {
             BatchPhase::Before | BatchPhase::After => {
@@ -215,41 +258,80 @@ impl BatchEngine {
                     self.finish(Status::Binding);
                     return true;
                 };
-                if process::revalidate(
+                let validation = process::revalidate(
                     config,
                     binding.profile,
                     binding.kernel_root,
                     binding.observation,
                     &mut bounded,
-                )
-                .is_err()
-                {
+                );
+                if let Err(error) = validation {
                     self.binding = None;
-                    self.finish(Status::Binding);
+                    let status = if request.operation == Operation::Explain
+                        && error == ProcessError::Read(ReadError::Paging(PagingError::PhysicalRead))
+                    {
+                        Status::Read
+                    } else {
+                        Status::Binding
+                    };
+                    self.finish(status);
                 } else if self.phase == BatchPhase::After || request.operation == Operation::Bind {
                     self.finish(Status::Success);
                 } else {
                     self.phase = BatchPhase::Data;
                 }
             }
+            BatchPhase::Data if request.operation == Operation::Explain => {
+                let Some(binding) = self.binding else {
+                    self.finish(Status::Binding);
+                    return true;
+                };
+                let result = paging::translate(
+                    config,
+                    binding.observation.kernel_root_pa,
+                    request.ranges[0].address,
+                    &mut bounded,
+                );
+                if result == Err(PagingError::PhysicalRead) {
+                    self.finish(Status::Read);
+                    return true;
+                }
+                let Some(observation) = diagnostic else {
+                    self.finish(Status::Binding);
+                    return true;
+                };
+                let Ok(bytes) = observation.encode() else {
+                    self.finish(Status::Read);
+                    return true;
+                };
+                self.data[..bytes.len()].copy_from_slice(&bytes);
+                self.length = bytes.len();
+                self.phase = BatchPhase::After;
+            }
             BatchPhase::Data => {
                 let range = request.ranges[self.range];
                 let address = range.address + self.offset as u64;
-                let count = SLICE_BYTES
-                    .min(range.length as usize - self.offset)
-                    .min(4096 - (address as usize & 4095));
+                let page_remaining = PAGE_BYTES - (address as usize & (PAGE_BYTES - 1));
+                let count =
+                    SLICE_BYTES.min(range.length as usize - self.offset).min(page_remaining);
                 let physical = if request.operation == Operation::Sample {
-                    let binding = self.binding.unwrap();
-                    match paging::translate(
-                        config,
-                        binding.observation.kernel_root_pa,
-                        address,
-                        &mut bounded,
-                    ) {
-                        Ok(translation) => translation.pa(),
-                        Err(_) => {
-                            self.finish(Status::Read);
-                            return true;
+                    if let Some(previous) = translation.filter(|previous| {
+                        previous.range == self.range && previous.address == address
+                    }) {
+                        previous.physical
+                    } else {
+                        let binding = self.binding.unwrap();
+                        match paging::translate(
+                            config,
+                            binding.observation.kernel_root_pa,
+                            address,
+                            &mut bounded,
+                        ) {
+                            Ok(translation) => translation.pa(),
+                            Err(_) => {
+                                self.finish(Status::Read);
+                                return true;
+                            }
                         }
                     }
                 } else {
@@ -261,6 +343,21 @@ impl BatchEngine {
                 }
                 self.length += count;
                 self.offset += count;
+                // Reuse only for the immediately following fragment of this range in this
+                // 4 KiB page. Even a huge-page translation is forgotten at a 4 KiB boundary.
+                // A successful translation and the page bound make both additions safe.
+                *translation = if request.operation == Operation::Sample
+                    && self.offset < range.length as usize
+                    && count < page_remaining
+                {
+                    Some(FragmentTranslation {
+                        range: self.range,
+                        address: address + count as u64,
+                        physical: physical + count as u64,
+                    })
+                } else {
+                    None
+                };
                 if self.offset == range.length as usize {
                     self.range += 1;
                     self.offset = 0;
@@ -280,6 +377,8 @@ impl BatchEngine {
 
     /// Service one metadata phase or at most four data fragments (at most 1024 data bytes).
     /// Metadata validation stays on each side of the data, in separate opportunities.
+    /// Adjacent fragments in the same range and 4 KiB page share one sampled translation
+    /// during this call only. This does not pin the mapping or provide an atomic snapshot.
     /// The whole call retains the single-phase callback ceiling; grouping never grants a
     /// fresh callback budget per fragment. This bounds work, not elapsed time: callers
     /// must separately validate their worst-case interrupt latency on the target machine.
@@ -288,6 +387,7 @@ impl BatchEngine {
         read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
     ) -> bool {
         let limit = if self.phase == BatchPhase::Data { MAX_DATA_SLICES_PER_CALL } else { 1 };
+        let mut translation = None;
         let mut calls = 0;
         let mut bounded = |address, bytes: &mut [u8]| {
             if calls == MAX_SLICE_CALLS || bytes.len() > SLICE_BYTES {
@@ -297,7 +397,7 @@ impl BatchEngine {
             read(address, bytes)
         };
         for _ in 0..limit {
-            if self.advance(&mut bounded) {
+            if self.advance_with_translation(&mut bounded, &mut translation) {
                 return true;
             }
             if self.phase != BatchPhase::Data {
@@ -357,6 +457,13 @@ struct ProcessBinding {
     token: u64,
 }
 
+#[derive(Clone, Copy)]
+struct FragmentTranslation {
+    range: usize,
+    address: u64,
+    physical: u64,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BatchPhase {
     Idle,
@@ -372,7 +479,10 @@ mod tests {
 
     use super::*;
     use std::vec::Vec;
-    use svmvisor_card_abi::batch::{BatchRange, BindingEvidence};
+    use svmvisor_card_abi::{
+        batch::{BatchRange, BindingEvidence},
+        diagnostic,
+    };
 
     fn request(operation: Operation, sequence: u64) -> BatchRequest {
         BatchRequest {
@@ -484,7 +594,11 @@ mod tests {
     fn pending(operation: Operation, ranges: &[BatchRange], image: &[u8]) -> BatchEngine {
         let mut engine = BatchEngine::new();
         hello(&mut engine);
-        let token = if operation == Operation::Sample { bind(&mut engine, image) } else { 0 };
+        let token = if matches!(operation, Operation::Sample | Operation::Explain) {
+            bind(&mut engine, image)
+        } else {
+            0
+        };
         let mut request = request(operation, 3);
         request.token = token;
         request.count = ranges.len();
@@ -543,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_calls_preserve_bytes_and_reads_with_fewer_continuations() {
+    fn bounded_calls_preserve_bytes_and_data_reads_with_fewer_continuations() {
         let image = four_level_image();
         for (operation, ranges, old_calls, new_calls) in [
             (Operation::Physical, std::vec![BatchRange { address: 0x8000, length: 4096 }], 16, 4),
@@ -570,9 +684,10 @@ mod tests {
             assert_eq!(old.len(), old_calls);
             assert_eq!(new.len(), new_calls);
             assert_eq!(
-                old.iter().flatten().collect::<Vec<_>>(),
-                new.iter().flatten().collect::<Vec<_>>()
+                old.iter().flatten().filter(|(address, _)| *address >= 0x8000).collect::<Vec<_>>(),
+                new.iter().flatten().filter(|(address, _)| *address >= 0x8000).collect::<Vec<_>>()
             );
+            assert_eq!(single.steps, grouped.steps);
             assert_eq!(single.response(), grouped.response());
             assert_eq!(status(&grouped), Status::Success as u32);
             let expected: Vec<_> = ranges
@@ -587,7 +702,14 @@ mod tests {
             if operation == Operation::Sample {
                 assert!(new.first().unwrap().iter().all(|(address, _)| *address < 0x8000));
                 assert!(new.last().unwrap().iter().all(|(address, _)| *address < 0x8000));
-                assert_eq!(new[1].len(), 20);
+                assert_eq!(old.first(), new.first());
+                assert_eq!(old.last(), new.last());
+                assert!(new[1].len() < 20);
+            } else {
+                assert_eq!(
+                    old.iter().flatten().collect::<Vec<_>>(),
+                    new.iter().flatten().collect::<Vec<_>>()
+                );
             }
         }
     }
@@ -603,15 +725,133 @@ mod tests {
                 let old = finish_traced(&mut single, &image, false, Some(fail_at));
                 let new = finish_traced(&mut grouped, &image, true, Some(fail_at));
                 assert_eq!(
-                    old.iter().flatten().collect::<Vec<_>>(),
-                    new.iter().flatten().collect::<Vec<_>>()
+                    old.iter()
+                        .flatten()
+                        .filter(|(address, _)| *address >= 0x8000)
+                        .collect::<Vec<_>>(),
+                    new.iter()
+                        .flatten()
+                        .filter(|(address, _)| *address >= 0x8000)
+                        .collect::<Vec<_>>()
                 );
+                assert_eq!(single.steps, grouped.steps);
                 assert_eq!(single.response(), grouped.response());
                 assert_eq!(status(&grouped), Status::Read as u32);
                 assert_eq!(grouped.response().unwrap().len(), 68);
                 assert!(grouped.data.iter().all(|byte| *byte == 0));
             }
         }
+    }
+
+    #[test]
+    fn bounded_calls_share_one_walk_for_four_fragments_of_each_page_size() {
+        let mut gigabyte = image();
+        put(&mut gigabyte, 0x2000, 0x0083);
+        for (image, levels) in [(four_level_image(), 4), (image(), 3), (gigabyte, 2)] {
+            let ranges = [BatchRange { address: 0x8000, length: 1024 }];
+            let mut single = pending(Operation::Sample, &ranges, &image);
+            let mut grouped = pending(Operation::Sample, &ranges, &image);
+            let old = finish_traced(&mut single, &image, false, None);
+            let new = finish_traced(&mut grouped, &image, true, None);
+            assert_eq!(old[1..5].iter().map(Vec::len).sum::<usize>(), 4 * (levels + 1));
+            assert_eq!(new[1].len(), levels + 4);
+            assert_eq!(new.len(), 3);
+            assert_eq!(single.steps, grouped.steps);
+            assert_eq!(single.response(), grouped.response());
+        }
+    }
+
+    #[test]
+    fn bounded_calls_restart_walks_at_pages_and_each_range() {
+        for (image, levels) in [(four_level_image(), 4), (image(), 3)] {
+            for ranges in [
+                std::vec![BatchRange { address: 0x8f00, length: 1024 }],
+                std::vec![
+                    BatchRange { address: 0x8000, length: 512 },
+                    BatchRange { address: 0x8200, length: 512 },
+                ],
+                std::vec![
+                    BatchRange { address: 0x8000, length: 512 },
+                    BatchRange { address: 0x8100, length: 512 },
+                ],
+                std::vec![
+                    BatchRange { address: 0x8000, length: 512 },
+                    BatchRange { address: 0x8400, length: 512 },
+                ],
+            ] {
+                let mut engine = pending(Operation::Sample, &ranges, &image);
+                let trace = finish_traced(&mut engine, &image, true, None);
+                assert_eq!(trace.len(), 3);
+                assert_eq!(trace[1].len(), 2 * levels + 4);
+                assert_eq!(trace[1].iter().filter(|(address, _)| *address == 0x1000).count(), 2);
+                let expected: Vec<_> = ranges
+                    .iter()
+                    .flat_map(|range| {
+                        image
+                            [range.address as usize..range.address as usize + range.length as usize]
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+                assert_eq!(&engine.response().unwrap()[64..64 + expected.len()], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_calls_discard_a_failed_walk_after_partial_data() {
+        let image = four_level_image();
+        let ranges = [BatchRange { address: 0x8f00, length: 512 }];
+        let mut engine = pending(Operation::Sample, &ranges, &image);
+        let trace = finish_traced(&mut engine, &image, true, Some(0x4048));
+        assert_eq!(status(&engine), Status::Read as u32);
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[1].len(), 9);
+        assert_eq!(trace[1].last(), Some(&(0x4048, 8)));
+        assert_eq!(trace[1].iter().filter(|(address, _)| *address >= 0x8000).count(), 1);
+        assert_eq!(engine.response().unwrap().len(), 68);
+        assert!(engine.data.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn bounded_calls_observe_new_mapping_in_the_next_opportunity() {
+        let mut image = four_level_image();
+        image[0xc000..0xd000].fill(0x3c);
+        let mut engine =
+            pending(Operation::Sample, &[BatchRange { address: 0x8000, length: 2048 }], &image);
+        assert!(!advance(&mut engine, &image));
+        let mut calls = 0;
+        assert!(!engine.advance_bounded(&mut |address, bytes| {
+            calls += 1;
+            let start = address as usize;
+            bytes.copy_from_slice(&image[start..start + bytes.len()]);
+            Ok(())
+        }));
+        assert_eq!(calls, 8);
+        assert_eq!(engine.length, 1024);
+        put(&mut image, 0x4040, 0xc003);
+        let trace = finish_traced(&mut engine, &image, true, None);
+        assert_eq!(trace[0].len(), 8);
+        assert_eq!(trace[0][4..], [(0xc400, 256), (0xc500, 256), (0xc600, 256), (0xc700, 256)]);
+        assert_eq!(status(&engine), Status::Success as u32);
+        assert_eq!(&engine.response().unwrap()[64..1088], &image[0x8000..0x8400]);
+        assert_eq!(&engine.response().unwrap()[1088..2112], &[0x3c; 1024]);
+    }
+
+    #[test]
+    fn reused_translation_does_not_extend_service_step_budget() {
+        let image = four_level_image();
+        let mut engine =
+            pending(Operation::Sample, &[BatchRange { address: 0x8000, length: 4096 }], &image);
+        assert!(!advance(&mut engine, &image));
+        engine.steps = MAX_SERVICE_STEPS - 2;
+        let trace = finish_traced(&mut engine, &image, true, None);
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].len(), 6);
+        assert_eq!(engine.steps, MAX_SERVICE_STEPS);
+        assert_eq!(status(&engine), Status::Read as u32);
+        assert!(engine.data.iter().all(|byte| *byte == 0));
+        assert!(engine.binding.is_none());
     }
 
     #[test]
@@ -823,5 +1063,222 @@ mod tests {
         request.count = usize::MAX;
         assert_eq!(engine.begin(request, 7, config()), Err(Status::Shape));
         assert!(engine.response().is_none());
+    }
+
+    #[test]
+    fn explain_returns_exact_walk_evidence_in_three_opportunities_without_target_reads() {
+        for (kind, address, count) in [
+            (0, 0x8123, 4),
+            (1, 0x8123, 4),
+            (2, 0x8123, 3),
+            (3, 0x8123, 2),
+            (4, 0x0000_8000_0000_0000, 0),
+            (5, 0x8123, 4),
+            (6, u64::MAX, 1),
+        ] {
+            let mut image = four_level_image();
+            match kind {
+                1 => put(&mut image, 0x4040, 0x1234_5000),
+                2 => put(&mut image, 0x3000, 0x83),
+                3 => put(&mut image, 0x2000, 0x83),
+                5 => put(&mut image, 0x4040, (1 << 48) | 0x8003),
+                _ => {}
+            }
+            let mut engine =
+                pending(Operation::Explain, &[BatchRange { address, length: 1 }], &image);
+            let token = engine.binding.unwrap().token;
+            let calls = finish_traced(&mut engine, &image, true, None);
+            assert_eq!(calls.len(), 3);
+            assert_eq!(engine.steps, 3);
+            assert_eq!(calls[1].len(), count);
+            assert!(calls.iter().flatten().all(|(pa, _)| *pa < 0x8000));
+            assert_eq!(status(&engine), Status::Success as u32);
+            let response = engine.response().unwrap();
+            assert_eq!(response.len(), 64 + diagnostic::BYTES + 4);
+            assert_eq!(u64::from_le_bytes(response[32..40].try_into().unwrap()), token);
+            let observation = DiagnosticObservation::decode(&response[64..160]).unwrap();
+            assert_eq!(observation.root, 0x1000);
+            assert_eq!(observation.address, address);
+            assert_eq!(observation.physical_bits, 48);
+            assert!(observation.nxe && observation.page_1g);
+            assert_eq!(observation.count, count);
+            for (entry, &(pa, length)) in observation.entries[..count].iter().zip(&calls[1]) {
+                assert_eq!(length, 8);
+                assert_eq!(entry.address, pa);
+                assert_eq!(
+                    entry.value,
+                    u64::from_le_bytes(image[pa as usize..pa as usize + 8].try_into().unwrap())
+                );
+            }
+            assert_eq!(observation.entries[count..], [DiagnosticEntry::EMPTY; 4][count..]);
+        }
+    }
+
+    #[test]
+    fn explain_pre_and_post_identity_changes_discard_evidence_and_token() {
+        for before in [true, false] {
+            for (offset, value) in [(0x6010, 43), (0x6018, 0x2000), (0x6020, 100), (0x6108, 0x6200)]
+            {
+                let mut image = four_level_image();
+                let mut engine = pending(
+                    Operation::Explain,
+                    &[BatchRange { address: 0x8000, length: 1 }],
+                    &image,
+                );
+                if !before {
+                    assert!(!advance(&mut engine, &image));
+                    assert!(!advance(&mut engine, &image));
+                    assert_eq!(engine.length, diagnostic::BYTES);
+                }
+                put(&mut image, offset, value);
+                assert!(advance(&mut engine, &image));
+                assert_eq!(status(&engine), Status::Binding as u32);
+                let response = engine.response().unwrap();
+                assert_eq!(response.len(), 68);
+                assert_eq!(&response[32..40], &[0; 8]);
+                assert!(engine.binding.is_none());
+                assert!(engine.data.iter().all(|byte| *byte == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn explain_physical_walk_failures_return_no_partial_evidence_or_extra_reads() {
+        let image = four_level_image();
+        for failed in 1..=4 {
+            let mut engine =
+                pending(Operation::Explain, &[BatchRange { address: 0x8000, length: 1 }], &image);
+            let token = engine.binding.unwrap().token;
+            assert!(!advance(&mut engine, &image));
+            let mut calls = 0;
+            assert!(engine.advance_bounded(&mut |pa, bytes| {
+                calls += 1;
+                if calls == failed {
+                    bytes.fill(0xee);
+                    return Err(PagingError::PhysicalRead);
+                }
+                bytes.copy_from_slice(&image[pa as usize..pa as usize + bytes.len()]);
+                Ok(())
+            }));
+            assert_eq!(calls, failed);
+            assert_eq!(status(&engine), Status::Read as u32);
+            let response = engine.response().unwrap();
+            assert_eq!(response.len(), 68);
+            assert_eq!(u64::from_le_bytes(response[32..40].try_into().unwrap()), token);
+            assert!(engine.data.iter().all(|byte| *byte == 0));
+        }
+    }
+
+    #[test]
+    fn explain_metadata_physical_failures_are_transport_errors_and_discard_evidence() {
+        let image = four_level_image();
+        for phase in [BatchPhase::Before, BatchPhase::After] {
+            let mut baseline =
+                pending(Operation::Explain, &[BatchRange { address: 0x8000, length: 1 }], &image);
+            let opportunities = finish_traced(&mut baseline, &image, true, None);
+            let count = opportunities[if phase == BatchPhase::Before { 0 } else { 2 }].len();
+            for failed in 1..=count {
+                let mut engine = pending(
+                    Operation::Explain,
+                    &[BatchRange { address: 0x8000, length: 1 }],
+                    &image,
+                );
+                while engine.phase != phase {
+                    assert!(!advance(&mut engine, &image));
+                }
+                let mut calls = 0;
+                assert!(engine.advance_bounded(&mut |pa, bytes| {
+                    calls += 1;
+                    if calls == failed {
+                        bytes.fill(0xee);
+                        return Err(PagingError::PhysicalRead);
+                    }
+                    bytes.copy_from_slice(&image[pa as usize..pa as usize + bytes.len()]);
+                    Ok(())
+                }));
+                assert_eq!(calls, failed);
+                assert_eq!(status(&engine), Status::Read as u32);
+                assert_eq!(engine.response().unwrap().len(), 68);
+                assert!(engine.binding.is_none());
+                assert!(engine.data.iter().all(|byte| *byte == 0));
+            }
+        }
+        let mut sample =
+            pending(Operation::Sample, &[BatchRange { address: 0x8000, length: 1 }], &image);
+        assert!(sample.advance(&mut |_, _| Err(PagingError::PhysicalRead)));
+        assert_eq!(status(&sample), Status::Binding as u32);
+    }
+
+    #[test]
+    fn explain_preserves_the_submitted_paging_width_and_feature_flags() {
+        let image = four_level_image();
+        for physical_bits in [32, 48, 52] {
+            for (nxe, page_1g) in [(false, false), (true, false), (false, true), (true, true)] {
+                let mut engine = BatchEngine::new();
+                hello(&mut engine);
+                let token = bind(&mut engine, &image);
+                let mut request = request(Operation::Explain, 3);
+                request.token = token;
+                request.count = 1;
+                request.ranges[0] = BatchRange { address: 0x8000, length: 1 };
+                let config = PagingConfig::new(physical_bits, nxe, page_1g).unwrap();
+                engine.begin(request, 7, config).unwrap();
+                finish_traced(&mut engine, &image, true, None);
+                assert_eq!(status(&engine), Status::Success as u32);
+                let observation =
+                    DiagnosticObservation::decode(&engine.response().unwrap()[64..160]).unwrap();
+                assert_eq!(observation.physical_bits, physical_bits);
+                assert_eq!(observation.nxe, nxe);
+                assert_eq!(observation.page_1g, page_1g);
+            }
+        }
+    }
+
+    #[test]
+    fn explain_preserves_sequence_binding_shape_and_service_limits() {
+        let image = four_level_image();
+        for (token, count, length) in [(0, 1, 1), (1, 0, 1), (1, 2, 1), (1, 1, 0), (1, 1, 2)] {
+            let mut engine = BatchEngine::new();
+            hello(&mut engine);
+            bind(&mut engine, &image);
+            let mut request = request(Operation::Explain, 3);
+            request.token = token;
+            request.count = count;
+            request.ranges[0] = BatchRange { address: 0x8000, length };
+            assert_eq!(engine.begin(request, 7, config()), Err(Status::Shape));
+            assert!(!engine.advance(&mut |_, _| panic!("malformed request must not read")));
+        }
+        let mut engine = BatchEngine::new();
+        hello(&mut engine);
+        let token = bind(&mut engine, &image);
+        let mut request = request(Operation::Explain, 3);
+        request.token = token + 1;
+        request.count = 1;
+        request.ranges[0] = BatchRange { address: 0x8000, length: 1 };
+        engine.begin(request, 7, config()).unwrap();
+        assert_eq!(status(&engine), Status::Binding as u32);
+        assert_eq!(&engine.response().unwrap()[32..40], &[0; 8]);
+        assert!(engine.binding.is_none());
+        for phase in [BatchPhase::Before, BatchPhase::Data, BatchPhase::After] {
+            let mut engine = pending(Operation::Explain, &request.ranges[..1], &image);
+            while engine.phase != phase {
+                assert!(!advance(&mut engine, &image));
+            }
+            engine.steps = MAX_SERVICE_STEPS;
+            assert!(engine.advance_bounded(&mut |_, _| panic!("exhausted service must not read")));
+            assert_eq!(status(&engine), Status::Read as u32);
+            assert_eq!(engine.response().unwrap().len(), 68);
+            assert!(engine.data.iter().all(|byte| *byte == 0));
+        }
+        let mut engine = pending(Operation::Explain, &request.ranges[..1], &image);
+        let request = engine.request.unwrap();
+        finish_traced(&mut engine, &image, true, None);
+        engine.reset_response();
+        engine.begin(request, 7, config()).unwrap();
+        assert_eq!(status(&engine), Status::Sequence as u32);
+        let mut engine =
+            pending(Operation::Sample, &[BatchRange { address: u64::MAX, length: 1 }], &image);
+        finish_traced(&mut engine, &image, true, None);
+        assert_eq!(status(&engine), Status::Read as u32);
     }
 }

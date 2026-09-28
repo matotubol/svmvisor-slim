@@ -37,8 +37,10 @@
 //! from the process's kernel object, and every byte of target memory, including the loader's
 //! module list, comes from the runtime.
 
+mod address;
 mod binding;
 mod bridge;
+pub mod capture;
 mod config;
 mod context;
 mod error;
@@ -51,6 +53,10 @@ mod svm;
 mod transport;
 
 pub use self::{
+    address::{
+        AddressExplanation, PagingConfig, PagingError, PagingLevel, Translation, WalkEntry,
+        WalkTrace,
+    },
     config::Config,
     error::{Error, ErrorKind, Result},
     modules::Module,

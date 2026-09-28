@@ -37,6 +37,7 @@ impl BatchRequest {
             1 => Operation::Physical,
             2 => Operation::Bind,
             3 => Operation::Sample,
+            4 => Operation::Explain,
             _ => return Err(FrameError::Operation),
         };
         let mut request = Self {
@@ -59,11 +60,12 @@ impl BatchRequest {
                 }
                 48
             }
-            Operation::Physical | Operation::Sample => {
+            Operation::Physical | Operation::Sample | Operation::Explain => {
                 if request.count == 0
                     || request.count > MAX_RANGES
                     || (operation == Operation::Physical && request.token != 0)
-                    || (operation == Operation::Sample && request.token == 0)
+                    || (operation != Operation::Physical && request.token == 0)
+                    || (operation == Operation::Explain && request.count != 1)
                 {
                     return Err(FrameError::Shape);
                 }
@@ -75,6 +77,7 @@ impl BatchRequest {
                         length: word(bytes, offset + 8),
                     };
                     if range.length == 0
+                        || (operation == Operation::Explain && range.length != 1)
                         || word(bytes, offset + 12) != 0
                         || range.address.checked_add(u64::from(range.length) - 1).is_none()
                     {
@@ -210,6 +213,8 @@ pub enum Operation {
     Physical = 1,
     Bind = 2,
     Sample = 3,
+    /// Optional raw page-walk evidence, negotiated through local transport capabilities.
+    Explain = 4,
 }
 
 #[repr(u32)]
@@ -376,7 +381,7 @@ mod tests {
         let crc = crc32(&bytes[..252]);
         put_word(&mut bytes, 252, crc);
         assert_eq!(BatchRequest::decode(&bytes), Err(FrameError::Shape));
-        put_word(&mut bytes, 4, u32::from(VERSION) | (4 << 16));
+        put_word(&mut bytes, 4, u32::from(VERSION) | (5 << 16));
         let crc = crc32(&bytes[..252]);
         put_word(&mut bytes, 252, crc);
         assert_eq!(BatchRequest::decode(&bytes), Err(FrameError::Operation));
@@ -395,5 +400,31 @@ mod tests {
             Err(FrameError::Shape)
         );
         assert_eq!(encode_response(physical(), 8, 0, Status::Read, &[], &mut output), Ok(68));
+    }
+
+    #[test]
+    fn explain_requires_one_bound_address_but_preserves_noncanonical_inputs() {
+        let mut request = physical();
+        request.operation = Operation::Explain;
+        request.token = 5;
+        request.ranges[0].length = 1;
+        for address in [0, 0x8000, 0x0000_8000_0000_0000, u64::MAX] {
+            request.ranges[0].address = address;
+            assert_eq!(BatchRequest::decode(&request.encode()), Ok(request));
+        }
+        for (token, count, length) in [(0, 1, 1), (5, 0, 1), (5, 2, 1), (5, 1, 0), (5, 1, 2)] {
+            let mut changed = request;
+            changed.token = token;
+            changed.count = count;
+            changed.ranges[0].length = length;
+            assert_eq!(BatchRequest::decode(&changed.encode()), Err(FrameError::Shape));
+        }
+        for offset in [60, 64, 200] {
+            let mut changed = request.encode();
+            changed[offset] = 1;
+            let checksum = crc32(&changed[..252]);
+            put_word(&mut changed, 252, checksum);
+            assert_eq!(BatchRequest::decode(&changed), Err(FrameError::Shape));
+        }
     }
 }

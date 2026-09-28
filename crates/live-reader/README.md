@@ -37,7 +37,61 @@ svmvisor-live-reader = { path = "../crates/live-reader" }
   Reading either counter sends nothing. See [costs and validation](PERFORMANCE.md).
 - **Observations, not snapshots.** Values may change while a request copies, and
   separate requests are separate observations.
-- **Nothing partial.** On any error, no output buffer is changed.
+- **Strict reads are all-or-nothing.** On any strict read error, no output buffer is changed.
+  The separate capture API records readable spans and explicit gaps.
+
+## Profiles and diagnostics
+
+The embedded default describes kernel build `26100.9457`. To use another verified
+build without recompiling, supply the JSON produced by
+`crates/hypervisor/profiles/extract.py` from that build's exact kernel and PDB:
+
+```powershell
+python crates/hypervisor/profiles/extract.py --image ntoskrnl.exe --pdb ntkrnlmp.pdb --output kernel-profile.json
+```
+
+Extraction requires `llvm-pdbutil` on PATH (or its `--llvm-pdbutil` path option).
+
+```rust,no_run
+use svmvisor_live_reader::Config;
+
+let config = Config::new("ntoskrnl.exe", "ntkrnlmp.pdb").profile("kernel-profile.json");
+```
+
+Explicit evidence is bounded to 1 MiB and fails without fallback if invalid. The
+reader checks schema, offsets, hashes, file lengths, kernel PE/CodeView identity,
+and syscall anchors before connecting; discovery still checks the mapped kernel.
+Use evidence from your trusted extraction process: hashes bind the supplied files
+to the record but do not prove that someone supplied the correct symbol offsets.
+No symbol download or directory scan is performed.
+
+`Svm::explain_address(handle, address)` returns the page-table root, raw entries
+and the precise translation result, including a nonpresent entry that stopped
+the walk. It checks process identity before and after and never accesses the
+translated target data. Supporting runtimes perform it in one batch with three
+service opportunities. The first diagnostic makes one additional capability query;
+the result is retained for this connection. Older runtimes fall back to at most 124
+physical requests per diagnostic. Both paths use fresh observations and the read
+timeout. Ordinary reads do not issue capability queries.
+Entries are observations, not proof of a stable mapping or CPU access permission.
+Nonpresent Windows entries remain raw; this does not recover pagefile or
+compressed memory.
+
+## Captures with gaps
+
+`capture::read(&mut svm, handle, regions, limits)` returns page-bounded spans.
+Readable spans contain bytes and SHA-256; unreadable spans contain no bytes.
+PID, creation time, capture/span timing, request counts and measured reader
+VMMCALL counts accompany the data. Process or session failure discards the whole
+capture. Strict `read_process_memory` and `read_batch` retain their existing
+all-or-nothing behavior.
+
+The defaults allow 16 MiB, 8192 spans and 30 seconds. Hard ceilings are 64 MiB,
+16384 spans and 300 seconds. Limits and complete ranges are checked before reads;
+each read receives the remaining deadline. Captures use no retry, page-in,
+background polling or target memory cache. A capture is a sequence of observations,
+not an atomic snapshot. The client can display gaps and export a binary file with
+an authoritative manifest; see [client commands](../../client/README.md).
 
 ## Errors
 
@@ -51,6 +105,7 @@ svmvisor-live-reader = { path = "../crates/live-reader" }
 | `InvalidHandle` | Closed, or replaced by a later `open_process` | connection |
 | `Discovery` | Kernel context or process discovery failed | connection |
 | `InvalidArgument` | Bad address range or setting; nothing was sent | everything |
+| `LimitReached` | Capture reached its local time limit; no result published | handle and connection |
 | `Profile` | Kernel/PDB files do not match the recorded profile | nothing was started |
 | `Connect` | The runtime could not be reached or the thread pinned | nothing was started |
 | `SessionEnded` | Malformed response, timeout or transport failure | nothing; connect again |

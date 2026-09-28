@@ -5,12 +5,18 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use svmvisor_card_abi::batch::{
-    self, BatchRange, BatchRequest, BindingEvidence, HEADER_BYTES, MAGIC, MAX_DATA_BYTES,
-    MAX_RANGES, MAX_RESPONSE_BYTES, Operation, Status, VERSION,
+use svmvisor_card_abi::{
+    batch::{
+        self, BatchRange, BatchRequest, BindingEvidence, HEADER_BYTES, MAGIC, MAX_DATA_BYTES,
+        MAX_RANGES, MAX_RESPONSE_BYTES, Operation, Status, VERSION,
+    },
+    diagnostic, local,
 };
 
-use crate::transport::{Exchange, NativeTransport};
+use crate::{
+    address::{self, PagingConfig, WalkTrace},
+    transport::{Exchange, NativeTransport},
+};
 
 /// Why an exchange failed. Only a resident refusal of a well-formed request keeps the session.
 #[derive(Debug, PartialEq, Eq)]
@@ -53,6 +59,7 @@ pub(crate) struct ReadBridge {
     sequence: u64,
     context_cpu: Option<u32>,
     context_exit_sequence: u64,
+    capabilities: Option<u64>,
     max_calls: u64,
     deadline: Option<Instant>,
     phase_deadline: Option<Instant>,
@@ -110,6 +117,7 @@ impl ReadBridge {
             sequence: 0,
             context_cpu: None,
             context_exit_sequence: 0,
+            capabilities: None,
             max_calls,
             deadline,
             phase_deadline: deadline,
@@ -133,6 +141,41 @@ impl ReadBridge {
 
     pub(crate) fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// Terminal public-API failures must also prevent a later open from resetting deadlines.
+    pub(crate) fn end(&mut self) {
+        self.failed = true;
+    }
+
+    pub(crate) fn supports_diagnostics(&mut self) -> Result<bool, String> {
+        if self.failed {
+            return Err("local session already failed; no retry".into());
+        }
+        let result = self.capabilities_inner();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result.map(|flags| flags & local::CAP_DIAGNOSTIC != 0)
+    }
+
+    fn capabilities_inner(&mut self) -> Result<u64, String> {
+        self.finish_phase()?;
+        if let Some(flags) = self.capabilities {
+            return Ok(flags);
+        }
+        if self.calls >= self.max_calls {
+            return Err("request limit reached".into());
+        }
+        self.calls += 1;
+        let deadline = self.response_deadline()?;
+        let flags = self.transport.capabilities(self.session, deadline)?;
+        self.finish_phase()?;
+        if Instant::now() >= deadline {
+            return Err("capabilities response deadline reached; discarded".into());
+        }
+        self.capabilities = Some(flags);
+        Ok(flags)
     }
 
     pub(crate) fn context(
@@ -225,6 +268,25 @@ impl ReadBridge {
     pub(crate) fn sample(&mut self, token: u64, ranges: &[BatchRange]) -> Result<Vec<u8>, Failure> {
         self.exchange(Operation::Sample, token, ranges, BindingEvidence::EMPTY)
             .map(|(_, bytes)| bytes)
+    }
+
+    pub(crate) fn explain(
+        &mut self,
+        token: u64,
+        config: PagingConfig,
+        root: u64,
+        address: u64,
+    ) -> Result<WalkTrace, Failure> {
+        let (_, bytes) = self.exchange(
+            Operation::Explain,
+            token,
+            &[BatchRange { address, length: 1 }],
+            BindingEvidence::EMPTY,
+        )?;
+        address::decode(&bytes, config, root, address).map_err(|message| {
+            self.failed = true;
+            Failure::Fatal(message)
+        })
     }
 
     fn exchange(
@@ -323,8 +385,8 @@ fn decode_response(bytes: &[u8], request: BatchRequest) -> Result<(u64, u64, &[u
     {
         return Err("invalid response data length/padding".into());
     }
-    // Only Sample refusals are recoverable: the resident keeps the session after a failed range,
-    // and clears just the binding after an identity change.
+    // Sample read failures retain the binding. Sample/Explain identity changes clear only
+    // the binding. A failed physical diagnostic walk always ends the session.
     match word(40) {
         0 => {}
         status if status == Status::Read as u32 && request.operation == Operation::Sample => {
@@ -333,7 +395,10 @@ fn decode_response(bytes: &[u8], request: BatchRequest) -> Result<(u64, u64, &[u
             }
             return Err(Failure::Unreadable);
         }
-        status if status == Status::Binding as u32 && request.operation == Operation::Sample => {
+        status
+            if status == Status::Binding as u32
+                && matches!(request.operation, Operation::Sample | Operation::Explain) =>
+        {
             if length != 0 || token != 0 {
                 return Err("invalid recoverable binding refusal".into());
             }
@@ -343,12 +408,16 @@ fn decode_response(bytes: &[u8], request: BatchRequest) -> Result<(u64, u64, &[u
             return Err(format!("resident batch refused (status={status}); session ended").into());
         }
     }
-    let expected: usize =
-        request.ranges[..request.count].iter().map(|range| range.length as usize).sum();
+    let expected: usize = if request.operation == Operation::Explain {
+        diagnostic::BYTES
+    } else {
+        request.ranges[..request.count].iter().map(|range| range.length as usize).sum()
+    };
     if length != expected
         || (request.operation == Operation::Hello && token != 0)
         || (request.operation == Operation::Bind && token == 0)
-        || (request.operation == Operation::Sample && token != request.token)
+        || (matches!(request.operation, Operation::Sample | Operation::Explain)
+            && token != request.token)
     {
         return Err("response token or data length mismatch".into());
     }
@@ -361,6 +430,44 @@ mod tests {
 
     use std::{cell::RefCell, rc::Rc};
     use svmvisor_card_abi::batch::REQUEST_BYTES;
+
+    struct CapabilityTransport {
+        inner: FakeTransport,
+        queries: Rc<RefCell<usize>>,
+        reply: Result<u64, String>,
+    }
+
+    impl Exchange for CapabilityTransport {
+        fn exchange(
+            &mut self,
+            bytes: &[u8; REQUEST_BYTES],
+            deadline: Instant,
+        ) -> Result<Vec<u8>, String> {
+            let request = BatchRequest::decode(bytes).unwrap();
+            if request.operation == Operation::Explain {
+                // Framing is valid but the payload names the wrong root and paging profile.
+                let data = diagnostic::DiagnosticObservation::EMPTY.encode().unwrap();
+                let mut output = [0; MAX_RESPONSE_BYTES];
+                let length = batch::encode_response(
+                    request,
+                    7,
+                    request.token,
+                    Status::Success,
+                    &data,
+                    &mut output,
+                )
+                .unwrap();
+                return Ok(output[..length].to_vec());
+            }
+            self.inner.exchange(bytes, deadline)
+        }
+
+        fn capabilities(&mut self, session: u64, _: Instant) -> Result<u64, String> {
+            assert_eq!(session, 1);
+            *self.queries.borrow_mut() += 1;
+            self.reply.clone()
+        }
+    }
 
     struct ContextTransport {
         inner: FakeTransport,
@@ -396,6 +503,90 @@ mod tests {
             cpu_slot: 3,
             page1gb: true,
         }
+    }
+
+    #[test]
+    fn capabilities_are_lazy_cached_budgeted_and_do_not_advance_batch_sequences() {
+        for supported in [false, true] {
+            let queries = Rc::new(RefCell::new(0));
+            let mut bridge = ReadBridge::with_transport(
+                Box::new(CapabilityTransport {
+                    inner: FakeTransport {
+                        calls: Rc::new(RefCell::new(Vec::new())),
+                        corrupt: None,
+                    },
+                    queries: queries.clone(),
+                    reply: Ok(if supported { local::CAP_DIAGNOSTIC } else { 0 }),
+                }),
+                1,
+                3,
+                None,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            assert_eq!(*queries.borrow(), 0);
+            assert_eq!(bridge.calls, 1);
+            assert_eq!(bridge.supports_diagnostics(), Ok(supported));
+            assert_eq!(bridge.supports_diagnostics(), Ok(supported));
+            assert_eq!(bridge.calls, 2);
+            assert_eq!(bridge.sequence, 1);
+            assert_eq!(*queries.borrow(), 1);
+            bridge.read(0x1000, &mut [0; 8]).unwrap();
+            assert_eq!(bridge.sequence, 2);
+            assert_eq!(bridge.supports_diagnostics(), Ok(supported));
+            assert!(bridge.read(0x1000, &mut [0; 8]).is_err());
+        }
+    }
+
+    #[test]
+    fn capability_query_failures_poison_the_session_without_retry() {
+        for limit in [1, 20] {
+            let queries = Rc::new(RefCell::new(0));
+            let mut bridge = ReadBridge::with_transport(
+                Box::new(CapabilityTransport {
+                    inner: FakeTransport {
+                        calls: Rc::new(RefCell::new(Vec::new())),
+                        corrupt: None,
+                    },
+                    queries: queries.clone(),
+                    reply: Err("refused".into()),
+                }),
+                1,
+                limit,
+                None,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            assert!(bridge.supports_diagnostics().is_err());
+            assert!(bridge.failed());
+            assert!(bridge.supports_diagnostics().is_err());
+            assert_eq!(*queries.borrow(), usize::from(limit > 1));
+        }
+    }
+
+    #[test]
+    fn inconsistent_diagnostic_evidence_poisoning_survives_valid_response_framing() {
+        let mut bridge = ReadBridge::with_transport(
+            Box::new(CapabilityTransport {
+                inner: FakeTransport { calls: Rc::new(RefCell::new(Vec::new())), corrupt: None },
+                queries: Rc::new(RefCell::new(0)),
+                reply: Ok(local::CAP_DIAGNOSTIC),
+            }),
+            1,
+            20,
+            None,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(bridge.supports_diagnostics().unwrap());
+        assert!(matches!(
+            bridge.explain(9, PagingConfig::new(48, true, true).unwrap(), 0x1000, 0x1234),
+            Err(Failure::Fatal(_))
+        ));
+        assert!(bridge.failed());
+        let calls = bridge.calls();
+        assert!(bridge.read(0x1000, &mut [0; 8]).is_err());
+        assert_eq!(bridge.calls(), calls);
     }
 
     #[test]
@@ -599,6 +790,7 @@ mod tests {
             sequence: 0,
             context_cpu: None,
             context_exit_sequence: 0,
+            capabilities: None,
             max_calls: 20,
             deadline: Some(deadline),
             phase_deadline: Some(deadline),
@@ -626,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn only_sample_read_and_binding_refusals_keep_the_session() {
+    fn only_sample_read_and_process_binding_refusals_keep_the_session() {
         let mut request = BatchRequest {
             operation: Operation::Sample,
             session: 11,
@@ -650,6 +842,10 @@ mod tests {
         for status in [Status::Identity, Status::Sequence, Status::Shape] {
             assert!(matches!(refusal(request, status), Failure::Fatal(_)), "{status:?}");
         }
+        request.operation = Operation::Explain;
+        request.ranges[0].length = 1;
+        assert_eq!(refusal(request, Status::Binding), Failure::Unbound);
+        assert!(matches!(refusal(request, Status::Read), Failure::Fatal(_)));
         request.operation = Operation::Physical;
         assert!(matches!(refusal(request, Status::Read), Failure::Fatal(_)));
     }

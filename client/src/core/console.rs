@@ -6,15 +6,19 @@
 use std::{
     fmt::{self, Write as _},
     io::{self, Write},
+    path::{Path, PathBuf},
     str::FromStr,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
-use svmvisor_live_reader::{ErrorKind, Module, Result};
+use svmvisor_live_reader::{
+    AddressExplanation, ErrorKind, MAX_REQUEST_RANGES, Module, Result,
+    capture::{CaptureLimits, CaptureRegion},
+};
 
-use crate::process::Process;
+use crate::{capture, process::Process};
 
 /// Bytes `dump` shows when no length is given.
 const DUMP_BYTES: usize = 64;
@@ -42,17 +46,23 @@ const HELP: &str = "\
   read <address> [type]        read one value: u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 (default u64)
   dump <address> [length]      hex dump, length in bytes as decimal or 0x-hex (default 64)
   watch <address> [type] [ms]  print one value every 500 ms, or every `ms`, until Enter
+  watchmany <type> <ms> <addresses...>  watch up to eight values in one batch per tick
+  pte <address>               explain the address translation, including failed entries
+  capture <address> <length> <directory>  save bytes and a manifest of unreadable gaps
   help, quit
   Addresses: 0x7ff6a0001000, or module[+offset] such as client.dll+0x40.";
 
 /// One line typed at the prompt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     Help,
     Modules,
     Read(u64, Kind),
     Dump(u64, usize),
     Watch(u64, Kind, Duration),
+    WatchMany(Vec<u64>, Kind, Duration),
+    Pte(u64),
+    Capture(u64, usize, PathBuf),
     Quit,
 }
 
@@ -75,14 +85,54 @@ impl Command {
                     rest.get(1).map_or(Ok(WATCH_INTERVAL), |text| interval_millis(text))?;
                 Self::Watch(address, kind, interval)
             }
+            ["watchmany", kind, interval, addresses @ ..]
+                if (1..=MAX_REQUEST_RANGES).contains(&addresses.len()) =>
+            {
+                Self::WatchMany(
+                    addresses
+                        .iter()
+                        .map(|address| locate(address, modules))
+                        .collect::<Result<_, _>>()?,
+                    value_kind(Some(kind))?,
+                    interval_millis(interval)?,
+                )
+            }
+            ["pte", address] => Self::Pte(locate(address, modules)?),
+            ["capture", address, length, directory @ ..] if !directory.is_empty() => Self::Capture(
+                locate(address, modules)?,
+                byte_length(length, CaptureLimits::default().max_bytes)?,
+                capture_directory(line)?,
+            ),
             ["dump", address, rest @ ..] if rest.len() <= 1 => {
-                let length = rest.first().map_or(Ok(DUMP_BYTES), |length| dump_length(length))?;
+                let length = rest
+                    .first()
+                    .map_or(Ok(DUMP_BYTES), |length| byte_length(length, MAX_DUMP_BYTES))?;
                 Self::Dump(locate(address, modules)?, length)
             }
             _ => return Err(format!("Cannot run `{}`; type help.", line.trim())),
         };
         Ok(Some(command))
     }
+}
+
+/// Keep the path's interior whitespace exactly as entered, with optional surrounding quotes.
+fn capture_directory(line: &str) -> Result<PathBuf, String> {
+    let mut remainder = line;
+    for _ in 0..3 {
+        remainder = remainder.trim_start();
+        let end =
+            remainder.find(char::is_whitespace).ok_or("Capture needs a new output directory.")?;
+        remainder = &remainder[end..];
+    }
+    let path = remainder.trim();
+    let path = match path.strip_prefix('"') {
+        Some(quoted) => quoted.strip_suffix('"').ok_or("Capture path has an unmatched quote.")?,
+        None => path,
+    };
+    if path.trim().is_empty() || path.contains('"') {
+        return Err("Capture needs a path with balanced optional surrounding quotes.".into());
+    }
+    Ok(path.into())
 }
 
 /// A value type a `read` or `watch` decodes, little-endian.
@@ -154,15 +204,9 @@ impl FromStr for Kind {
 /// reported and the prompt continues; the process exiting or the session failing ends it and is
 /// returned.
 pub fn run(process: &mut Process) -> Result<()> {
-    let mut modules = match process.modules() {
-        Ok(modules) => modules,
-        Err(error) if is_fatal(error.kind()) => return Err(error),
-        Err(error) => {
-            println!("  modules unavailable: {error}");
-            Vec::new()
-        }
-    };
-    println!("{} modules loaded. Type help for commands.", modules.len());
+    let mut modules = Vec::new();
+    let mut modules_loaded = false;
+    println!("Type help for commands. Module names load on first use; `modules` refreshes them.");
     loop {
         print!("svmvisor> ");
         // A prompt that fails to flush still reads the line.
@@ -170,6 +214,19 @@ pub fn run(process: &mut Process) -> Result<()> {
         let mut line = String::new();
         if io::stdin().read_line(&mut line).map_or(true, |read| read == 0) {
             return Ok(());
+        }
+        if !modules_loaded && needs_modules(&line) {
+            match process.modules() {
+                Ok(listed) => {
+                    modules = listed;
+                    modules_loaded = true;
+                }
+                Err(error) if is_fatal(error.kind()) => return Err(error),
+                Err(error) => {
+                    println!("  modules unavailable: {error}");
+                    continue;
+                }
+            }
         }
         let command = match Command::parse(&line, &modules) {
             Ok(Some(command)) => command,
@@ -186,6 +243,7 @@ pub fn run(process: &mut Process) -> Result<()> {
             }
             Command::Modules => process.modules().map(|listed| {
                 modules = listed;
+                modules_loaded = true;
                 for module in &modules {
                     println!("  {:<32} 0x{:016X}  0x{:X}", module.name, module.base, module.size);
                 }
@@ -198,10 +256,23 @@ pub fn run(process: &mut Process) -> Result<()> {
                 })
             }
             Command::Dump(address, length) => {
-                process.read_bytes(address, length).map(|bytes| print!("{}", dump(address, &bytes)))
+                let region = CaptureRegion { address, length };
+                process.capture(&[region], CaptureLimits::default()).map(|observation| {
+                    match capture::dump(&observation) {
+                        Ok(text) => print!("{text}"),
+                        Err(error) => println!("  could not display capture: {error}"),
+                    }
+                })
             }
             Command::Watch(address, kind, interval) => {
-                watch(process, address, kind, interval, &modules)
+                watch(process, &[address], kind, interval, &modules)
+            }
+            Command::WatchMany(addresses, kind, interval) => {
+                watch(process, &addresses, kind, interval, &modules)
+            }
+            Command::Pte(address) => explain(process, address),
+            Command::Capture(address, length, directory) => {
+                save_capture(process, address, length, &directory)
             }
             Command::Quit => return Ok(()),
         };
@@ -213,18 +284,80 @@ pub fn run(process: &mut Process) -> Result<()> {
     }
 }
 
-/// Reads `address` every `interval`, one line per sample, until Enter is pressed. A sample that
+fn explain(process: &mut Process, address: u64) -> Result<()> {
+    let explanation = process.explain_address(address)?;
+    print!("{}", describe_walk(&explanation));
+    Ok(())
+}
+
+fn describe_walk(explanation: &AddressExplanation) -> String {
+    let walk = &explanation.walk;
+    let mut text = format!(
+        "  PID {} created={} VA={:#x} root={:#x}\n",
+        explanation.pid, explanation.created, walk.va, walk.root_pa
+    );
+    for entry in walk.entries.iter().flatten() {
+        let raw = entry.raw.map_or_else(|| "unreadable".into(), |raw| format!("{raw:#018x}"));
+        writeln!(
+            text,
+            "  {:?}[{}] entry PA={:#x} raw={raw}",
+            entry.level, entry.index, entry.entry_pa
+        )
+        .unwrap();
+    }
+    match walk.result {
+        Ok(mapping) => writeln!(
+            text,
+            "  PA={:#x}, page={} bytes, remaining={} bytes",
+            mapping.pa(),
+            mapping.page_bytes(),
+            mapping.contiguous_bytes()
+        )
+        .unwrap(),
+        Err(error) => writeln!(text, "  translation stopped: {error:?}").unwrap(),
+    }
+    text.push_str("  Observed entries; mapping and bytes can change while Windows runs.\n");
+    text
+}
+
+fn save_capture(
+    process: &mut Process,
+    address: u64,
+    length: usize,
+    directory: &Path,
+) -> Result<()> {
+    match directory.try_exists() {
+        Ok(false) => {}
+        Ok(true) => {
+            println!("  choose a new capture directory; {} already exists", directory.display());
+            return Ok(());
+        }
+        Err(error) => {
+            println!("  could not inspect capture directory: {error}");
+            return Ok(());
+        }
+    }
+    let observation =
+        process.capture(&[CaptureRegion { address, length }], CaptureLimits::default())?;
+    match capture::export(&observation, directory) {
+        Ok(()) => println!("  capture saved in {}", directory.display()),
+        Err(error) => println!("  could not save capture: {error}"),
+    }
+    Ok(())
+}
+
+/// Reads the addresses in one batch every `interval`, until Enter is pressed. A sample that
 /// cannot be read is reported as its own line and the watch continues; a fatal error ends it.
 fn watch(
     process: &mut Process,
-    address: u64,
+    addresses: &[u64],
     kind: Kind,
     interval: Duration,
     modules: &[Module],
 ) -> Result<()> {
     println!(
         "  watching {} as {kind} every {} ms; press Enter to stop.",
-        describe(address, modules),
+        addresses.iter().map(|&address| describe(address, modules)).collect::<Vec<_>>().join(", "),
         interval.as_millis()
     );
     let (stop, stopped) = mpsc::channel();
@@ -235,13 +368,26 @@ fn watch(
     let started = Instant::now();
     let mut next = started;
     let mut number = 0u64;
-    let mut bytes = [0; 8];
-    let bytes = &mut bytes[..kind.bytes()];
+    let mut bytes = [[0; 8]; MAX_REQUEST_RANGES];
+    let mut reads: Vec<_> = addresses
+        .iter()
+        .copied()
+        .zip(bytes.iter_mut())
+        .map(|(address, buffer)| (address, &mut buffer[..kind.bytes()]))
+        .collect();
     loop {
+        // A completed stop request must not cause another guest read.
+        if stopped.try_recv() != Err(mpsc::TryRecvError::Empty) {
+            return Ok(());
+        }
         number += 1;
         let read_started = Instant::now();
-        let value = match process.read_into(address, bytes) {
-            Ok(()) => kind.format(bytes),
+        let calls_before = process.svm().calls();
+        let hypercalls_before = process.svm().hypercalls();
+        let value = match process.read_batch(&mut reads) {
+            Ok(()) => {
+                reads.iter().map(|(_, bytes)| kind.format(bytes)).collect::<Vec<_>>().join(" | ")
+            }
             Err(error) if is_fatal(error.kind()) => {
                 println!();
                 return Err(error);
@@ -249,7 +395,17 @@ fn watch(
             Err(error) => format!("unreadable: {error}"),
         };
         let read = read_started.elapsed();
-        println!("{}", sample_line(number, started.elapsed(), &value, read));
+        let calls = process.svm().calls().saturating_sub(calls_before);
+        let hypercalls = process
+            .svm()
+            .hypercalls()
+            .zip(hypercalls_before)
+            .map(|(after, before)| after.saturating_sub(before));
+        let cost = hypercalls.map_or_else(
+            || format!("{calls} requests"),
+            |exits| format!("{calls} requests, {exits} reader exits"),
+        );
+        println!("{}  [{cost}]", sample_line(number, started.elapsed(), &value, read));
         // The wait until the next sample is also the wait for Enter.
         next = next_sample(next, interval, Instant::now());
         match stopped.recv_timeout(next.saturating_duration_since(Instant::now())) {
@@ -257,6 +413,22 @@ fn watch(
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
+}
+
+/// Numeric commands do not need a loader-list walk. Symbol names load only when requested.
+fn needs_modules(line: &str) -> bool {
+    let words: Vec<_> = line.split_whitespace().collect();
+    let addresses = match words.as_slice() {
+        ["read" | "watch" | "dump" | "pte" | "capture", address, ..] => {
+            std::slice::from_ref(address)
+        }
+        ["watchmany", _, _, addresses @ ..] => addresses,
+        _ => return false,
+    };
+    addresses.iter().any(|address| {
+        let name = address.split_once('+').map_or(*address, |(name, _)| name);
+        name.contains('.') || hexadecimal(name).is_err()
+    })
 }
 
 /// Keep the normal cadence when on time; after an overrun, skip the backlog and
@@ -310,15 +482,15 @@ fn value_kind(name: Option<&str>) -> Result<Kind, String> {
     name.map_or(Ok(Kind::U64), |name| name.parse())
 }
 
-/// A `dump` length: decimal, or hexadecimal with `0x`, from 1 to [`MAX_DUMP_BYTES`].
-fn dump_length(value: &str) -> Result<usize, String> {
+/// A bounded byte length: decimal, or hexadecimal with `0x`.
+fn byte_length(value: &str, maximum: usize) -> Result<usize, String> {
     let length = match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
         Some(digits) => usize::from_str_radix(digits, 16).ok(),
         None => value.parse().ok(),
     };
     length
-        .filter(|length| (1..=MAX_DUMP_BYTES).contains(length))
-        .ok_or_else(|| format!("Length must be 1..={MAX_DUMP_BYTES} bytes."))
+        .filter(|length| (1..=maximum).contains(length))
+        .ok_or_else(|| format!("Length must be 1..={maximum} bytes."))
 }
 
 /// A `watch` interval in milliseconds, from 1 to [`MAX_WATCH_MILLIS`].
@@ -340,28 +512,6 @@ fn describe(address: u64, modules: &[Module]) -> String {
             || format!("0x{address:X}"),
             |(module, offset)| format!("{}+0x{offset:X}", module.name),
         )
-}
-
-/// Sixteen bytes a line: address, hexadecimal, then printable ASCII.
-fn dump(address: u64, bytes: &[u8]) -> String {
-    let mut text = String::with_capacity(bytes.len().div_ceil(16) * 86);
-    for (index, line) in bytes.chunks(16).enumerate() {
-        let line_address = address + index as u64 * 16;
-        // Writing to String cannot fail; no formatting intermediate needs allocation.
-        write!(text, "  {line_address:016X}  ").unwrap();
-        for byte in line {
-            write!(text, "{byte:02X} ").unwrap();
-        }
-        for _ in line.len()..16 {
-            text.push_str("   ");
-        }
-        text.push(' ');
-        for &byte in line {
-            text.push(if byte.is_ascii_graphic() || byte == b' ' { byte as char } else { '.' });
-        }
-        text.push('\n');
-    }
-    text
 }
 
 #[cfg(test)]
@@ -451,32 +601,79 @@ mod tests {
     }
 
     #[test]
-    fn dumps_show_sixteen_bytes_a_line_and_places_name_their_module() {
-        let bytes: Vec<u8> = (0..18).map(|index| b'A' + index).collect();
-        assert_eq!(
-            dump(0x1000, &bytes),
-            "  0000000000001000  41 42 43 44 45 46 47 48 49 4A 4B 4C 4D 4E 4F 50  ABCDEFGHIJKLMNOP\n\
-             \x20 0000000000001010  51 52                                            QR\n"
-        );
+    fn places_name_their_module() {
         assert_eq!(describe(0x7ffa_1000_0040, &modules()), "client.dll+0x40");
         assert_eq!(describe(0x1000, &modules()), "0x1000");
     }
 
     #[test]
-    fn dump_keeps_ascii_and_hex_columns_for_empty_partial_and_full_lines() {
-        assert!(dump(0, &[]).is_empty());
-        for length in [1, 15, 16, 17, MAX_DUMP_BYTES] {
-            let bytes: Vec<u8> = (0..length).map(|index| index as u8).collect();
-            let text = dump(0x1000, &bytes);
-            assert_eq!(text.lines().count(), length.div_ceil(16));
-            for (line, source) in text.lines().zip(bytes.chunks(16)) {
-                assert_eq!(line.len(), 69 + source.len());
-                for (index, byte) in source.iter().enumerate() {
-                    assert_eq!(&line[20 + index * 3..22 + index * 3], format!("{byte:02X}"));
-                    let ascii = if byte.is_ascii_graphic() || *byte == b' ' { *byte } else { b'.' };
-                    assert_eq!(line.as_bytes()[69 + index], ascii);
-                }
-            }
+    fn numeric_commands_skip_module_discovery() {
+        for line in [
+            "help",
+            "modules",
+            "quit",
+            "read 0x1000",
+            "dump 7ffa0000 64",
+            "watch 0x2000 u64 100",
+            "watchmany u32 100 1000 2000",
+            "pte 0x4000",
+            "capture 0x1000 4096 C:\\captures\\sample.one",
+        ] {
+            assert!(!needs_modules(line), "{line}");
+        }
+        for line in [
+            "read game.exe+0x10",
+            "watchmany u64 500 1000 client.dll+20",
+            "dump client.dll",
+            "pte game.exe",
+            "capture game.exe 4096 output",
+        ] {
+            assert!(needs_modules(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn batch_watch_and_forensic_commands_parse_bounded_inputs() {
+        let modules = modules();
+        assert_eq!(
+            Command::parse("watchmany u32 500 0x1000 client.dll+20", &modules),
+            Ok(Some(Command::WatchMany(vec![0x1000, 0x7ffa_1000_0020], Kind::U32, WATCH_INTERVAL)))
+        );
+        assert_eq!(Command::parse("pte 0x1000", &modules), Ok(Some(Command::Pte(0x1000))));
+        assert_eq!(
+            Command::parse("capture game.exe 4096 C:\\my captures\\first", &modules),
+            Ok(Some(Command::Capture(
+                0x7ff6_0000_0000,
+                4096,
+                PathBuf::from("C:\\my captures\\first")
+            )))
+        );
+        for line in [
+            "watchmany u64 10",
+            "watchmany u64 0 1000",
+            "watchmany u64 100 1 2 3 4 5 6 7 8 9",
+            "capture 1000 4096",
+            "pte 1000 extra",
+        ] {
+            assert!(Command::parse(line, &modules).is_err(), "{line}");
+        }
+    }
+
+    #[test]
+    fn capture_preserves_directory_whitespace_and_requires_balanced_quotes() {
+        for line in [
+            "capture 1000 4096 C:\\my  captures\\first",
+            "  capture\t1000 4096 \"C:\\my  captures\\first\"  ",
+        ] {
+            assert_eq!(
+                Command::parse(line, &[]),
+                Ok(Some(Command::Capture(0x1000, 4096, PathBuf::from("C:\\my  captures\\first"))))
+            );
+        }
+        for line in
+            ["capture 1000 4096 \"path", "capture 1000 4096 path\"", "capture 1000 4096 \"\""]
+        {
+            assert!(Command::parse(line, &[]).is_err(), "{line}");
         }
     }
 }

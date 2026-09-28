@@ -13,6 +13,7 @@
 pub mod batch;
 pub mod boot_options;
 pub mod context;
+pub mod diagnostic;
 pub mod endpoint;
 pub mod entry;
 pub mod envelope;

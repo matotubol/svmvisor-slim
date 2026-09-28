@@ -1,13 +1,24 @@
 //! Bind supplied kernel/PDB files to the recorded static layout evidence.
 
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use svmvisor_hypervisor::reader::process::{ProcessLayoutEvidence, ProcessProfile};
 
+use crate::config::Config;
+
 const EVIDENCE: &str = include_str!("../../hypervisor/profiles/ntoskrnl-26100.9457.json");
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
+const MAX_PE_OFFSET: u32 = 4096;
+const OPTIONAL_BYTES: usize = 240;
+const MAX_DEBUG_ENTRIES: u32 = 64;
+const MAX_CODEVIEW_BYTES: u32 = 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) struct KernelProfile {
@@ -87,13 +98,47 @@ pub fn load(kernel: &Path, pdb: &Path) -> Result<ProcessProfile, String> {
     Ok(load_kernel(kernel, pdb)?.process())
 }
 
+/// Select explicit local evidence, or keep the embedded profile when none was requested.
+/// This performs only local file reads; live kernel validation remains part of discovery.
+pub(crate) fn load_config(config: &Config) -> Result<KernelProfile, String> {
+    match &config.profile {
+        Some(path) => {
+            let evidence = read_evidence(path)?;
+            load_evidence(&config.kernel, &config.pdb, &evidence)
+        }
+        None => load_kernel(&config.kernel, &config.pdb),
+    }
+}
+
 pub(crate) fn load_kernel(kernel: &Path, pdb: &Path) -> Result<KernelProfile, String> {
     let evidence: Value = serde_json::from_str(EVIDENCE)
         .map_err(|error| format!("recorded kernel evidence is malformed: {error}"))?;
+    load_evidence(kernel, pdb, &evidence)
+}
+
+fn read_evidence(path: &Path) -> Result<Value, String> {
+    let file =
+        File::open(path).map_err(|error| format!("open profile {}: {error}", path.display()))?;
+    let metadata = file.metadata().map_err(|error| format!("inspect profile: {error}"))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_EVIDENCE_BYTES {
+        return Err("profile must be a nonempty regular file of at most 1 MiB".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_EVIDENCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read profile: {error}"))?;
+    if bytes.len() as u64 != metadata.len() {
+        return Err("profile changed length during reading".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|error| format!("profile JSON is malformed: {error}"))
+}
+
+fn load_evidence(kernel: &Path, pdb: &Path, evidence: &Value) -> Result<KernelProfile, String> {
     // The recorded symbols establish a field location, not a tagged storage encoding.
     // Require an already aligned stored root; do not infer which low bits are meaningful.
-    let profile = parse_kernel(&evidence)?;
-    verify_file(kernel, &evidence["image"], "kernel")?;
+    let profile = parse_kernel(evidence)?;
+    let mut image = verify_file(kernel, &evidence["image"], "kernel")?;
+    verify_image(&mut image, &profile)?;
     verify_file(pdb, &evidence["pdb"], "PDB")?;
     Ok(profile)
 }
@@ -188,6 +233,8 @@ fn parse(evidence: &Value, dtb_low_bits_mask: u16) -> Result<ProcessProfile, Str
         || evidence["image"]["codeview"]["guid"].as_str().is_none()
         || evidence["image"]["codeview"]["guid"] != evidence["pdb"]["guid"]
         || number(&evidence["image"]["codeview"]["age"])? != number(&evidence["pdb"]["dbi_age"])?
+        || number(&evidence["pdb"]["info_age"])? < number(&evidence["pdb"]["dbi_age"])?
+        || evidence["pdb"]["private_symbols_stripped"].as_bool() != Some(true)
         || number(&evidence["types"]["_LIST_ENTRY"]["bytes"])? != 16
         || number(&evidence["list_fields"]["Flink"]["offset"])? != 0
         || number(&evidence["list_fields"]["Blink"]["offset"])? != 8
@@ -225,7 +272,133 @@ fn number(value: &Value) -> Result<u32, String> {
         .ok_or_else(|| "recorded evidence is missing a bounded unsigned integer".into())
 }
 
-fn verify_file(path: &Path, identity: &Value, label: &str) -> Result<(), String> {
+/// Check the supplied PE itself, so editable evidence cannot merely claim a different identity.
+/// These file reads use raw section offsets; current-boot validation reads the mapped image.
+fn verify_image(file: &mut File, profile: &KernelProfile) -> Result<(), String> {
+    let expected = profile.identity();
+    let mut dos = [0; 64];
+    read_at(file, 0, &mut dos)?;
+    let offset = read_u32(&dos, 60);
+    if dos[..2] != *b"MZ" || !(64..=MAX_PE_OFFSET).contains(&offset) {
+        return Err("invalid kernel DOS header".into());
+    }
+    let mut nt = [0; 24 + OPTIONAL_BYTES];
+    read_at(file, u64::from(offset), &mut nt)?;
+    let optional = &nt[24..];
+    let count = read_u16(&nt, 6);
+    let headers_bytes = read_u32(optional, 60);
+    let sections_offset = u64::from(offset) + nt.len() as u64;
+    if nt[..4] != *b"PE\0\0"
+        || read_u16(&nt, 4) != expected.machine
+        || !(1..=96).contains(&count)
+        || read_u32(&nt, 8) != expected.timestamp
+        || usize::from(read_u16(&nt, 20)) != OPTIONAL_BYTES
+        || read_u16(optional, 0) != 0x020b
+        || read_u32(optional, 56) != expected.image_bytes
+        || read_u32(optional, 64) != expected.checksum
+        || read_u32(optional, 108) != 16
+        || headers_bytes > expected.image_bytes
+        || sections_offset + u64::from(count) * 40 > u64::from(headers_bytes)
+    {
+        return Err("kernel PE identity does not match the recorded profile".into());
+    }
+    let mut sections = vec![0; usize::from(count) * 40];
+    read_at(file, sections_offset, &mut sections)?;
+    let mut anchors = [false; 2];
+    for section in sections.chunks_exact(40) {
+        let rva = read_u32(section, 12);
+        let length = read_u32(section, 8);
+        let end = u64::from(rva) + u64::from(length);
+        if end > u64::from(expected.image_bytes) || (length != 0 && rva < headers_bytes) {
+            return Err("kernel section exceeds the recorded image extent".into());
+        }
+        for (index, &anchor) in profile.syscall_rvas().iter().enumerate() {
+            if anchor >= rva && u64::from(anchor) < end {
+                if anchors[index] || read_u32(section, 36) & 0x2000_0000 == 0 {
+                    return Err("kernel syscall anchor is not uniquely executable".into());
+                }
+                anchors[index] = true;
+            }
+        }
+    }
+    if anchors.contains(&false) {
+        return Err("kernel syscall anchor is outside executable sections".into());
+    }
+    let debug_rva = read_u32(optional, 160);
+    let debug_bytes = read_u32(optional, 164);
+    if debug_bytes == 0
+        || debug_bytes % 28 != 0
+        || debug_bytes / 28 > MAX_DEBUG_ENTRIES
+        || debug_rva.checked_add(debug_bytes).is_none_or(|end| end > expected.image_bytes)
+    {
+        return Err("invalid kernel debug directory size".into());
+    }
+    let debug_offset = image_offset(&sections, headers_bytes, debug_rva, debug_bytes)?;
+    let mut found = false;
+    for index in 0..debug_bytes / 28 {
+        let mut entry = [0; 28];
+        read_at(file, debug_offset + u64::from(index) * 28, &mut entry)?;
+        if read_u32(&entry, 12) != 2 {
+            continue;
+        }
+        let length = read_u32(&entry, 16);
+        if found || !(25..=MAX_CODEVIEW_BYTES).contains(&length) {
+            return Err("ambiguous or invalid kernel CodeView record".into());
+        }
+        let record_rva = read_u32(&entry, 20);
+        if record_rva.checked_add(length).is_none_or(|end| end > expected.image_bytes) {
+            return Err("kernel CodeView record exceeds image extent".into());
+        }
+        let record_offset = image_offset(&sections, headers_bytes, record_rva, length)?;
+        if record_offset != u64::from(read_u32(&entry, 24)) {
+            return Err("kernel CodeView file and image locations disagree".into());
+        }
+        let mut record = [0; MAX_CODEVIEW_BYTES as usize];
+        read_at(file, record_offset, &mut record[..length as usize])?;
+        if record[..4] != *b"RSDS"
+            || record[4..20] != expected.codeview_guid
+            || read_u32(&record, 20) != expected.codeview_age
+            || !record[24..length as usize].contains(&0)
+        {
+            return Err("kernel CodeView identity does not match the recorded profile".into());
+        }
+        found = true;
+    }
+    if !found {
+        return Err("kernel has no CodeView identity".into());
+    }
+    Ok(())
+}
+
+fn image_offset(sections: &[u8], headers_bytes: u32, rva: u32, length: u32) -> Result<u64, String> {
+    let mut found =
+        (u64::from(rva) + u64::from(length) <= u64::from(headers_bytes)).then_some(u64::from(rva));
+    for section in sections.chunks_exact(40) {
+        let Some(delta) = rva.checked_sub(read_u32(section, 12)) else { continue };
+        if u64::from(delta) + u64::from(length) <= u64::from(read_u32(section, 16)) {
+            if found.is_some() {
+                return Err("kernel debug data has ambiguous section mappings".into());
+            }
+            found = Some(u64::from(read_u32(section, 20)) + u64::from(delta));
+        }
+    }
+    found.ok_or_else(|| "kernel debug data is outside initialized image bytes".into())
+}
+
+fn read_at(file: &mut File, offset: u64, bytes: &mut [u8]) -> Result<(), String> {
+    file.seek(SeekFrom::Start(offset)).map_err(|error| format!("seek kernel PE: {error}"))?;
+    file.read_exact(bytes).map_err(|error| format!("read kernel PE: {error}"))
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+}
+
+fn verify_file(path: &Path, identity: &Value, label: &str) -> Result<File, String> {
     let expected_bytes = u64::from(number(&identity["file_bytes"])?);
     let expected_hash = identity["sha256"]
         .as_str()
@@ -253,14 +426,170 @@ fn verify_file(path: &Path, identity: &Value, label: &str) -> Result<(), String>
     if actual_hash != expected_hash.to_ascii_lowercase() {
         return Err(format!("{label} SHA-256 does not match the recorded kernel profile"));
     }
-    Ok(())
+    Ok(file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::{
+        env, fs,
+        path::PathBuf,
+        process,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use serde_json::json;
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct ProfileFiles {
+        directory: PathBuf,
+        evidence: Value,
+        image: Vec<u8>,
+    }
+
+    impl ProfileFiles {
+        fn new() -> Self {
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let directory =
+                env::temp_dir().join(format!("svmvisor-profile-{}-{sequence}", process::id()));
+            fs::create_dir(&directory).unwrap();
+            let mut evidence: Value = serde_json::from_str(EVIDENCE).unwrap();
+            evidence["image"]["codeview"]["guid"] = json!("00112233-4455-6677-8899-AABBCCDDEEFF");
+            evidence["pdb"]["guid"] = evidence["image"]["codeview"]["guid"].clone();
+            evidence["fields"]["CreateTime"]["offset"] = json!(0x2a0);
+            let identity = parse_kernel(&evidence).unwrap().identity;
+            let mut image = vec![0; 1024];
+            image[..2].copy_from_slice(b"MZ");
+            image[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+            image[0x80..0x84].copy_from_slice(b"PE\0\0");
+            image[0x84..0x86].copy_from_slice(&identity.machine.to_le_bytes());
+            image[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+            image[0x88..0x8c].copy_from_slice(&identity.timestamp.to_le_bytes());
+            image[0x94..0x96].copy_from_slice(&240u16.to_le_bytes());
+            image[0x98..0x9a].copy_from_slice(&0x020bu16.to_le_bytes());
+            for (offset, value) in [
+                (0xd0, identity.image_bytes),
+                (0xd4, 0x200),
+                (0xd8, identity.checksum),
+                (0x104, 16),
+                (0x138, 0x1000),
+                (0x13c, 28),
+                (0x190, identity.image_bytes - 0x1000),
+                (0x194, 0x1000),
+                (0x198, 0x200),
+                (0x19c, 0x200),
+                (0x1ac, 0x2000_0000),
+                (0x20c, 2),
+                (0x210, 25),
+                (0x214, 0x1040),
+                (0x218, 0x240),
+            ] {
+                image[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            image[0x240..0x244].copy_from_slice(b"RSDS");
+            image[0x244..0x254].copy_from_slice(&identity.codeview_guid);
+            image[0x254..0x258].copy_from_slice(&identity.codeview_age.to_le_bytes());
+            Self { directory, evidence, image }
+        }
+
+        fn save(&mut self) -> Config {
+            let kernel = self.directory.join("kernel.exe");
+            let pdb = self.directory.join("kernel.pdb");
+            let profile = self.directory.join("profile.json");
+            let pdb_bytes = b"caller-owned PDB fixture";
+            for (label, bytes) in [("image", self.image.as_slice()), ("pdb", pdb_bytes.as_slice())]
+            {
+                self.evidence[label]["file_bytes"] = json!(bytes.len());
+                let hash: String =
+                    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+                self.evidence[label]["sha256"] = json!(hash);
+            }
+            fs::write(&kernel, &self.image).unwrap();
+            fs::write(&pdb, pdb_bytes).unwrap();
+            fs::write(&profile, serde_json::to_vec(&self.evidence).unwrap()).unwrap();
+            Config::new(kernel, pdb).profile(profile)
+        }
+    }
+
+    impl Drop for ProfileFiles {
+        fn drop(&mut self) {
+            for name in ["kernel.exe", "kernel.pdb", "profile.json"] {
+                let _ = fs::remove_file(self.directory.join(name));
+            }
+            let _ = fs::remove_dir(&self.directory);
+        }
+    }
+
+    #[test]
+    fn external_profile_selects_its_verified_identity_and_offsets() {
+        let mut files = ProfileFiles::new();
+        let config = files.save();
+        let profile = load_config(&config).unwrap();
+        assert_eq!(profile.process().layout().create_time_offset, Some(0x2a0));
+        assert_ne!(
+            profile.identity().codeview_guid,
+            KernelProfile::fixture().identity().codeview_guid
+        );
+        assert!(load_config(&Config::new(&config.kernel, &config.pdb)).is_err());
+    }
+
+    #[test]
+    fn external_profile_cannot_claim_another_pe_identity_with_valid_hashes() {
+        for offset in [0x84, 0x88, 0xd0, 0xd8, 0x244, 0x254] {
+            let mut files = ProfileFiles::new();
+            files.image[offset] ^= 1;
+            let config = files.save();
+            let error = load_config(&config).unwrap_err();
+            assert!(error.contains("identity"), "offset {offset:x}: {error}");
+        }
+    }
+
+    #[test]
+    fn external_profile_preserves_hash_schema_and_layout_checks() {
+        let mut files = ProfileFiles::new();
+        let config = files.save();
+        fs::write(&config.pdb, b"same-size wrong fixture!").unwrap();
+        assert!(load_config(&config).unwrap_err().contains("SHA-256"));
+        for pointer in ["/schema_version", "/pdb/dbi_age", "/fields/ActiveProcessLinks/offset"] {
+            let mut files = ProfileFiles::new();
+            *files.evidence.pointer_mut(pointer).unwrap() = json!(u32::MAX);
+            assert!(load_config(&files.save()).is_err(), "accepted {pointer}");
+        }
+    }
+
+    #[test]
+    fn external_profile_rejects_malformed_and_oversized_evidence_without_fallback() {
+        let mut files = ProfileFiles::new();
+        let config = files.save();
+        let path = config.profile.as_ref().unwrap();
+        fs::write(path, b"{invalid JSON}").unwrap();
+        assert!(load_config(&config).unwrap_err().contains("JSON"));
+        let oversized = File::create(path).unwrap();
+        oversized.set_len(MAX_EVIDENCE_BYTES + 1).unwrap();
+        drop(oversized);
+        assert!(load_config(&config).unwrap_err().contains("1 MiB"));
+        fs::remove_file(path).unwrap();
+        assert!(load_config(&config).unwrap_err().contains("open profile"));
+    }
+
+    #[test]
+    fn external_profile_rejects_ambiguous_codeview_and_nonexecutable_anchors() {
+        let mut files = ProfileFiles::new();
+        files.image[0x13c..0x140].copy_from_slice(&56u32.to_le_bytes());
+        files.image.copy_within(0x200..0x21c, 0x21c);
+        assert!(load_config(&files.save()).unwrap_err().contains("ambiguous"));
+        let mut files = ProfileFiles::new();
+        files.image[0x1ac..0x1b0].fill(0);
+        assert!(load_config(&files.save()).unwrap_err().contains("executable"));
+        for offset in [0x138, 0x214] {
+            let mut files = ProfileFiles::new();
+            files.image[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(load_config(&files.save()).is_err());
+        }
+    }
 
     #[test]
     fn recorded_evidence_constructs_the_validated_profile() {

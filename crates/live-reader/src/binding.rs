@@ -3,7 +3,7 @@
 use svmvisor_card_abi::batch::BindingEvidence;
 use svmvisor_hypervisor::reader::{
     paging::PagingConfig,
-    process::{self, ProcessRequest},
+    process::{self, ProcessObservation, ProcessRequest},
 };
 
 use crate::{
@@ -17,6 +17,7 @@ pub(crate) struct Bound {
     pub token: u64,
     /// The creation time the token pins.
     pub created: u64,
+    pub identity: ProcessObservation,
     pub details: Details,
 }
 
@@ -67,5 +68,5 @@ pub(crate) fn discover(
             .ok_or("profile requires creation-time offset")?,
         root_mask: layout.dtb_low_bits_mask,
     })?;
-    Ok(Some(Bound { token, created, details }))
+    Ok(Some(Bound { token, created, identity, details }))
 }

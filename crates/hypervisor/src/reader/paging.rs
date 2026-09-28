@@ -70,6 +70,36 @@ impl Translation {
     }
 }
 
+/// One sampled page-table entry, including the entry which stopped a diagnostic walk.
+/// `raw` is absent only when its physical read failed; partially read bytes are discarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkEntry {
+    pub level: PagingLevel,
+    pub table_pa: u64,
+    pub entry_pa: u64,
+    pub index: u16,
+    pub raw: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PagingLevel {
+    Pml4,
+    Pdpt,
+    Pd,
+    Pt,
+}
+
+/// At most four separately sampled entries. A failed walk retains its last attempted level.
+/// The result has the same consistency and permission limitations as [`translate`].
+/// Nonpresent entries are raw software-owned bits, not decoded Windows memory-manager states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkTrace {
+    pub root_pa: u64,
+    pub va: u64,
+    pub entries: [Option<WalkEntry>; WALK_LEVELS as usize],
+    pub result: Result<Translation, PagingError>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PagingError {
     UnsupportedPhysicalWidth,
@@ -99,6 +129,33 @@ pub fn translate(
     va: u64,
     read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
 ) -> Result<Translation, PagingError> {
+    walk(config, root_pa, va, read, &mut |_| {})
+}
+
+/// Observe the same bounded walk as [`translate`], retaining raw entries and its failure.
+/// This adds no physical reads, retries, writes, page faults or target execution.
+pub fn trace(
+    config: PagingConfig,
+    root_pa: u64,
+    va: u64,
+    read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
+) -> WalkTrace {
+    let mut entries = [None; WALK_LEVELS as usize];
+    let mut count = 0;
+    let result = walk(config, root_pa, va, read, &mut |entry| {
+        entries[count] = Some(entry);
+        count += 1;
+    });
+    WalkTrace { root_pa, va, entries, result }
+}
+
+fn walk(
+    config: PagingConfig,
+    root_pa: u64,
+    va: u64,
+    read: &mut impl FnMut(u64, &mut [u8]) -> Result<(), PagingError>,
+    observe: &mut impl FnMut(WalkEntry),
+) -> Result<Translation, PagingError> {
     // Canonicality: 24593_3.44_APM_Vol2 p202. Validate before any callback.
     if !is_canonical_48(va) {
         return Err(PagingError::NoncanonicalAddress);
@@ -118,7 +175,21 @@ pub fn translate(
         let mut bytes = [0; ENTRY_BYTES];
         // Table bases are aligned and width-checked, so this addition cannot overflow
         // or leave the physical width, even for the final entry of the highest table.
-        read(table_pa + index * ENTRY_BYTES as u64, &mut bytes)?;
+        let entry_pa = table_pa + index * ENTRY_BYTES as u64;
+        let result = read(entry_pa, &mut bytes);
+        observe(WalkEntry {
+            level: match level {
+                3 => PagingLevel::Pml4,
+                2 => PagingLevel::Pdpt,
+                1 => PagingLevel::Pd,
+                _ => PagingLevel::Pt,
+            },
+            table_pa,
+            entry_pa,
+            index: index as u16,
+            raw: result.is_ok().then(|| u64::from_le_bytes(bytes)),
+        });
+        result?;
         let entry = u64::from_le_bytes(bytes);
         // All remaining bits are software-owned for P=0: 24593_3.44_APM_Vol2 p216.
         if entry & PRESENT == 0 {

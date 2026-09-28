@@ -24,7 +24,7 @@ results apply to the removed virtual interrupt/cache backend, not this revision.
 
 ## Layout
 
-- `client`: [Iced desktop client](client/README.md), process picker and hex memory viewer.
+- `client`: [Windows process picker and read-only console](client/README.md), with memory capture and address diagnostics.
 - `crates/hypervisor`: the single hypervisor crate. `firmware/` owns UEFI boot,
   `host/resident/` owns the runtime, and `reader/` owns bounded memory reads.
   Its UEFI binary embeds its audited resident image, linked with `payload.ld`.

@@ -22,6 +22,9 @@ const MAX_MODULES: usize = 4096;
 /// `UNICODE_STRING.Length` is in bytes; module names are far shorter than this.
 const MAX_NAME_BYTES: u16 = 1024;
 
+type Read<'a> = dyn FnMut(u64, &mut [u8]) -> Result<()> + 'a;
+type ReadBatch<'a> = dyn FnMut(&mut [(u64, &mut [u8])]) -> Result<()> + 'a;
+
 /// A loaded image (the executable or a DLL) in the target's address space.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Module {
@@ -48,16 +51,62 @@ impl Module {
     }
 }
 
-type Read<'a> = dyn FnMut(u64, &mut [u8]) -> Result<()> + 'a;
+struct Entry {
+    next: u64,
+    base: u64,
+    size: u32,
+    name_bytes: u16,
+    name_buffer: u64,
+}
 
-/// Every module in load order. `read` fills a buffer from a target virtual address.
-pub(crate) fn list(peb: u64, read: &mut Read<'_>) -> Result<Vec<Module>> {
+impl Entry {
+    fn from_bytes(bytes: &[u8; ENTRY_BYTES]) -> Self {
+        let field = |offset: usize| u64::from_le_bytes(bytes[offset..][..8].try_into().unwrap());
+        Self {
+            next: field(0),
+            base: field(ENTRY_DLL_BASE),
+            size: u32::from_le_bytes(bytes[ENTRY_SIZE_OF_IMAGE..][..4].try_into().unwrap()),
+            name_bytes: u16::from_le_bytes([
+                bytes[ENTRY_BASE_NAME_LENGTH],
+                bytes[ENTRY_BASE_NAME_LENGTH + 1],
+            ]),
+            name_buffer: field(ENTRY_BASE_NAME_BUFFER),
+        }
+    }
+}
+
+/// Every module in load order, batching each name with the following loader entry.
+pub(crate) fn list(peb: u64, read: &mut ReadBatch<'_>) -> Result<Vec<Module>> {
+    let (head, link) = start(peb, &mut |address, bytes| read(&mut [(address, bytes)]))?;
     let mut modules = Vec::new();
-    walk(peb, read, |entry, read| {
-        modules.push(Module { name: name(entry, read)?, base: entry.base, size: entry.size });
-        Ok(false)
-    })?;
-    Ok(modules)
+    if link == head {
+        return Ok(modules);
+    }
+    let mut bytes = [0; ENTRY_BYTES];
+    read(&mut [(link, &mut bytes)])?;
+    for index in 0..MAX_MODULES {
+        let entry = Entry::from_bytes(&bytes);
+        let mut name_bytes = name_buffer(&entry)?;
+        let last = entry.next == head;
+        if !last && index + 1 == MAX_MODULES {
+            return Err(changed());
+        }
+        // Only the current name and the next complete entry are read. No memory between them
+        // is sampled, and a failed batch cannot publish a partial module list.
+        match (name_bytes.is_empty(), last) {
+            (false, false) => {
+                read(&mut [(entry.name_buffer, &mut name_bytes), (entry.next, &mut bytes)])?;
+            }
+            (false, true) => read(&mut [(entry.name_buffer, &mut name_bytes)])?,
+            (true, false) => read(&mut [(entry.next, &mut bytes)])?,
+            (true, true) => {}
+        }
+        modules.push(Module { name: decode_name(&name_bytes), base: entry.base, size: entry.size });
+        if last {
+            return Ok(modules);
+        }
+    }
+    Err(changed())
 }
 
 /// The first module in load order, which is the executable.
@@ -89,58 +138,54 @@ pub(crate) fn find(peb: u64, wanted: &str, read: &mut Read<'_>) -> Result<Option
     Ok(found)
 }
 
-struct Entry {
-    base: u64,
-    size: u32,
-    name_bytes: u16,
-    name_buffer: u64,
-}
-
 /// Calls `visit` for each entry until it returns true or the list ends.
 fn walk(
     peb: u64,
     read: &mut Read<'_>,
     mut visit: impl FnMut(&Entry, &mut Read<'_>) -> Result<bool>,
 ) -> Result<()> {
-    let ldr = u64_at(read, peb.checked_add(PEB_LDR).ok_or_else(changed)?)?;
-    if ldr == 0 {
-        return Err(Error::new(ErrorKind::Unreadable, "the process loader has not started yet"));
-    }
-    let head = ldr.checked_add(LDR_LOAD_ORDER).ok_or_else(changed)?;
-    let mut link = u64_at(read, head)?;
+    let (head, mut link) = start(peb, read)?;
     for _ in 0..MAX_MODULES {
         if link == head {
             return Ok(());
         }
         let mut bytes = [0; ENTRY_BYTES];
         read(link, &mut bytes)?;
-        let field = |offset: usize| u64::from_le_bytes(bytes[offset..][..8].try_into().unwrap());
-        let entry = Entry {
-            base: field(ENTRY_DLL_BASE),
-            size: u32::from_le_bytes(bytes[ENTRY_SIZE_OF_IMAGE..][..4].try_into().unwrap()),
-            name_bytes: u16::from_le_bytes([
-                bytes[ENTRY_BASE_NAME_LENGTH],
-                bytes[ENTRY_BASE_NAME_LENGTH + 1],
-            ]),
-            name_buffer: field(ENTRY_BASE_NAME_BUFFER),
-        };
+        let entry = Entry::from_bytes(&bytes);
         if visit(&entry, read)? {
             return Ok(());
         }
-        link = field(0);
+        link = entry.next;
     }
     Err(changed())
 }
 
+fn start(peb: u64, read: &mut Read<'_>) -> Result<(u64, u64)> {
+    let ldr = u64_at(read, peb.checked_add(PEB_LDR).ok_or_else(changed)?)?;
+    if ldr == 0 {
+        return Err(Error::new(ErrorKind::Unreadable, "the process loader has not started yet"));
+    }
+    let head = ldr.checked_add(LDR_LOAD_ORDER).ok_or_else(changed)?;
+    Ok((head, u64_at(read, head)?))
+}
+
 fn name(entry: &Entry, read: &mut Read<'_>) -> Result<String> {
+    let mut bytes = name_buffer(entry)?;
+    read(entry.name_buffer, &mut bytes)?;
+    Ok(decode_name(&bytes))
+}
+
+fn name_buffer(entry: &Entry) -> Result<Vec<u8>> {
     if !entry.name_bytes.is_multiple_of(2) || entry.name_bytes > MAX_NAME_BYTES {
         return Err(changed());
     }
-    let mut bytes = vec![0; usize::from(entry.name_bytes)];
-    read(entry.name_buffer, &mut bytes)?;
+    Ok(vec![0; usize::from(entry.name_bytes)])
+}
+
+fn decode_name(bytes: &[u8]) -> String {
     let units: Vec<u16> =
         bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
-    Ok(String::from_utf16_lossy(&units))
+    String::from_utf16_lossy(&units)
 }
 
 fn u64_at(read: &mut Read<'_>, address: u64) -> Result<u64> {
@@ -213,6 +258,17 @@ mod tests {
         }
     }
 
+    fn batch_reader(
+        memory: &BTreeMap<u64, u8>,
+    ) -> impl FnMut(&mut [(u64, &mut [u8])]) -> Result<()> + '_ {
+        |reads| {
+            for (address, bytes) in reads {
+                reader(memory)(*address, bytes)?;
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn lists_modules_in_load_order_and_finds_them_by_name() {
         let memory = memory(&[
@@ -220,13 +276,91 @@ mod tests {
             ("ntdll.dll", 0x7ffb_0000_0000, 0x1f_0000),
             ("client.dll", 0x7ffa_1000_0000, 0x200_0000),
         ]);
-        let modules = list(PEB, &mut reader(&memory)).unwrap();
+        let modules = list(PEB, &mut batch_reader(&memory)).unwrap();
         let names: Vec<_> = modules.iter().map(|module| module.name.as_str()).collect();
         assert_eq!(names, ["malware.exe", "ntdll.dll", "client.dll"]);
         assert_eq!(first(PEB, &mut reader(&memory)).unwrap().unwrap(), modules[0]);
         let client = find(PEB, "CLIENT.dll", &mut reader(&memory)).unwrap().unwrap();
         assert_eq!((client.base, client.size), (0x7ffa_1000_0000, 0x200_0000));
         assert_eq!(find(PEB, "server.dll", &mut reader(&memory)).unwrap(), None);
+    }
+
+    #[test]
+    fn full_list_batches_exact_names_with_the_next_entry() {
+        let memory =
+            memory(&[("a.dll", 0x1_0000, 1), ("b.dll", 0x2_0000, 2), ("c.dll", 0x3_0000, 3)]);
+        let mut requests: Vec<Vec<(u64, usize)>> = Vec::new();
+        let modules = list(PEB, &mut |reads| {
+            requests.push(reads.iter().map(|(address, bytes)| (*address, bytes.len())).collect());
+            batch_reader(&memory)(reads)
+        })
+        .unwrap();
+        let expected: Vec<Vec<(u64, usize)>> = vec![
+            vec![(PEB + PEB_LDR, 8)],
+            vec![(PEB + 0x100 + LDR_LOAD_ORDER, 8)],
+            vec![(PEB + 0x1000, ENTRY_BYTES)],
+            vec![(PEB + 0x1080, 10), (PEB + 0x1100, ENTRY_BYTES)],
+            vec![(PEB + 0x1180, 10), (PEB + 0x1200, ENTRY_BYTES)],
+            vec![(PEB + 0x1280, 10)],
+        ];
+        assert_eq!(requests, expected);
+        assert_eq!(requests.len(), modules.len() + 3);
+    }
+
+    #[test]
+    fn empty_lists_and_names_do_not_add_requests() {
+        for (source, expected_requests) in [(vec![], 2), (vec![("", 0x1_0000, 1)], 3)] {
+            let memory = memory(&source);
+            let mut requests = 0;
+            let modules = list(PEB, &mut |reads| {
+                requests += 1;
+                assert!(reads.iter().all(|(_, bytes)| !bytes.is_empty()));
+                batch_reader(&memory)(reads)
+            })
+            .unwrap();
+            assert_eq!(modules.len(), source.len());
+            assert_eq!(requests, expected_requests);
+        }
+    }
+
+    #[test]
+    fn malformed_pipelined_names_stop_before_another_request() {
+        for length in [1u16, MAX_NAME_BYTES + 2] {
+            let mut memory = memory(&[("a.dll", 0x1_0000, 1), ("b.dll", 0x2_0000, 2)]);
+            for (offset, byte) in length.to_le_bytes().into_iter().enumerate() {
+                memory.insert(PEB + 0x1100 + ENTRY_BASE_NAME_LENGTH as u64 + offset as u64, byte);
+            }
+            let mut requests = 0;
+            let error = list(PEB, &mut |reads| {
+                requests += 1;
+                batch_reader(&memory)(reads)
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unreadable);
+            assert_eq!(requests, 4);
+        }
+    }
+
+    #[test]
+    fn a_failed_name_or_next_entry_discards_the_whole_list() {
+        let memory =
+            memory(&[("a.dll", 0x1_0000, 1), ("b.dll", 0x2_0000, 2), ("c.dll", 0x3_0000, 3)]);
+        for failed_range in 0..2 {
+            let mut requests = 0;
+            let error = list(PEB, &mut |reads| {
+                requests += 1;
+                for (index, (address, bytes)) in reads.iter_mut().enumerate() {
+                    if requests == 5 && index == failed_range {
+                        return Err(Error::new(ErrorKind::Unreadable, "pipeline read failed"));
+                    }
+                    reader(&memory)(*address, bytes)?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unreadable);
+            assert_eq!(requests, 5);
+        }
     }
 
     #[test]
@@ -252,8 +386,14 @@ mod tests {
         for (offset, byte) in entry.to_le_bytes().into_iter().enumerate() {
             memory.insert(entry + offset as u64, byte);
         }
-        let error = list(PEB, &mut reader(&memory)).unwrap_err();
+        let error = list(PEB, &mut batch_reader(&memory)).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unreadable);
+    }
+
+    #[test]
+    fn a_complete_list_can_reach_the_module_limit() {
+        let memory = memory(&vec![("", 0x1_0000, 1); MAX_MODULES]);
+        assert_eq!(list(PEB, &mut batch_reader(&memory)).unwrap().len(), MAX_MODULES);
     }
 
     #[test]
@@ -273,12 +413,13 @@ mod tests {
 
     #[test]
     fn overflowing_loader_pointers_never_issue_a_wrapped_read() {
-        let error = list(u64::MAX, &mut |_, _| panic!("invalid PEB must not be read")).unwrap_err();
+        let error = list(u64::MAX, &mut |_| panic!("invalid PEB must not be read")).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unreadable);
         let mut addresses = Vec::new();
-        let error = list(PEB, &mut |address, bytes| {
-            addresses.push(address);
-            bytes.copy_from_slice(&u64::MAX.to_le_bytes());
+        let error = list(PEB, &mut |reads| {
+            assert_eq!(reads.len(), 1);
+            addresses.push(reads[0].0);
+            reads[0].1.copy_from_slice(&u64::MAX.to_le_bytes());
             Ok(())
         })
         .unwrap_err();

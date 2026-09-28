@@ -1,6 +1,8 @@
 //! Synthetic memory images exercise only the public passive translator.
 
-use svmvisor_hypervisor::reader::paging::{self, PagingConfig, PagingError, Translation};
+use svmvisor_hypervisor::reader::paging::{
+    self, PagingConfig, PagingError, PagingLevel, Translation, WalkTrace,
+};
 
 struct Image {
     bytes: Vec<u8>,
@@ -41,6 +43,18 @@ impl Image {
             Ok(())
         })
     }
+
+    fn trace(&mut self, va: u64) -> WalkTrace {
+        paging::trace(PagingConfig::new(48, true, true).unwrap(), 0x1000, va, &mut |pa, bytes| {
+            self.reads.push(pa);
+            let source = self
+                .bytes
+                .get(pa as usize..pa as usize + bytes.len())
+                .ok_or(PagingError::PhysicalRead)?;
+            bytes.copy_from_slice(source);
+            Ok(())
+        })
+    }
 }
 
 #[test]
@@ -51,6 +65,104 @@ fn four_kbyte_leaf_uses_four_little_endian_reads() {
     assert_eq!(translation.page_bytes(), 0x1000);
     assert_eq!(translation.contiguous_bytes(), 0xedd);
     assert_eq!(image.reads, [0x1000, 0x2000, 0x3000, 0x4000]);
+}
+
+#[test]
+fn trace_preserves_raw_nonpresent_entries_at_each_level() {
+    let levels = [PagingLevel::Pml4, PagingLevel::Pdpt, PagingLevel::Pd, PagingLevel::Pt];
+    for (index, pa) in [0x1000, 0x2000, 0x3000, 0x4000].into_iter().enumerate() {
+        let mut image = Image::new();
+        image.entry(pa, u64::MAX - 1);
+        let trace = image.trace(0x123);
+        assert_eq!(trace.root_pa, 0x1000);
+        assert_eq!(trace.va, 0x123);
+        assert_eq!(trace.result, Err(PagingError::NotPresent));
+        assert_eq!(image.reads.len(), index + 1);
+        let last = trace.entries[index].unwrap();
+        assert_eq!(last.level, levels[index]);
+        assert_eq!(last.table_pa, pa as u64);
+        assert_eq!(last.entry_pa, pa as u64);
+        assert_eq!(last.index, 0);
+        assert_eq!(last.raw, Some(u64::MAX - 1));
+        assert!(trace.entries[index + 1..].iter().all(Option::is_none));
+    }
+}
+
+#[test]
+fn trace_retains_large_leaves_without_adding_reads() {
+    for (entry_pa, entry, va, expected, page_bytes, level, count) in [
+        (0x4000, 0x8001, 0x123, 0x8123, 0x1000, PagingLevel::Pt, 4),
+        (0x3000, 0x20_1081, 0x1f_ffff, 0x3f_ffff, 0x20_0000, PagingLevel::Pd, 3),
+        (0x2000, 0x4000_1081, 0x3fff_ffff, 0x7fff_ffff, 0x4000_0000, PagingLevel::Pdpt, 2),
+    ] {
+        let mut image = Image::new();
+        image.entry(entry_pa, entry);
+        let translation = image.translate(va).unwrap();
+        let normal_reads = image.reads.clone();
+        image.reads.clear();
+        let trace = image.trace(va);
+        assert_eq!(trace.result, Ok(translation));
+        assert_eq!(translation.pa(), expected);
+        assert_eq!(translation.page_bytes(), page_bytes);
+        assert_eq!(image.reads, normal_reads);
+        assert_eq!(image.reads.len(), count);
+        assert_eq!(trace.entries[count - 1].unwrap().level, level);
+        assert_eq!(trace.entries[count - 1].unwrap().raw, Some(entry));
+        assert!(trace.entries[count..].iter().all(Option::is_none));
+    }
+}
+
+#[test]
+fn trace_discards_partial_physical_reads_and_retains_failed_level() {
+    let config = PagingConfig::new(48, true, true).unwrap();
+    let mut calls = 0;
+    let trace = paging::trace(config, 0x1000, 0x1000, &mut |pa, bytes| {
+        calls += 1;
+        if calls == 1 {
+            assert_eq!(pa, 0x1000);
+            bytes.copy_from_slice(&0x2001u64.to_le_bytes());
+            Ok(())
+        } else {
+            assert_eq!(pa, 0x2000);
+            bytes.fill(0xff);
+            Err(PagingError::PhysicalRead)
+        }
+    });
+    assert_eq!(calls, 2);
+    assert_eq!(trace.result, Err(PagingError::PhysicalRead));
+    assert_eq!(trace.entries[1].unwrap().level, PagingLevel::Pdpt);
+    assert_eq!(trace.entries[1].unwrap().raw, None);
+    assert_eq!(trace.entries[1].unwrap().entry_pa, 0x2000);
+    assert!(trace.entries[2..].iter().all(Option::is_none));
+}
+
+#[test]
+fn trace_invalid_inputs_do_not_read_memory() {
+    let config = PagingConfig::new(32, true, true).unwrap();
+    for (root, va, error) in [
+        (0x1000, 0x0000_8000_0000_0000, PagingError::NoncanonicalAddress),
+        (0x1001, 0, PagingError::MisalignedRoot),
+        (1 << 32, 0, PagingError::RootOutsidePhysicalWidth),
+    ] {
+        let trace = paging::trace(config, root, va, &mut |_, _| panic!("unexpected read"));
+        assert_eq!(trace.result, Err(error));
+        assert!(trace.entries.iter().all(Option::is_none));
+    }
+}
+
+#[test]
+fn trace_reports_reserved_entry_at_its_nonzero_index() {
+    let mut image = Image::new();
+    image.entry(0x3008, 0x20_2081);
+    let trace = image.trace(0x20_0000);
+    assert_eq!(trace.result, Err(PagingError::ReservedBitsSet));
+    let last = trace.entries[2].unwrap();
+    assert_eq!(last.level, PagingLevel::Pd);
+    assert_eq!(last.table_pa, 0x3000);
+    assert_eq!(last.entry_pa, 0x3008);
+    assert_eq!(last.index, 1);
+    assert_eq!(last.raw, Some(0x20_2081));
+    assert_eq!(image.reads, [0x1000, 0x2000, 0x3008]);
 }
 
 #[test]

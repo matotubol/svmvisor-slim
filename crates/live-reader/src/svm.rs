@@ -1,11 +1,17 @@
 //! The connection to the resident runtime and the process handles it hands out.
 
-use svmvisor_hypervisor::reader::{
-    paging::{PagingConfig, PagingError},
-    process::{MAX_PROCESS_NODES, ProcessRequest},
+use std::time::Duration;
+
+use svmvisor_hypervisor::{
+    memory::address::is_canonical_48,
+    reader::{
+        paging::{PagingConfig, PagingError},
+        process::{MAX_PROCESS_NODES, ProcessObservation, ProcessRequest},
+    },
 };
 
 use crate::{
+    address::{self, AddressError, AddressExplanation},
     binding::{self, Bound},
     bridge::{Failure, ReadBridge},
     config::Config,
@@ -53,6 +59,7 @@ struct Open {
     handle: ProcessHandle,
     token: u64,
     created: u64,
+    identity: ProcessObservation,
     details: Details,
 }
 
@@ -80,7 +87,7 @@ impl Svm {
     /// older svmvisor runtime can stop the machine. This call cannot detect either case.
     pub unsafe fn connect(config: Config) -> Result<Self> {
         let paging = check(&config)?;
-        let profile = profile::load_kernel(&config.kernel, &config.pdb)
+        let profile = profile::load_config(&config)
             .map_err(|message| Error::new(ErrorKind::Profile, message))?;
         let bridge = ReadBridge::start(
             config.cpu,
@@ -174,11 +181,11 @@ impl Svm {
         let found = binding::discover(context.paging, &self.profile, request, &mut self.bridge)
             .map_err(|message| self.discovery(message))?;
         self.bridge.finish_phase().map_err(|m| self.ended(m))?;
-        let Bound { token, created, details } = found
+        let Bound { token, created, identity, details } = found
             .ok_or_else(|| Error::new(ErrorKind::ProcessNotFound, format!("PID {pid} absent")))?;
         self.serial += 1;
         let handle = ProcessHandle { pid, serial: self.serial };
-        self.open = Some(Open { handle, token, created, details });
+        self.open = Some(Open { handle, token, created, identity, details });
         Ok(handle)
     }
 
@@ -187,6 +194,70 @@ impl Svm {
         if self.open.as_ref().is_some_and(|open| open.handle == handle) {
             self.open = None;
         }
+    }
+
+    /// Creation time recorded when this handle was opened. This observation issues no call.
+    pub fn process_created(&mut self, handle: ProcessHandle) -> Result<u64> {
+        Ok(self.opened(handle)?.created)
+    }
+
+    /// Observe the target's page-table walk without reading its mapped data or faulting pages in.
+    /// Mapping failures, including nonpresent raw entries, are retained in the returned report.
+    /// The process is revalidated before and after; physical transport failures end the session.
+    /// Supporting runtimes use one batch with three service opportunities. A capability query
+    /// is issued once on first use; older runtimes use at most 124 physical requests per walk.
+    /// Both paths use `read_timeout` and leave ordinary process-read costs unchanged.
+    pub fn explain_address(
+        &mut self,
+        handle: ProcessHandle,
+        address: u64,
+    ) -> Result<AddressExplanation> {
+        let open = self.opened(handle)?;
+        let identity = open.identity;
+        let created = open.created;
+        let token = open.token;
+        if !is_canonical_48(address) {
+            return Err(Error::new(ErrorKind::InvalidArgument, "address is not canonical"));
+        }
+        let context = self.resolved()?;
+        self.bridge.begin_phase("explain", self.config.read_timeout).map_err(|m| self.ended(m))?;
+        let supported =
+            self.bridge.supports_diagnostics().map_err(|message| self.ended(message))?;
+        let walk = if supported {
+            self.bridge.explain(token, context.paging, identity.kernel_root_pa, address).map_err(
+                |failure| match failure {
+                    Failure::Unbound => {
+                        self.open = None;
+                        Error::new(
+                            ErrorKind::ProcessGone,
+                            format!("PID {} exited or changed identity", handle.pid),
+                        )
+                    }
+                    failure => self.ended(failure.to_string()),
+                },
+            )?
+        } else {
+            address::explain(
+                context.paging,
+                &self.profile,
+                context.kernel.kernel_root,
+                identity,
+                address,
+                &mut self.bridge,
+            )
+            .map_err(|error| match error {
+                AddressError::Backend(message) => self.ended(message),
+                AddressError::Identity(error) => {
+                    self.open = None;
+                    Error::new(
+                        ErrorKind::ProcessGone,
+                        format!("PID {} identity validation failed: {error:?}", handle.pid),
+                    )
+                }
+            })?
+        };
+        self.bridge.finish_phase().map_err(|m| self.ended(m))?;
+        Ok(AddressExplanation { pid: handle.pid, created, paging: context.paging, walk })
     }
 
     /// Like `ReadProcessMemory`: fills `buffer` from `address`. Any length is accepted; long
@@ -198,6 +269,20 @@ impl Svm {
         buffer: &mut [u8],
     ) -> Result<()> {
         self.read_batch(handle, &mut [(address, buffer)])
+    }
+
+    pub(crate) fn read_process_memory_bounded(
+        &mut self,
+        handle: ProcessHandle,
+        address: u64,
+        buffer: &mut [u8],
+        timeout: Duration,
+    ) -> Result<()> {
+        let original = self.config.read_timeout;
+        self.config.read_timeout = original.min(timeout);
+        let result = self.read_process_memory(handle, address, buffer);
+        self.config.read_timeout = original;
+        result
     }
 
     /// Reads one little-endian value, such as `u32`, `f32`, `u64` pointers or `[f32; 3]`.
@@ -257,11 +342,11 @@ impl Svm {
 
     /// Every module the loader lists, in load order: the executable first, then its DLLs.
     ///
-    /// Each entry costs a runtime request or two, so keep the list rather than calling this
-    /// before every read. A module unlinked from the loader's list is not included.
+    /// Full enumeration batches each name with the next loader entry. Keep the list rather
+    /// than calling this before every read. Unlinked modules are not included.
     pub fn modules(&mut self, handle: ProcessHandle) -> Result<Vec<Module>> {
         let peb = self.peb(handle)?;
-        modules::list(peb, &mut |address, buffer| self.read_process_memory(handle, address, buffer))
+        modules::list(peb, &mut |reads| self.read_batch(handle, reads))
     }
 
     /// The module named `name`, such as `client.dll`, ignoring ASCII case. Only the entries
@@ -368,7 +453,11 @@ impl Svm {
             },
         )
         .map_err(|error| {
-            self.discovery(format!("automatic context failed: {error}; backend={backend_error:?}"))
+            self.discovery(format!(
+                "automatic context failed for caller root {:#x}: {error}; \
+                 backend={backend_error:?}; a KPTI user root may lack the required kernel mappings",
+                candidate.kernel_root_pa
+            ))
         })?;
         Ok(Resolved {
             paging: validated.config(),
@@ -415,6 +504,7 @@ impl Svm {
     }
 
     fn ended(&mut self, message: impl Into<String>) -> Error {
+        self.bridge.end();
         self.open = None;
         Error::new(ErrorKind::SessionEnded, message)
     }

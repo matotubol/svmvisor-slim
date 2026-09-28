@@ -15,6 +15,7 @@ pub use self::{
     runtime::{config, connect},
 };
 
+pub mod capture;
 pub mod console;
 mod picker;
 mod process;

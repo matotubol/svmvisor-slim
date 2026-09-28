@@ -14,6 +14,8 @@ pub struct Error {
 pub enum ErrorKind {
     /// An argument or configuration value is out of range. Nothing was sent.
     InvalidArgument,
+    /// An operation reached its local work or time limit. The session remains usable.
+    LimitReached,
     /// The kernel/PDB files do not match the recorded profile. Nothing was sent.
     Profile,
     /// The runtime could not be reached or pinned. No session exists.

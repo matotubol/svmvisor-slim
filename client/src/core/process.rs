@@ -1,6 +1,9 @@
 //! One open process on its own runtime connection, read without passing handles around.
 
-use svmvisor_live_reader::{Module, Plain, ProcessEntry, ProcessHandle, Result, Svm};
+use svmvisor_live_reader::{
+    AddressExplanation, Module, Plain, ProcessEntry, ProcessHandle, Result, Svm,
+    capture::{self, CaptureLimits, CaptureObservation, CaptureRegion},
+};
 
 /// A process opened on a connection that it owns. Every read goes through the runtime, never
 /// through Windows.
@@ -77,6 +80,20 @@ impl Process {
     /// Batching unrelated reads is much faster than reading them one at a time.
     pub fn read_batch(&mut self, reads: &mut [(u64, &mut [u8])]) -> Result<()> {
         self.svm.read_batch(self.handle, reads)
+    }
+
+    /// Captures bounded page fragments, retaining unreadable spans as explicit evidence.
+    pub fn capture(
+        &mut self,
+        regions: &[CaptureRegion],
+        limits: CaptureLimits,
+    ) -> Result<CaptureObservation> {
+        capture::read(&mut self.svm, self.handle, regions, limits)
+    }
+
+    /// Returns the page-table entries and exact reason a translation stopped.
+    pub fn explain_address(&mut self, address: u64) -> Result<AddressExplanation> {
+        self.svm.explain_address(self.handle, address)
     }
 
     // Modules.

@@ -8,6 +8,7 @@ use svmvisor_hypervisor::reader::process::MAX_PROCESS_NODES;
 pub struct Config {
     pub(crate) kernel: PathBuf,
     pub(crate) pdb: PathBuf,
+    pub(crate) profile: Option<PathBuf>,
     pub(crate) cpu: u16,
     pub(crate) max_nodes: usize,
     pub(crate) max_calls: Option<u64>,
@@ -34,6 +35,7 @@ impl Config {
         Self {
             kernel: kernel.into(),
             pdb: pdb.into(),
+            profile: None,
             cpu: 0,
             max_nodes: MAX_PROCESS_NODES,
             max_calls: None,
@@ -43,6 +45,15 @@ impl Config {
             read_timeout: Duration::from_secs(10),
             context: None,
         }
+    }
+
+    /// Use JSON evidence generated from these exact kernel/PDB files by the profile extractor.
+    /// Without this setting the embedded kernel profile is used. Evidence is limited to 1 MiB;
+    /// its file hashes, identity, offsets and anchors are checked before starting a session.
+    /// The evidence's symbol extraction provenance remains the caller's responsibility.
+    pub fn profile(mut self, path: impl Into<PathBuf>) -> Self {
+        self.profile = Some(path.into());
+        self
     }
 
     /// Processor (group 0, 0..=31) the connecting thread is pinned to while connected.

@@ -13,6 +13,7 @@ pub const MAX_PROCESS_NODES: usize = 4096;
 pub const MAX_EPROCESS_BYTES: u32 = 16 * PAGE_BYTES as u32;
 const WORD_BYTES: u32 = size_of::<u64>() as u32;
 const LINK_BYTES: u32 = 2 * WORD_BYTES;
+const NODE_FIELD_BYTES: u32 = WORD_BYTES + LINK_BYTES;
 const MAX_FIELD_BYTES: u32 = 64;
 
 /// Structurally checked offsets; construction does not verify their Windows build provenance.
@@ -116,6 +117,45 @@ struct ImageReader<'a, F> {
 }
 
 impl<F: FnMut(u64, &mut [u8]) -> Result<(), PagingError>> ImageReader<'_, F> {
+    fn read_node(
+        &mut self,
+        layout: ProcessLayoutEvidence,
+        eprocess_va: u64,
+        previous: u64,
+    ) -> Result<(u64, u64), ProcessError> {
+        let links_va = eprocess_va + u64::from(layout.active_links_offset);
+        let adjacent = layout.pid_offset + WORD_BYTES == layout.active_links_offset
+            || layout.active_links_offset + LINK_BYTES == layout.pid_offset;
+        let mut pid = None;
+        let (forward, backward) = if adjacent {
+            // The checked profile proves these fields touch. Copy only PID and LIST_ENTRY,
+            // without intervening bytes or a cached translation across pages or nodes.
+            let start = layout.pid_offset.min(layout.active_links_offset);
+            let mut bytes = [0; NODE_FIELD_BYTES as usize];
+            self.read_exact(eprocess_va + u64::from(start), &mut bytes)?;
+            let word = |offset: u32| {
+                let index = (offset - start) as usize;
+                read_u64(&bytes[index..index + WORD_BYTES as usize])
+            };
+            pid = Some(word(layout.pid_offset));
+            let forward = word(layout.active_links_offset);
+            let backward = word(layout.active_links_offset + WORD_BYTES);
+            validate_pointer(forward, LINK_BYTES)?;
+            validate_pointer(backward, LINK_BYTES)?;
+            (forward, backward)
+        } else {
+            self.read_links(links_va)?
+        };
+        if backward != previous || forward == links_va {
+            return Err(ProcessError::CorruptLinks);
+        }
+        let pid = match pid {
+            Some(pid) => pid,
+            None => self.read_word(eprocess_va + u64::from(layout.pid_offset))?,
+        };
+        Ok((pid, forward))
+    }
+
     fn read_identity_links(
         &mut self,
         layout: ProcessLayoutEvidence,
@@ -225,10 +265,12 @@ impl From<ReadError> for ProcessError {
 /// retry occurs. A later read through an observed root requires the same stable image to relate
 /// its bytes to this observation; PID, object address, and root reuse are not prevented.
 ///
-/// At most `max_nodes` nodes (capped at `MAX_PROCESS_NODES`) are read. Each node needs two
-/// virtual reads, plus at most two reads for the matching PID. Head links need one read.
-/// Every field read is at most 16 bytes and can cross at most two mapped pages. There are
-/// no retries, allocations, process modifications, or live-memory acquisition operations.
+/// At most `max_nodes` nodes (capped at `MAX_PROCESS_NODES`) are read. Each node needs one
+/// virtual read when PID and active links are adjacent in either order, otherwise two reads.
+/// Matching PIDs need at most two more reads. Head links need one read. Every field read is
+/// at most 24 bytes and can cross at most two mapped pages. There are no retries, allocations,
+/// process modifications, or live-memory acquisition operations. Grouping adjacent fields
+/// reduces reads but does not provide an atomic snapshot of mutable source memory.
 pub fn find(
     config: PagingConfig,
     profile: ProcessProfile,
@@ -270,7 +312,7 @@ pub fn find(
 /// Inspect the complete circular list and copy every node into `nodes`, in list order,
 /// returning how many were copied. The link checks, bounds and caveats are those of `find`;
 /// `nodes.len()` (at most `MAX_PROCESS_NODES`) is the node limit. Duplicate PIDs are copied as
-/// found. Each node needs two virtual reads.
+/// found. Each node needs one virtual read for adjacent PID and active links, otherwise two.
 pub fn list(
     config: PagingConfig,
     profile: ProcessProfile,
@@ -312,11 +354,7 @@ fn walk<'a, F: FnMut(u64, &mut [u8]) -> Result<(), PagingError>>(
             .checked_sub(u64::from(layout.active_links_offset))
             .ok_or(ProcessError::InvalidPointer)?;
         validate_pointer(eprocess_va, layout.eprocess_bytes)?;
-        let (next, backward) = image.read_links(current)?;
-        if backward != previous || next == current {
-            return Err(ProcessError::CorruptLinks);
-        }
-        let pid = image.read_word(eprocess_va + u64::from(layout.pid_offset))?;
+        let (pid, next) = image.read_node(layout, eprocess_va, previous)?;
         visit(image, eprocess_va, pid)?;
         previous = current;
         current = next;

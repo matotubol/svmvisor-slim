@@ -239,6 +239,65 @@ fn ownership_requires_nonzero_session_and_same_address_space() {
 }
 
 #[test]
+fn capabilities_require_an_owned_idle_session_and_ignore_memory_buffers() {
+    let mut channel = LocalChannel::new();
+    let mut frame = GuestRegisters {
+        rcx: protocol::CAPABILITIES,
+        rdx: u64::MAX,
+        r8: u64::MAX,
+        r9: 0,
+        r10: 9,
+        ..GuestRegisters::default()
+    };
+    assert_eq!(channel.handle_without_memory(0x2000, &frame), Some((protocol::OWNER, 0)));
+    channel.owner = 0x2000;
+    channel.session = 9;
+    for (root, session) in [(0x4000, 9), (0x2000, 10), (0x2000, 0)] {
+        frame.r10 = session;
+        assert_eq!(channel.handle_without_memory(root, &frame), Some((protocol::OWNER, 0)));
+    }
+    frame.r10 = 9;
+    assert_eq!(
+        channel.handle_without_memory(0x2000, &frame),
+        Some((protocol::COMPLETE, protocol::CAP_DIAGNOSTIC))
+    );
+    assert_eq!((channel.owner, channel.session), (0x2000, 9));
+    channel.buffers = LocalBuffers::from_registers(&registers(9));
+    assert_eq!(channel.handle_without_memory(0x2000, &frame), Some((protocol::BUSY, 0)));
+    assert_eq!(channel.handle_without_memory(0x4000, &frame), Some((protocol::OWNER, 0)));
+    channel.clear();
+    assert_eq!(channel.handle_without_memory(0x2000, &frame), Some((protocol::OWNER, 0)));
+}
+
+#[test]
+fn immutable_page_size_capability_is_queried_once_across_session_changes() {
+    for supported in [false, true] {
+        let mut channel = LocalChannel::new();
+        let mut queries = 0;
+        for _ in 0..3 {
+            assert_eq!(
+                channel.page_1g(|| {
+                    queries += 1;
+                    supported
+                }),
+                supported
+            );
+            channel.clear();
+        }
+        assert_eq!(queries, 1);
+        channel.reset();
+        assert_eq!(
+            channel.page_1g(|| {
+                queries += 1;
+                supported
+            }),
+            supported
+        );
+        assert_eq!(queries, 2);
+    }
+}
+
+#[test]
 fn pending_request_cannot_be_stolen_and_idle_hello_invalidates_old_owner() {
     let mut channel = LocalChannel::new();
     channel.boot = 17;

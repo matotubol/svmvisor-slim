@@ -34,6 +34,7 @@ struct LocalChannel {
     buffers: Option<LocalBuffers>,
     steps: u32,
     last_progress: u64,
+    page_1g: Option<bool>,
 }
 
 impl LocalChannel {
@@ -46,11 +47,18 @@ impl LocalChannel {
             buffers: None,
             steps: 0,
             last_progress: 0,
+            page_1g: None,
         }
     }
 
     fn owns(&self, root: u64, session: u64) -> bool {
         self.owner == root && self.session == session && session != 0
+    }
+
+    fn page_1g(&mut self, query: impl FnOnce() -> bool) -> bool {
+        // Each relocated channel stays on one CPU. This hardware feature survives session
+        // changes; guest EFER and address-space observations are still captured per submit.
+        *self.page_1g.get_or_insert_with(query)
     }
 
     fn clear(&mut self) {
@@ -65,6 +73,7 @@ impl LocalChannel {
         self.clear();
         self.boot = 0;
         self.last_progress = 0;
+        self.page_1g = None;
     }
 
     fn expire(&mut self, exits: u64) {
@@ -82,6 +91,9 @@ impl LocalChannel {
         registers: &GuestRegisters,
     ) -> Option<(u64, u64)> {
         let status = match registers.rcx {
+            protocol::CAPABILITIES if !self.owns(root, registers.r10) => protocol::OWNER,
+            protocol::CAPABILITIES if self.buffers.is_some() => protocol::BUSY,
+            protocol::CAPABILITIES => return Some((protocol::COMPLETE, protocol::CAP_DIAGNOSTIC)),
             protocol::ABORT if self.owns(root, registers.r10) => {
                 self.clear();
                 protocol::COMPLETE
@@ -204,7 +216,7 @@ impl LocalChannel {
             lstar: vmcb.guest_lstar(),
             physical_bits: memory.width(),
             cpu_slot: state.slot as u32,
-            page1gb: page1gb_supported(),
+            page1gb: self.page_1g(page1gb_supported),
         };
         let bytes = observation.encode();
         if memory.write_user(buffers.response, &bytes).is_err() {
@@ -355,17 +367,22 @@ pub(super) unsafe fn handle(
         complete(vmcb, registers, next, (protocol::MEMORY, 0));
         return true;
     };
-    let Ok(config) = PagingConfig::new(memory.width(), vmcb.guest_efer() & (1 << 11) != 0, true)
-    else {
-        complete(vmcb, registers, next, (protocol::UNAVAILABLE, 0));
-        return true;
-    };
     if channel.boot == 0 {
         // SAFETY: RDTSC is supported by the admitted AMD64 runtime; this is correlation only.
         channel.boot = unsafe { _rdtsc() }.max(1);
     }
     let result = match registers.rcx {
-        protocol::SUBMIT => channel.submit(memory, root, registers, config),
+        protocol::SUBMIT => {
+            let Ok(config) = PagingConfig::new(
+                memory.width(),
+                vmcb.guest_efer() & (1 << 11) != 0,
+                channel.page_1g(page1gb_supported),
+            ) else {
+                complete(vmcb, registers, next, (protocol::UNAVAILABLE, 0));
+                return true;
+            };
+            channel.submit(memory, root, registers, config)
+        }
         protocol::STEP => channel.step(memory, root, registers),
         protocol::CONTEXT => channel.context(memory, root, registers, vmcb, state),
         _ => (protocol::INVALID, 0),

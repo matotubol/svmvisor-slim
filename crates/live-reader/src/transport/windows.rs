@@ -7,7 +7,7 @@ use svmvisor_card_abi::{
     local,
 };
 
-use crate::transport::{Exchange, complete, context_complete};
+use crate::transport::{Exchange, capabilities_complete, complete, context_complete};
 
 const PAGE_BYTES: usize = 4096;
 const ALLOCATION_BYTES: usize = 3 * PAGE_BYTES;
@@ -128,6 +128,17 @@ impl NativeTransport {
 impl Exchange for NativeTransport {
     fn hypercalls(&self) -> Option<u64> {
         Some(self.hypercalls.get())
+    }
+
+    fn capabilities(&mut self, session: u64, deadline: Instant) -> Result<u64, String> {
+        // SAFETY: pure query; this session and affinity belong to the constructing thread.
+        if unsafe { GetCurrentThreadId() } != self.thread_id || self.session != session {
+            return Err("local capabilities session or thread changed".into());
+        }
+        capabilities_complete(deadline, |operation| {
+            // SAFETY: established local ABI on the same pinned caller; no memory is accessed.
+            unsafe { self.call(operation) }
+        })
     }
 
     fn context(&mut self, session: u64, deadline: Instant) -> Result<Vec<u8>, String> {

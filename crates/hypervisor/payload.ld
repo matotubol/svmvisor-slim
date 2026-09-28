@@ -9,7 +9,8 @@ SECTIONS {
     .rodata : { *(.rodata .rodata.*) *(.srodata .srodata.*) }
     . = ALIGN(4096);
     data_start = .;
-    .data : { *(.data .data.*) *(.sdata .sdata.*) *(.got .got.*) }
+    /* Pack page-aligned maps before small state so a leading scalar cannot waste a page. */
+    .data : { *(SORT_BY_ALIGNMENT(.data.*)) *(.data) *(.sdata .sdata.*) *(.got .got.*) }
     /* A file-backed alignment byte makes the flat-image extent unambiguous. */
     .padding : { BYTE(0); . = ALIGN(4096); }
     image_load_end = .;

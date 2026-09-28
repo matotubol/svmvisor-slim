@@ -27,6 +27,11 @@ pub(crate) trait Exchange {
     fn context(&mut self, _: u64, _: Instant) -> Result<Vec<u8>, String> {
         Err("automatic context is unsupported by this transport/runtime".into())
     }
+
+    /// Optional features are queried lazily; older transports support none.
+    fn capabilities(&mut self, _: u64, _: Instant) -> Result<u64, String> {
+        Ok(0)
+    }
 }
 
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
@@ -73,6 +78,25 @@ fn complete(deadline: Instant, mut call: impl FnMut(u64) -> (u64, u64)) -> Resul
     Err("local batch exceeded bounded continuation count; session aborted".into())
 }
 
+fn capabilities_complete(
+    deadline: Instant,
+    mut call: impl FnMut(u64) -> (u64, u64),
+) -> Result<u64, String> {
+    if Instant::now() >= deadline {
+        return Err("capabilities deadline reached".into());
+    }
+    let (status, flags) = call(local::CAPABILITIES);
+    if Instant::now() >= deadline {
+        return Err("capabilities response deadline reached; discarded".into());
+    }
+    match (status, flags) {
+        (local::COMPLETE, flags) => Ok(flags),
+        // Version-one runtimes return exactly INVALID/0 for an unknown control operation.
+        (local::INVALID, 0) => Ok(0),
+        _ => Err(format!("invalid capabilities response (status={status})")),
+    }
+}
+
 fn context_complete(
     deadline: Instant,
     mut call: impl FnMut(u64) -> (u64, u64),
@@ -100,6 +124,28 @@ mod tests {
     use super::*;
 
     use std::time::Duration;
+
+    #[test]
+    fn capabilities_accept_only_success_or_exact_legacy_refusal_without_retry() {
+        for (reply, expected) in [
+            ((local::COMPLETE, local::CAP_DIAGNOSTIC), Some(local::CAP_DIAGNOSTIC)),
+            ((local::COMPLETE, 1 << 63), Some(1 << 63)),
+            ((local::INVALID, 0), Some(0)),
+            ((local::INVALID, 1), None),
+            ((local::OWNER, 0), None),
+            ((local::PENDING, 0), None),
+            ((local::BUSY, 0), None),
+        ] {
+            let mut operations = Vec::new();
+            let result = capabilities_complete(Instant::now() + Duration::from_secs(1), |op| {
+                operations.push(op);
+                reply
+            });
+            assert_eq!(result.ok(), expected);
+            assert_eq!(operations, [local::CAPABILITIES]);
+        }
+        assert!(capabilities_complete(Instant::now(), |_| panic!("expired query")).is_err());
+    }
 
     #[test]
     fn pending_work_continues_without_resubmitting_request() {
