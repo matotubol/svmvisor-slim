@@ -258,6 +258,7 @@ fn msr_failure_context(
 ) -> (u64, u64) {
     use crate::svm::{
         dispatch::NativeEferError as E, events::MsrFaultError as M, exit::ResumeError as R,
+        vmcb::NativeRetirementError as N,
     };
     let info = vmcb.exit_snapshot().info1;
     let instruction_value = |e| match e {
@@ -293,6 +294,11 @@ fn msr_failure_context(
             (3, u64::from_le_bytes(vmcb.bytes()[0x558..0x560].try_into().unwrap()))
         }
         E::UnsupportedDebugState => (4, vmcb.guest_rflags()),
+        E::Retirement(N::DebugControlUnavailable | N::InterruptShadow) => (4, vmcb.guest_rflags()),
+        E::Retirement(N::EventState(error)) => {
+            let (reason, value) = pending(error);
+            (0x20 + reason, value)
+        }
         E::UnsupportedMsr { index, .. } => (5, index.into()),
         E::UnsupportedValue { value } => (6, value),
         E::Instruction(e) => (

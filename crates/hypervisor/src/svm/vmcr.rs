@@ -6,8 +6,6 @@
 //! 215-216 make LOCK read-only and a zero SvmLockKey never clears it. APM volume 2
 //! physical pages 645-646 define reserved-bit faults, LOCK and SVMDIS versus EFER.SVME.
 
-use x86_64::registers::rflags::RFlags;
-
 use crate::{
     arch::x86_64::{
         capabilities::ValidatedCapabilities,
@@ -120,16 +118,17 @@ fn complete_vmcr(
     if write && input & !ignored != 0 {
         return Err(NativeVmCrError::UnsupportedValue { value: input });
     }
-    if vmcb.guest_rflags() & RFlags::TRAP_FLAG.bits() != 0 {
-        return Err(NativeVmCrError::UnsupportedDebugState);
-    }
     let next = instruction.continuation(snapshot).map_err(NativeVmCrError::Instruction)?;
+    let retirement = vmcb.prepare_native_msr_retirement()?;
     if write {
         vmcb.commit_emulated_instruction(vmcb.guest_rax(), next);
     } else {
         vmcb.commit_emulated_instruction(owner.logical(), next);
         frame.rdx = 0;
     }
-    vmcb.complete_native_instruction_state();
-    Ok(NativeMsrOutcome::Completed)
+    if vmcb.complete_native_msr_retirement(retirement) {
+        Ok(NativeMsrOutcome::DebugTrapPrepared)
+    } else {
+        Ok(NativeMsrOutcome::Completed)
+    }
 }

@@ -3,7 +3,7 @@ use svmvisor_hypervisor::{
     svm::{
         dispatch::{NativeEfer, NativeEferError, NativeMsrOutcome, handle_native_efer},
         permission_maps::Msrpm,
-        vmcb::{InstructionIntercept, Vmcb},
+        vmcb::{InstructionIntercept, NativeRetirementError, Vmcb},
     },
 };
 
@@ -415,7 +415,7 @@ fn native_nested_paging_requires_prepared_root_asid_and_clean_control() {
 }
 
 #[test]
-fn completion_consumes_shadow_rf_but_debug_traps_remain_explicitly_unsupported() {
+fn completion_consumes_shadow_rf_but_tf_requires_owned_debug_control() {
     let (mut owner, mut vmcb, mut frame) = stopped(false, 0);
     put(&mut vmcb, 0x68, 1);
     put(&mut vmcb, 0x570, 0x1_0202);
@@ -427,7 +427,7 @@ fn completion_consumes_shadow_rf_but_debug_traps_remain_explicitly_unsupported()
     let original_frame = frame;
     assert_eq!(
         handle_native_efer(&mut owner, &mut vmcb, &mut frame, &[0x0f, 0x32]),
-        Err(NativeEferError::UnsupportedDebugState)
+        Err(NativeEferError::Retirement(NativeRetirementError::DebugControlUnavailable))
     );
     assert_eq!(*vmcb.bytes(), original);
     assert_eq!(frame, original_frame);

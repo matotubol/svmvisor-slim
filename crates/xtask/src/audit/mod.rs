@@ -10,12 +10,14 @@ use std::collections::HashMap;
 use crate::json::Value;
 
 pub use capture::audit_entry_capture;
+pub use host_paging::audit_host_paging;
 pub use lbr::audit_lbr_capture;
 pub use msr_capture::audit_msr_capture;
 pub use pmu::audit_pmu_commit;
 pub use tsc_ratio::audit_tsc_ratio_init;
 
 mod capture;
+mod host_paging;
 mod lbr;
 mod msr_capture;
 mod pmu;

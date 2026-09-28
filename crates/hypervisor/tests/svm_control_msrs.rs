@@ -309,7 +309,7 @@ fn failed_provenance_or_lifecycle_validation_is_transactional() {
                 (0x0a8, 0x8000_0b0d),
                 (0x088, 0x8000_0202),
                 (0x4d0, 0x1501),
-                (0x570, 0x102),
+                (0x570, 0x102), // TF without LBR-owned DebugCtl.
             ] {
                 let mut owner = owner(&vmcr);
                 let (mut vmcb, mut frame) = stopped(index, true, 0x8888_0000);

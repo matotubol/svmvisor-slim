@@ -82,8 +82,22 @@ svmvisor_resident_lbr_capture_end:
     rdmsr
     or $0x800, %eax
     wrmsr
+    /* MOV CR3 alone retains firmware global translations, which may still
+     * grant RWX access to host guards/data. Clear host PGE before switching
+     * roots and leave it clear: our private tables have no global leaves.
+     * Keeping PGE clear also prevents speculative global refills under the
+     * old root. Guest CR4 is already captured in the VMCB and stays unchanged;
+     * PCIDE and all other inherited controls are preserved here.
+     * APM2 rev3.44 physical pp109,220-222,564; NPT host PGE ignored at p615. */
+.globl svmvisor_resident_host_paging
+svmvisor_resident_host_paging:
+    mov %cr4, %rax
+    and $-129, %rax
+    mov %rax, %cr4
     mov 8(%r10), %rax
     mov %rax, %cr3
+.globl svmvisor_resident_host_paging_end
+svmvisor_resident_host_paging_end:
     mov %cr0, %rax
     or $0x10000, %rax
     mov %rax, %cr0
@@ -200,7 +214,8 @@ svmvisor_resident_entry_capture:
 .globl svmvisor_resident_vmrun
 svmvisor_resident_vmrun:
     /* GIF remains clear, so physical IRQs cannot run on the captured guest
-     * register frame. V_INTR_MASKING uses this host IF=1 for the guest run. */
+     * register frame. VMRUN loads guest RFLAGS; with V_INTR_MASKING=0 that
+     * guest IF controls IRQ delivery. VMEXIT clears GIF before restoring IF. */
     sti
     vmrun %rax
 .globl svmvisor_resident_vmexit

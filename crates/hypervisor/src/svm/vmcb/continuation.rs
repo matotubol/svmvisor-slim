@@ -3,6 +3,7 @@
 use crate::{
     arch::x86_64::descriptors::SegmentState,
     svm::{
+        events::ExternalInterruptError,
         exit::ResumeCandidate,
         vmcb::{
             GUEST_CR0, GUEST_CR3, GUEST_CR4, GUEST_EFER, GUEST_ISST_ADDR, GUEST_RAX, GUEST_RFLAGS,
@@ -10,6 +11,17 @@ use crate::{
         },
     },
 };
+
+const INTERRUPT_SHADOW_OFFSET: usize = 0x068;
+const EVENT_INJECTION_OFFSET: usize = 0x0a8;
+const GUEST_DR6_OFFSET: usize = 0x568;
+const GUEST_DBGCTL_OFFSET: usize = 0x670;
+const TRAP_FLAG: u64 = 1 << 8;
+const RESUME_FLAG: u64 = 1 << 16;
+const BRANCH_SINGLE_STEP: u64 = 1 << 1;
+const DR6_BREAKPOINTS: u64 = 0xf;
+const DR6_SINGLE_STEP: u64 = 1 << 14;
+const DEBUG_TRAP_INJECTION: u64 = (1 << 31) | (3 << 8) | 1;
 
 // Continuation and committed instruction state.
 impl Vmcb {
@@ -129,12 +141,85 @@ impl Vmcb {
         self.request_full_tlb_flush();
     }
 
-    /// The native CPUID/MSR owner completed the instruction rather than
-    /// retrying a fault. Consume STI/MOV-SS shadow and RF (APM2 15.21.5,
-    /// 3.1.6). TF requires a separately owned post-instruction #DB and is
-    /// refused by these native handlers before they commit anything.
-    pub(crate) fn complete_native_instruction_state(&mut self) {
-        self.write_u64::<0x068>(self.read_u64::<0x068>() & !1);
-        self.write_u64::<GUEST_RFLAGS>(self.guest_rflags() & !(1 << 16));
+    /// Prepare retirement of an already validated, successful RDMSR/WRMSR.
+    ///
+    /// The caller owns a real stopped MSR intercept, its mode and continuation,
+    /// and must resolve architectural faults before calling this method. No
+    /// faulting instruction retires or raises a single-step trap (APM2 physical
+    /// pages 305, 470, 570). Commit this result only to the same stopped VMCB,
+    /// without changing event or debug state between preparation and commit.
+    ///
+    /// Saved DBGCTL is authoritative only with the admitted hardware LBR switch
+    /// (physical pages 602, 807). BTF steps control transfers, so these sequential
+    /// MSR instructions do not raise #DB when BTF is set (pages 460, 472).
+    /// A shadow does not identify its STI/MOV-SS origin or deferred debug cause;
+    /// keep that case bounded until it has a separate owner (pages 306, 597, 803).
+    pub(crate) fn prepare_native_msr_retirement(
+        &self,
+    ) -> Result<PreparedNativeMsrRetirement, NativeRetirementError> {
+        self.validate_external_interrupt_conflicts().map_err(NativeRetirementError::EventState)?;
+        if self.guest_rflags() & TRAP_FLAG == 0 {
+            return Ok(PreparedNativeMsrRetirement { debug_status: None });
+        }
+        if !self.native_lbr_enabled() {
+            return Err(NativeRetirementError::DebugControlUnavailable);
+        }
+        if self.read_u64::<INTERRUPT_SHADOW_OFFSET>() & 1 != 0 {
+            return Err(NativeRetirementError::InterruptShadow);
+        }
+        let debug_status = if self.read_u64::<GUEST_DBGCTL_OFFSET>() & BRANCH_SINGLE_STEP != 0 {
+            None
+        } else {
+            // RDMSR/WRMSR have no data or I/O operand. Instruction breakpoints
+            // precede the intercept, and RF suppresses their conditions (APM2
+            // physical pages 467, 570). Thus this pure single-step trap has no
+            // address-breakpoint cause. Preserve sticky BS/BD/BT and BLD, clear
+            // B0-B3, then set BS (pages 455-456, 469, 825-826).
+            Some((self.read_u64::<GUEST_DR6_OFFSET>() & !DR6_BREAKPOINTS) | DR6_SINGLE_STEP)
+        };
+        Ok(PreparedNativeMsrRetirement { debug_status })
     }
+
+    /// Commit the prepared retirement after the caller commits the MSR result
+    /// and next RIP. Returns whether a post-instruction #DB is now queued.
+    ///
+    /// Leave TF, DR7.GD, DBGCTL and branch records intact for architectural #DB
+    /// entry through EVENTINJ. Hardware pushes TF=1 and applies normal exception
+    /// entry effects; doing those early would corrupt a failed delivery (APM2
+    /// physical pages 458, 470-472, 593-594). This also preserves pending virtual
+    /// NMIs; #DB precedes NMI and INTR (physical page 327).
+    pub(crate) fn complete_native_msr_retirement(
+        &mut self,
+        prepared: PreparedNativeMsrRetirement,
+    ) -> bool {
+        self.complete_native_instruction_state();
+        if let Some(debug_status) = prepared.debug_status {
+            self.write_u64::<GUEST_DR6_OFFSET>(debug_status);
+            self.write_u64::<EVENT_INJECTION_OFFSET>(DEBUG_TRAP_INJECTION);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume the shadow and RF after successful instruction completion
+    /// (APM2 physical pages 116, 597). Callers that support single stepping use
+    /// prepared MSR retirement; other bounded owners must reject TF themselves.
+    pub(crate) fn complete_native_instruction_state(&mut self) {
+        self.write_u64::<INTERRUPT_SHADOW_OFFSET>(self.read_u64::<INTERRUPT_SHADOW_OFFSET>() & !1);
+        self.write_u64::<GUEST_RFLAGS>(self.guest_rflags() & !RESUME_FLAG);
+    }
+}
+
+/// Prevalidated retirement; deliberately not Copy so one completion consumes it.
+#[derive(Debug)]
+pub(crate) struct PreparedNativeMsrRetirement {
+    debug_status: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeRetirementError {
+    DebugControlUnavailable,
+    InterruptShadow,
+    EventState(ExternalInterruptError),
 }

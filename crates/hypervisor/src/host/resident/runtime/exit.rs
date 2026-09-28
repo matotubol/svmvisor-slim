@@ -533,14 +533,7 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
             {
                 let result = super::minimal::vmcr_with_nrip(state, vmcb, frame, &caps);
                 match result {
-                    Ok(NativeMsrOutcome::Completed) => {
-                        state.routing_retries = 0;
-                        return true;
-                    }
-                    Ok(NativeMsrOutcome::GeneralProtectionPrepared) => {
-                        state.pending_fault = true;
-                        return true;
-                    }
+                    Ok(outcome) => return complete_native_msr_exit(state, outcome),
                     Err(error) => {
                         let (reason, value) =
                             super::terminal::vmcr_nrip_failure(error, vmcb, vmcr_value(state));
@@ -550,14 +543,7 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
             }
             if let (Some(caps), Some(efer)) = (hardware_nrip, state.efer.as_mut()) {
                 match dispatch::handle_native_efer_with_nrip(efer, vmcb, frame, &caps) {
-                    Ok(NativeMsrOutcome::Completed) => {
-                        state.routing_retries = 0;
-                        return true;
-                    }
-                    Ok(NativeMsrOutcome::GeneralProtectionPrepared) => {
-                        state.pending_fault = true;
-                        return true;
-                    }
+                    Ok(outcome) => return complete_native_msr_exit(state, outcome),
                     Err(error) => {
                         let (reason, value) =
                             super::terminal::efer_nrip_failure(error, vmcb, efer.logical());
@@ -581,14 +567,7 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
             if frame.rcx as u32 == VM_CR {
                 let result = super::minimal::vmcr(state, vmcb, frame, &instruction);
                 match result {
-                    Ok(NativeMsrOutcome::Completed) => {
-                        state.routing_retries = 0;
-                        return true;
-                    }
-                    Ok(NativeMsrOutcome::GeneralProtectionPrepared) => {
-                        state.pending_fault = true;
-                        return true;
-                    }
+                    Ok(outcome) => return complete_native_msr_exit(state, outcome),
                     Err(error) => {
                         let (reason, value) = super::terminal::vmcr_failure(
                             error,
@@ -603,14 +582,7 @@ unsafe fn handle_exit(context: &mut ExitContext<'_>) -> bool {
 
             if let Some(efer) = state.efer.as_mut() {
                 match dispatch::handle_native_efer(efer, vmcb, frame, &instruction) {
-                    Ok(NativeMsrOutcome::Completed) => {
-                        state.routing_retries = 0;
-                        return true;
-                    }
-                    Ok(NativeMsrOutcome::GeneralProtectionPrepared) => {
-                        state.pending_fault = true;
-                        return true;
-                    }
+                    Ok(outcome) => return complete_native_msr_exit(state, outcome),
                     Err(error) if frame.rcx as u32 == EFER => {
                         let (reason, value) =
                             super::terminal::efer_failure(error, vmcb, efer.logical(), instruction);
@@ -650,19 +622,26 @@ fn complete_control_msr_exit(
     result: Result<NativeMsrOutcome, dispatch::NativeEferError>,
 ) -> bool {
     match result {
-        Ok(NativeMsrOutcome::Completed) => {
-            state.routing_retries = 0;
-            true
-        }
-        Ok(NativeMsrOutcome::GeneralProtectionPrepared) => {
-            state.pending_fault = true;
-            true
-        }
+        Ok(outcome) => complete_native_msr_exit(state, outcome),
         Err(_) => {
             let exit = vmcb.exit_snapshot();
             stop(state, exit.code, exit.rip, 0xf104, frame.rcx)
         }
     }
+}
+
+/// Keep retirement and event ownership consistent for all logical MSR owners.
+/// A trap follows a completed instruction; a fault retains its retry boundary.
+fn complete_native_msr_exit(state: &mut State, outcome: NativeMsrOutcome) -> bool {
+    match outcome {
+        NativeMsrOutcome::Completed => state.routing_retries = 0,
+        NativeMsrOutcome::DebugTrapPrepared => {
+            state.routing_retries = 0;
+            state.pending_fault = true;
+        }
+        NativeMsrOutcome::GeneralProtectionPrepared => state.pending_fault = true,
+    }
+    true
 }
 
 unsafe fn handle_diagnostic_ecam(
@@ -877,6 +856,78 @@ mod tests {
         assert!(!dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
         assert_eq!(*vmcb.bytes(), before);
         assert!(state.stopped_valid && !state.pending_fault);
+    }
+
+    #[test]
+    fn logical_msr_dispatch_tracks_single_step_delivery_and_branch_only_completion() {
+        for index in [EFER, VM_CR, VM_HSAVE_PA, SVM_LOCK_KEY, TSC_RATIO] {
+            for branch_only in [false, true] {
+                let (mut state, mut vmcb, mut frame) = stopped_svm();
+                assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
+                put(&mut vmcb, 0x070, 0x7c);
+                put(&mut vmcb, 0x570, 0x10102);
+                put(&mut vmcb, 0x568, 0xffff_2fff);
+                put(&mut vmcb, 0x670, if branch_only { 2 } else { 0 });
+                frame.rcx = u64::from(index);
+                state.routing_retries = 7;
+
+                assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+                assert_eq!(vmcb.guest_rip(), 0x3000);
+                assert_eq!(vmcb.guest_rflags(), 0x102);
+                assert_eq!(state.routing_retries, 0);
+                assert_eq!(state.pending_fault, !branch_only);
+                assert_eq!(vmcb.event_injection(), if branch_only { 0 } else { 0x8000_0301 });
+                assert!(!state.stopped_valid);
+            }
+        }
+    }
+
+    #[test]
+    fn completed_msr_debug_trap_replays_without_repeating_the_write() {
+        let (mut state, mut vmcb, mut frame) = stopped_svm();
+        assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
+        vmcb.configure_native_nmi_virtualization(1 << 25).unwrap();
+        vmcb.queue_native_nmi().unwrap();
+        put(&mut vmcb, 0x070, 0x7c);
+        put(&mut vmcb, 0x078, 1);
+        put(&mut vmcb, 0x570, 0x10102);
+        put(&mut vmcb, 0x5f8, 0x1234);
+        frame.rcx = u64::from(TSC_RATIO);
+        frame.rdx = 0;
+        assert!(dispatch_unclaimed(&mut state, &mut vmcb, &mut frame));
+        assert_eq!(state.svm_controls.unwrap().tsc_ratio(), 0x1234);
+        assert_eq!(vmcb.guest_rip(), 0x3000);
+        assert_eq!(vmcb.event_injection(), 0x8000_0301);
+        assert!(state.pending_fault && vmcb.virtual_nmi_pending());
+        let owner = state.svm_controls;
+        let registers = frame;
+
+        // Model exits during #DB delivery, not execution of another WRMSR.
+        // Hardware clears EVENTINJ and records the interrupted #DB in EXITINTINFO.
+        for code in [0x400, 0x63, 0x61] {
+            put(&mut vmcb, 0x070, code);
+            put(&mut vmcb, 0x088, 0x8000_0301);
+            put(&mut vmcb, 0x0a8, 0);
+            let mut expected = *vmcb.bytes();
+            expected[0x0a8..0x0b0].copy_from_slice(&0x8000_0301u64.to_le_bytes());
+            assert!(check_exit_event(&mut state, &mut vmcb));
+            assert_eq!(*vmcb.bytes(), expected);
+            assert_eq!((state.svm_controls, frame), (owner, registers));
+            assert!(state.pending_fault && vmcb.virtual_nmi_pending());
+        }
+
+        // Delivery succeeded; hardware is now at the handler with TF cleared.
+        put(&mut vmcb, 0x088, 0);
+        put(&mut vmcb, 0x0a8, 0);
+        put(&mut vmcb, 0x578, 0x4000);
+        put(&mut vmcb, 0x570, 2);
+        let delivered = *vmcb.bytes();
+        for _ in 0..2 {
+            assert!(check_exit_event(&mut state, &mut vmcb));
+            assert_eq!(*vmcb.bytes(), delivered);
+            assert_eq!((state.svm_controls, frame), (owner, registers));
+            assert!(!state.pending_fault && !state.stopped_valid);
+        }
     }
 
     #[test]

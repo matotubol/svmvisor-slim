@@ -89,6 +89,13 @@ CPL0-2 queues #UD at its original CS:RIP, before instruction-length lookup or
 reader access, preserving registers, flags and pending delivery. The supported
 user-mode probe still returns its version and remains an observable interface.
 
+The [control-register review](CONTROL-REGISTER-REVIEW.md) traces native CR0–CR8,
+PCID/TLB and INIT state ownership. Host entry clears inherited CR4.PGE before
+installing its private root; runtime validation rejects every CR interception
+path. Legal mode changes can still reach unsupported monitored MSR accesses in
+compatibility or paged legacy code, so native CR execution is not complete
+bare-metal equivalence.
+
 After startup acknowledgement, a VMMCALL unclaimed by the installed interfaces
 queues guest #UD at the original CS:RIP. It preserves registers and pending event
 delivery. The local reader and optional entry-trial ABI retain priority over that
@@ -115,6 +122,13 @@ unsupported and still stop. Hardware can raise an operand or privilege #GP befor
 the instruction intercept, so the new handler does not establish bare-metal fault
 priority for those cases. Other unsupported MSR policies also retain their stops.
 This is bounded conformance work, not nested virtualization or interface hiding.
+
+Logical EFER, VM_CR, VM_HSAVE_PA, SVM_LOCK_KEY and TSC_RATIO accesses now retire
+under ordinary single stepping and queue #DB at the validated following RIP.
+Branch-only stepping completes these non-branch instructions without a trap.
+Operand faults still retain the original RIP; TF with an interrupt shadow or
+without owned debug controls remains unsupported. The [MSR retirement review](MSR-RETIREMENT-REVIEW.md)
+records the manual evidence, event-replay checks, remaining gaps and target probes.
 
 This native hardware rewrite is experimental. The first cache-owner boot stopped
 on the SYS_CFG `0x780000` policy refusal (`0xf400`, detail 17); this routing-window

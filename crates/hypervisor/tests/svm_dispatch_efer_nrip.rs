@@ -141,7 +141,7 @@ fn malformed_hardware_evidence_and_pending_state_refuse_transactionally() {
             10 => put(&mut v, 0x558, 1),
             11 => put(&mut v, 0x548, 0),
             12 => put(&mut v, 0x548, 0x1020),
-            13 => put(&mut v, 0x570, 0x102),
+            13 => put(&mut v, 0x570, 0x102), // TF without LBR-owned DebugCtl.
             14 => put(&mut v, 0xa8, 1 << 31),
             15 => put(&mut v, 0x88, 1 << 31),
             16 => put(&mut v, 0x60, 1 << 25),

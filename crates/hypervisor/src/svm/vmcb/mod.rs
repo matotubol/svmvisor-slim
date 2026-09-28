@@ -16,6 +16,7 @@ use crate::{
 
 pub use crate::svm::vmcb::{control::native_pause_retry_ready, reflection::ReinjectOutcome};
 pub use cache::VmcbCacheOwner;
+pub use continuation::NativeRetirementError;
 
 mod cache;
 mod continuation;

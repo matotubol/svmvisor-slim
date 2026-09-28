@@ -20,7 +20,7 @@ pub(super) fn valid(vmcb: &Vmcb) -> bool {
 /// Cold admission precedes configuring the branch-record hardware switch.
 pub(super) fn valid_intercepts(vmcb: &Vmcb) -> bool {
     !vmcb.instruction_intercept(InstructionIntercept::Cpuid)
-        && !vmcb.cr3_intercepted()
+        && !vmcb.control_registers_intercepted()
         && [
             InstructionIntercept::Vmrun,
             InstructionIntercept::Vmmcall,
@@ -107,7 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn native_cpuid_preserves_cr3_and_required_svm_ownership() {
+    fn native_cpuid_preserves_control_registers_and_required_svm_ownership() {
         let mut vmcb = Vmcb::new();
         vmcb.configure_native_boot_intercepts().unwrap();
         assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_init_and_sipi_preserve_native_cpuid_and_cr3_controls() {
+    fn guest_init_and_sipi_preserve_native_cpuid_and_control_registers() {
         let mut vmcb = Vmcb::new();
         vmcb.configure_native_boot_intercepts().unwrap();
         assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
@@ -128,13 +128,21 @@ mod tests {
     }
 
     #[test]
-    fn cr3_traps_and_missing_svm_ownership_refuse_without_repairing_controls() {
-        for cr3 in [1u32 << 3, 1u32 << 19] {
+    fn cr_intercepts_and_missing_svm_ownership_refuse_without_repairing_controls() {
+        let cr_intercepts = (0..32)
+            .map(|bit| (0x000, 1u32 << bit))
+            .chain(core::iter::once((0x00c, 1 << 5)))
+            .chain((16..32).map(|bit| (0x010, 1 << bit)));
+        for (offset, mask) in cr_intercepts {
             let mut vmcb = Vmcb::new();
             vmcb.configure_native_boot_intercepts().unwrap();
             assert!(vmcb.configure_native_lbr(0x8000_0022, 2, 7, 0x2106));
-            // SAFETY: exclusive inert VMCB and its in-bounds CR intercept dword.
-            unsafe { ptr::from_mut(&mut vmcb).cast::<u32>().write(cr3) };
+            // SAFETY: exclusive inert VMCB; each offset is an aligned in-bounds
+            // intercept dword. Inject profile drift while preserving required bits.
+            unsafe {
+                let word = ptr::from_mut(&mut vmcb).cast::<u8>().add(offset).cast::<u32>();
+                word.write(word.read() | mask);
+            }
             let before = *vmcb.bytes();
             assert!(!valid(&vmcb));
             assert_eq!(vmcb.bytes(), &before);

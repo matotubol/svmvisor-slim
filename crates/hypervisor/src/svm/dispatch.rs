@@ -9,7 +9,10 @@ use crate::{
         msr::{EFER, EFER_SVME},
         registers::GuestRegisters,
     },
-    svm::{exit::ResumeError, vmcb::Vmcb},
+    svm::{
+        exit::ResumeError,
+        vmcb::{NativeRetirementError, Vmcb},
+    },
 };
 
 const NATIVE_EFER_MASK: u64 = 0xd01;
@@ -182,6 +185,8 @@ impl NativeEfer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeMsrOutcome {
     Completed,
+    /// Instruction completed at its next RIP; a single-step #DB awaits delivery.
+    DebugTrapPrepared,
     /// Fault retry at the original RIP. Delivery has not yet executed.
     GeneralProtectionPrepared,
 }
@@ -192,6 +197,7 @@ pub enum NativeEferError {
     BackingMismatch,
     UnsupportedMode,
     UnsupportedDebugState,
+    Retirement(NativeRetirementError),
     UnsupportedMsr {
         index: u32,
         write: bool,
@@ -204,6 +210,12 @@ pub enum NativeEferError {
     Instruction(ResumeError),
     PendingState(super::events::ExternalInterruptError),
     Fault(super::events::MsrFaultError),
+}
+
+impl From<NativeRetirementError> for NativeEferError {
+    fn from(error: NativeRetirementError) -> Self {
+        Self::Retirement(error)
+    }
 }
 
 pub type NativeVmCrError = NativeEferError;
@@ -348,10 +360,8 @@ fn native_efer_inner(
     {
         return Err(E::UnsupportedValue { value: input });
     }
-    if vmcb.guest_rflags() & (1 << 8) != 0 {
-        return Err(E::UnsupportedDebugState);
-    }
     let next = instruction.continuation(snapshot).map_err(E::Instruction)?;
+    let retirement = vmcb.prepare_native_msr_retirement()?;
     if write {
         if input != logical {
             vmcb.commit_native_efer(input);
@@ -363,8 +373,11 @@ fn native_efer_inner(
         frame.rdx = logical >> 32;
         owner.logical = logical;
     }
-    vmcb.complete_native_instruction_state();
-    Ok(NativeMsrOutcome::Completed)
+    if vmcb.complete_native_msr_retirement(retirement) {
+        Ok(NativeMsrOutcome::DebugTrapPrepared)
+    } else {
+        Ok(NativeMsrOutcome::Completed)
+    }
 }
 
 pub(crate) fn validate_native_interrupt_profile(

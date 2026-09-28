@@ -7,8 +7,6 @@
 //! follow PPR 57896 physical pages 213-216 and APM volume 2 physical page 647. SVM key
 //! reads return zero (PPR physical page 216; APM physical pages 648-649).
 
-use x86_64::registers::rflags::RFlags;
-
 use crate::{
     arch::x86_64::{
         capabilities::ValidatedCapabilities,
@@ -245,10 +243,8 @@ fn complete_control_msr(
     {
         return Err(E::UnsupportedMode);
     }
-    if vmcb.guest_rflags() & RFlags::TRAP_FLAG.bits() != 0 {
-        return Err(E::UnsupportedDebugState);
-    }
     let next = instruction.continuation(snapshot).map_err(E::Instruction)?;
+    let retirement = vmcb.prepare_native_msr_retirement()?;
     if write {
         if index == VM_HSAVE_PA {
             owner.hsave_pa = input;
@@ -269,6 +265,9 @@ fn complete_control_msr(
         vmcb.commit_emulated_instruction(u64::from(value as u32), next);
         frame.rdx = value >> 32;
     }
-    vmcb.complete_native_instruction_state();
-    Ok(NativeMsrOutcome::Completed)
+    if vmcb.complete_native_msr_retirement(retirement) {
+        Ok(NativeMsrOutcome::DebugTrapPrepared)
+    } else {
+        Ok(NativeMsrOutcome::Completed)
+    }
 }

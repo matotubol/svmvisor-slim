@@ -38,9 +38,13 @@ impl Vmcb {
         word & mask != 0
     }
 
-    /// APM volume 2 Appendix B: CR3 read/write interception at 000h/002h.
-    pub fn cr3_intercepted(&self) -> bool {
-        self.read_u32::<0x000>() & ((1 << 3) | (1 << 19)) != 0
+    /// Any CR read, pre-write, selective CR0-write or post-write interception.
+    /// APM2 rev3.44 Appendix B, physical pp799/801: a native CR policy must
+    /// exclude all three vectors, including traps after the write has retired.
+    pub fn control_registers_intercepted(&self) -> bool {
+        self.read_u32::<0x000>() != 0
+            || self.read_u32::<INTERCEPT_MISC1>() & (1 << 5) != 0
+            || self.read_u32::<INTERCEPT_MISC2>() & 0xffff_0000 != 0
     }
 
     pub fn event_intercept(&self, intercept: EventIntercept) -> bool {
